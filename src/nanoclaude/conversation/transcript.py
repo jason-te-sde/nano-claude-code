@@ -89,6 +89,17 @@ class Message:
     role: Role
     blocks: tuple[Block, ...]
 
+    # Declared unhashable rather than left to the default: blocks can hold a
+    # ToolUseBlock, declared unhashable above for holding decoded-JSON
+    # arguments. Left to frozen=True's default eq=True, dataclass would
+    # generate a real __hash__ -- isinstance(x, Hashable) would say True --
+    # that hashes a Message built only from TextBlock/ThinkingBlock/
+    # ToolResultBlock just fine and only raises TypeError, naming
+    # "ToolUseBlock" rather than this class, once an assistant turn with a
+    # tool call reaches it. That split is exactly the trap: a test written
+    # with simple values would pass and a real tool-call turn would fail.
+    __hash__ = None  # type: ignore[assignment]
+
     def tool_uses(self) -> tuple[ToolUseBlock, ...]:
         return tuple(b for b in self.blocks if isinstance(b, ToolUseBlock))
 
@@ -102,6 +113,12 @@ class Message:
 @dataclass(frozen=True, slots=True)
 class Transcript:
     messages: tuple[Message, ...] = ()
+
+    # Embeds a tuple of Message, declared unhashable above -- the same defect
+    # one level up: left to the default, a Transcript of plain-text turns
+    # would hash fine, and one with a tool call anywhere in its history would
+    # raise, naming "ToolUseBlock" rather than this class.
+    __hash__ = None  # type: ignore[assignment]
 
     def append(self, message: Message) -> Transcript:
         return Transcript((*self.messages, message))

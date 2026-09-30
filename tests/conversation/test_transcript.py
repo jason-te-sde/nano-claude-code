@@ -233,3 +233,28 @@ def test_tool_use_block_is_not_hashable():
     assert not isinstance(block, Hashable)  # type: ignore[unreachable]
     with pytest.raises(TypeError):
         hash(block)
+
+
+def test_message_is_not_hashable_when_it_holds_a_tool_use_block():
+    # A Message holding only a TextBlock happens to hash fine today -- that is
+    # exactly the trap: hashability that depends on which blocks a message
+    # holds would pass a test written with plain text and only fail later, on
+    # a real assistant turn that calls a tool, naming "ToolUseBlock" rather
+    # than this class. Declared unconditionally unhashable instead, so every
+    # Message reports honestly regardless of what it holds.
+    message = Message("assistant", (ToolUseBlock("t1", "Read", {"path": "a.py"}),))
+    assert not isinstance(message, Hashable)  # type: ignore[unreachable]
+    with pytest.raises(TypeError, match="unhashable type: 'Message'"):
+        hash(message)
+
+
+def test_transcript_is_not_hashable_when_it_holds_a_tool_use_block():
+    # Same trap one level up: a Transcript of plain-text turns happens to hash
+    # fine, and one with a tool call anywhere in its history raises, naming
+    # "ToolUseBlock" rather than this class.
+    transcript = Transcript(
+        (user_text("hi"), Message("assistant", (ToolUseBlock("t1", "Read", {"path": "a.py"}),)))
+    )
+    assert not isinstance(transcript, Hashable)  # type: ignore[unreachable]
+    with pytest.raises(TypeError, match="unhashable type: 'Transcript'"):
+        hash(transcript)

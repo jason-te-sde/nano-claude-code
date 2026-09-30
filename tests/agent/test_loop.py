@@ -98,14 +98,10 @@ def test_usage_accumulates_across_turns():
     # Usage() (all zeros), so state.usage + reply.usage and plain reply.usage
     # are bit-for-bit identical on turn one. Spanning two non-zero-usage turns
     # is what makes a dropped "+" show up as a wrong number instead of an
-    # accidental match. calls()/calls_many() always build a zero-Usage reply,
-    # so the tool-use turn's ModelReply is constructed directly.
-    from nanoclaude.conversation.transcript import ToolUseBlock
-    from nanoclaude.providers.base import ModelReply, StopKind, Usage
+    # accidental match.
+    from nanoclaude.providers.base import Usage
 
-    first_reply = ModelReply(
-        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), StopKind.TOOL_USE, Usage(10, 3), "scripted"
-    )
+    first_reply = calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=10, output_tokens=3)
     outcome = step(start("hi"), first_reply)
     assert isinstance(outcome, RunTools)
     assert outcome.state.usage == Usage(10, 3)

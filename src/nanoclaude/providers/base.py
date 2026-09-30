@@ -44,6 +44,16 @@ class ToolSpec:
     description: str
     schema: Mapping[str, Any]
 
+    # Declared unhashable rather than left to the default: schema is a JSON
+    # Schema object decoded the same way ToolUseBlock.arguments is -- see
+    # transcript.py -- so no version of this class has reliably hashable
+    # schemas either (a MappingProxyType would not help: it is not hashable
+    # itself). Left to frozen=True's default eq=True, dataclass would generate
+    # a real __hash__ -- isinstance(x, Hashable) would say True -- that only
+    # raises TypeError when actually called, and names "dict" rather than
+    # this class.
+    __hash__ = None  # type: ignore[assignment]
+
 
 @dataclass(frozen=True, slots=True)
 class ModelRequest:
@@ -53,6 +63,13 @@ class ModelRequest:
     max_output_tokens: int
     temperature: float = 0.0
 
+    # Embeds a Transcript and a sequence of ToolSpec, both declared unhashable
+    # (see transcript.py and above) -- the same defect resurfacing one level
+    # up, the way Done and RunTools embed LoopState in loop.py. Every
+    # ModelRequest carries a transcript, so this is unconditional regardless
+    # of what either field holds.
+    __hash__ = None  # type: ignore[assignment]
+
 
 @dataclass(frozen=True, slots=True)
 class ModelReply:
@@ -60,6 +77,16 @@ class ModelReply:
     stop: StopKind
     usage: Usage
     model: str
+
+    # Declared unhashable rather than left to the default: blocks can hold a
+    # ToolUseBlock, declared unhashable in transcript.py for holding
+    # decoded-JSON arguments. Left to frozen=True's default eq=True, dataclass
+    # would generate a real __hash__ -- isinstance(x, Hashable) would say True
+    # -- that hashes a text-only reply just fine and only raises TypeError,
+    # naming "ToolUseBlock" rather than this class, once a tool-call reply
+    # reaches it. That split is exactly the trap: a test written with simple
+    # values would pass and a real tool-call turn would fail.
+    __hash__ = None  # type: ignore[assignment]
 
 
 class ModelError(RuntimeError):
