@@ -1,7 +1,7 @@
 import pytest
 
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock, Transcript, user_text
-from nanoclaude.providers.base import ModelClient, ModelError, ModelRequest, StopKind
+from nanoclaude.providers.base import ModelClient, ModelError, ModelRequest, StopKind, Usage
 from nanoclaude.testing.scripted import ScriptedModel, calls, calls_many, says
 
 # A static check, not a runtime one: mypy --strict verifies ScriptedModel's shape
@@ -62,3 +62,25 @@ async def test_calls_many_preserves_order():
     ids = [block.id for block in reply.blocks if isinstance(block, ToolUseBlock)]
     assert ids == ["t1", "t2"]
     assert len(ids) == len(reply.blocks)  # every block really was a ToolUseBlock
+
+
+async def test_calls_defaults_usage_to_zero():
+    assert calls("Read", {"path": "a.py"}).usage == Usage()
+
+
+async def test_calls_accepts_explicit_token_usage():
+    # calls() used to hardcode Usage() while says() already took input_tokens/
+    # output_tokens -- an asymmetry that forced test_usage_accumulates_across_turns
+    # in test_loop.py to hand-build a ModelReply just to get non-zero usage on a
+    # tool-call turn. Mirrors says()'s own kwargs exactly.
+    reply = calls("Read", {"path": "a.py"}, input_tokens=10, output_tokens=3)
+    assert reply.usage == Usage(10, 3)
+
+
+async def test_calls_many_defaults_usage_to_zero():
+    assert calls_many(("Read", {}, "t1")).usage == Usage()
+
+
+async def test_calls_many_accepts_explicit_token_usage():
+    reply = calls_many(("Read", {}, "t1"), input_tokens=10, output_tokens=3)
+    assert reply.usage == Usage(10, 3)

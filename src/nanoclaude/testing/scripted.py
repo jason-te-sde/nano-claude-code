@@ -63,13 +63,19 @@ def calls(
     *,
     call_id: str = "call_1",
     preamble: str | None = None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
 ) -> ModelReply:
     blocks: tuple[Block, ...] = (ToolUseBlock(call_id, name, arguments),)
     if preamble is not None:
         blocks = (TextBlock(preamble), *blocks)
-    return ModelReply(blocks, StopKind.TOOL_USE, Usage(), "scripted")
+    return ModelReply(blocks, StopKind.TOOL_USE, Usage(input_tokens, output_tokens), "scripted")
 
 
-def calls_many(*requested: tuple[str, Mapping[str, Any], str]) -> ModelReply:
+def calls_many(
+    *requested: tuple[str, Mapping[str, Any], str],
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> ModelReply:
     blocks = tuple(ToolUseBlock(call_id, name, args) for name, args, call_id in requested)
-    return ModelReply(blocks, StopKind.TOOL_USE, Usage(), "scripted")
+    return ModelReply(blocks, StopKind.TOOL_USE, Usage(input_tokens, output_tokens), "scripted")
