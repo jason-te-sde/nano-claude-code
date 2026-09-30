@@ -1,0 +1,11 @@
+nano-claude-code is an independent reimplementation. It is not produced by,
+affiliated with, endorsed by, or supported by Anthropic PBC.
+
+"Claude" and "Claude Code" are trademarks of Anthropic PBC, used here only
+nominatively to describe what this project is modelled after. This repository
+contains no source code, prompt text, or other material copied from any
+Anthropic product, and is not a fork or redistribution of one.
+
+This project can talk to the Anthropic API, OpenAI-compatible APIs, and a local
+Ollama server. Use of those services is subject to their own terms. This project
+ships no credentials and no vendor code.
