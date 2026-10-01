@@ -27,6 +27,14 @@ class DangerVerdict:
     matches: tuple[str, ...] = ()
     classifier: str = "regex"
     detail: str = ""
+    # Appended last, defaulted True, so no existing positional construction
+    # changes meaning. False means this verdict's SAFE is "the regex
+    # classifier found nothing to refuse," not "this command is safe" -- the
+    # distinction policy.evaluate()'s rows 8 and 9 act on (spec 6.4, 17's
+    # degradation guarantee). A BLOCKED or UNPARSEABLE verdict is unaffected
+    # either way: a refusal is already the conservative answer. Still a plain
+    # bool field, so the dataclass stays hashable.
+    authoritative: bool = True
 
     @property
     def reason(self) -> str:
