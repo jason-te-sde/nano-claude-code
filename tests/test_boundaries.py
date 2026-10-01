@@ -52,3 +52,19 @@ def test_agent_does_no_io_keeps_no_clock_and_makes_no_ids():
         if name == banned or name.startswith(f"{banned}.")
     ]
     assert offenders == []
+
+
+def test_gitwildmatch_has_a_single_home():
+    """permissions/rules.py's GLOB_PATTERN_FACTORY keeps the deprecated pathspec
+    factory name ``"gitwildmatch"`` in exactly one place on purpose -- see that
+    constant's comment -- so that migrating to pathspec's new name (``"gitignore"``)
+    is a one-line change instead of a search across every file that matches a
+    glob. A second literal copy anywhere else would quietly reintroduce the
+    multi-site problem the constant exists to avoid.
+    """
+    offenders = sorted(
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if "gitwildmatch" in path.read_text(encoding="utf-8")
+    )
+    assert offenders == ["permissions/rules.py"]
