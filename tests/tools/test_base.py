@@ -85,19 +85,9 @@ def test_file_related_dataclasses_are_hashable():
     hash(outcome)  # must not raise
 
 
-def test_tool_context_reports_hashable_but_hashing_it_raises(ctx):
-    """Not decided the way ToolSpec/ModelRequest/ModelReply were (providers/base.py).
-
-    read_state is typed Mapping[str, FileStamp], but every real caller -- this
-    module's own `ctx` fixture included -- passes a plain dict, which is not
-    hashable. frozen=True plus the default eq=True generates a real __hash__
-    unconditionally, so isinstance(ctx, Hashable) reports True even though
-    hash(ctx) actually raises, naming "dict" rather than ToolContext -- exactly
-    the hazard providers/base.py's ToolSpec/ModelRequest/ModelReply close with
-    an explicit ``__hash__ = None``. ToolContext carries no such guard in the
-    brief this module was transcribed from; pinned here as a known gap rather
-    than left undocumented (see the task report).
-    """
-    assert isinstance(ctx, Hashable)
-    with pytest.raises(TypeError, match="unhashable type: 'dict'"):
+def test_tool_context_is_declared_unhashable(ctx):
+    # read_state is a mapping, so the class declares __hash__ = None instead of
+    # inheriting a generated hash that would raise naming "dict".
+    assert not isinstance(ctx, Hashable)
+    with pytest.raises(TypeError, match="ToolContext"):
         hash(ctx)

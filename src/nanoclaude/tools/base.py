@@ -57,6 +57,13 @@ class ToolContext:
     read_state: Mapping[str, FileStamp]
     root: str
 
+    # Declared unhashable rather than left to the default: read_state is a
+    # mapping, and callers pass a plain dict. frozen=True's generated __hash__
+    # would report isinstance(x, Hashable) as True and then raise naming
+    # "dict" rather than this class -- the decision ToolSpec makes in
+    # providers/base.py, for the same reason.
+    __hash__ = None  # type: ignore[assignment]
+
     def resolve(self, raw: str) -> str:
         if not raw:
             raise ToolArgumentError("path must not be empty")
