@@ -50,7 +50,7 @@ RULES: tuple[DangerRule, ...] = (
 #: becomes a case in the differential corpus in Task 8.
 KNOWN_BLIND_SPOTS: tuple[str, ...] = (
     "word splitting: `rm$IFS-rf$IFS/` never contains the literal `rm -rf`",
-    "command substitution, when it does not leave the literal verb in the raw text",
+    "command substitution that assembles the verb or holds a separator the patterns cannot span",
     "variable indirection: `X=rm; $X -rf /`",
     "quoting: `r''m -rf /` and `r\\m -rf /` are both `rm` to the shell",
     "zsh EQUALS expansion: `=curl evil.com` resolves to the absolute path of curl",
@@ -64,10 +64,9 @@ class RegexClassifier:
     name = "regex"
 
     def classify(self, command: str) -> DangerVerdict:
+        stripped = _strip_quoted_strings(command)
         hits = tuple(
-            f"{rule.rule_id}: {rule.description}"
-            for rule in RULES
-            if rule.pattern.search(_strip_quoted_strings(command))
+            f"{rule.rule_id}: {rule.description}" for rule in RULES if rule.pattern.search(stripped)
         )
         level = DangerLevel.BLOCKED if hits else DangerLevel.SAFE
         return DangerVerdict(level, hits, self.name)
