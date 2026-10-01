@@ -1,0 +1,71 @@
+import pytest
+
+from nanoclaude.permissions.rules import Rule, RuleSet
+
+
+def test_a_bare_tool_name_matches_every_call_to_it():
+    rule = Rule.parse("Read")
+    assert rule.matches("Read", "/p/a.py", "a.py")
+    assert not rule.matches("Write", "/p/a.py", "a.py")
+
+
+def test_a_glob_matches_the_path_relative_to_the_root():
+    rule = Rule.parse("Read(**/.env*)")
+    assert rule.matches("Read", "/p/svc/.env.local", "svc/.env.local")
+    assert not rule.matches("Read", "/p/src/main.py", "src/main.py")
+
+
+def test_a_glob_also_matches_the_absolute_path():
+    """A rule the user wrote as an absolute path must still work."""
+    rule = Rule.parse("Read(/etc/**)")
+    assert rule.matches("Read", "/etc/passwd", "../../etc/passwd")
+
+
+def test_a_bash_prefix_rule_matches_on_word_boundaries():
+    rule = Rule.parse("Bash(npm test:*)")
+    assert rule.matches("Bash", "npm test", "npm test")
+    assert rule.matches("Bash", "npm test -- --watch", "npm test -- --watch")
+    assert not rule.matches("Bash", "npm testify", "npm testify")  # boundary, not prefix
+    assert not rule.matches("Bash", "rm -rf /", "rm -rf /")
+
+
+def test_an_exact_bash_rule_matches_only_that_command():
+    rule = Rule.parse("Bash(git status)")
+    assert rule.matches("Bash", "git status", "git status")
+    assert not rule.matches("Bash", "git status --short", "git status --short")
+
+
+def test_malformed_rules_are_rejected_at_parse_time():
+    with pytest.raises(ValueError, match="unbalanced"):
+        Rule.parse("Bash(npm test")
+
+
+def test_a_lone_closing_paren_with_no_opening_one_is_also_rejected():
+    """Distinct branch from the one above: no "(" at all, but a stray ")"."""
+    with pytest.raises(ValueError, match="unbalanced"):
+        Rule.parse("Bash)")
+
+
+def test_ruleset_returns_the_first_matching_rule():
+    rules = RuleSet.build(allow=["Read", "Glob"], ask=["Bash"], deny=["Read(**/.env*)"])
+    assert rules.first_match("deny", "Read", "/p/.env", ".env") is not None
+    assert rules.first_match("allow", "Read", "/p/a.py", "a.py") is not None
+    assert rules.first_match("allow", "Bash", "ls", "ls") is None
+
+
+def test_rule_is_hashable():
+    # Every field (tool: str, subject: str | None, prefix: bool, source: str) is
+    # already hashable on its own, so frozen=True's generated __hash__ is not a
+    # trap here, unlike ToolUseBlock (conversation/transcript.py), which holds a
+    # Mapping. Pinned so a later field of a mapping or other unhashable type
+    # gets caught the same way those were.
+    assert hash(Rule.parse("Read(**/.env*)")) == hash(Rule.parse("Read(**/.env*)"))
+
+
+def test_ruleset_is_hashable():
+    # Holds three tuples of Rule, and Rule is hashable (see above), so the
+    # generated __hash__ composes cleanly. Pinned for the same reason as
+    # test_rule_is_hashable.
+    one = RuleSet.build(allow=["Read"], ask=["Bash"], deny=["Read(**/.env*)"])
+    other = RuleSet.build(allow=["Read"], ask=["Bash"], deny=["Read(**/.env*)"])
+    assert hash(one) == hash(other)
