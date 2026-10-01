@@ -530,3 +530,58 @@ def test_evaluate_defaults_to_no_grants_when_the_argument_is_omitted():
     """
     result = evaluate(req(tool="Bash", subject="ls", paths=()), policy())
     assert (result.decision, result.rule) == (Decision.ASK, "rule.ask")
+
+
+# Step 7b: the degradation guarantee (spec 6.4, 17) enforced in code, not just
+# in prose. A SAFE verdict whose classifier was not authoritative -- today
+# only reachable by constructing one directly, since best_classifier() (a
+# later task) is what will actually set the flag -- must not be promoted to
+# ALLOW by row 8 or row 9. All four directions are pinned, not just the
+# negative case: a guard proven only by its denial is the defect the
+# completeness clause (spec, test-completeness) names.
+SAFE_AST = DangerVerdict(DangerLevel.SAFE, (), "ast")
+SAFE_REGEX_ONLY = DangerVerdict(DangerLevel.SAFE, (), "regex", authoritative=False)
+
+
+def test_an_allow_rule_promotes_a_command_the_ast_classifier_cleared():
+    p = policy(rules=RuleSet.build(allow=["Bash(npm test:*)"]))
+    result = evaluate(req(tool="Bash", subject="npm test", paths=(), danger=SAFE_AST), p)
+    assert (result.decision, result.rule) == (Decision.ALLOW, "rule.allow")
+
+
+def test_an_allow_rule_does_not_promote_a_command_only_the_regex_classifier_cleared():
+    # The constraint this pins: regex-only means "not cleared", not "safe".
+    p = policy(rules=RuleSet.build(allow=["Bash(npm test:*)"], ask=["Bash"]))
+    result = evaluate(req(tool="Bash", subject="npm test", paths=(), danger=SAFE_REGEX_ONLY), p)
+    assert result.decision is Decision.ASK
+    assert result.rule != "rule.allow"
+
+
+def test_a_session_grant_promotes_a_command_the_ast_classifier_cleared():
+    p = policy(rules=RuleSet.build(ask=["Bash"]))
+    result = evaluate(
+        req(tool="Bash", subject="ls", paths=(), danger=SAFE_AST), p, Grants(frozenset({"Bash"}))
+    )
+    assert (result.decision, result.rule) == (Decision.ALLOW, "grant.session")
+
+
+def test_a_session_grant_does_not_promote_a_command_only_the_regex_classifier_cleared():
+    p = policy(rules=RuleSet.build(ask=["Bash"]))
+    result = evaluate(
+        req(tool="Bash", subject="ls", paths=(), danger=SAFE_REGEX_ONLY),
+        p,
+        Grants(frozenset({"Bash"})),
+    )
+    assert result.decision is Decision.ASK
+    assert result.rule != "grant.session"
+
+
+def test_a_blocked_verdict_is_refused_whether_or_not_it_is_authoritative():
+    # Row 4 precedes both gated rows, so the flag must change nothing here.
+    for authoritative in (True, False):
+        verdict = DangerVerdict(
+            DangerLevel.BLOCKED, ("rm.recursive-force",), "regex", authoritative=authoritative
+        )
+        p = policy(rules=RuleSet.build(allow=["Bash"]))
+        result = evaluate(req(tool="Bash", subject="rm -rf /", paths=(), danger=verdict), p)
+        assert result.rule == "bash.dangerous"

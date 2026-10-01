@@ -167,6 +167,23 @@ class Policy:
 _NO_GRANTS = Grants()
 
 
+def _unpromotable(danger: DangerVerdict | None) -> bool:
+    """True when a SAFE verdict must not be promoted to ALLOW by rows 8-9.
+
+    A verdict's ``authoritative`` defaults to True; the one thing allowed to
+    set it False is a fallback classifier owning up to being unable to
+    actually clear a command (spec 6.4's degradation guarantee -- "without
+    [the AST classifier] ... any command it cannot clear resolves to `ask`,
+    never `allow`"). SAFE-but-not-authoritative therefore means "nothing
+    refused this," not "this is safe," so rule.allow and grant.session must
+    not treat it as a clearance. ``danger is None`` (every file tool) and a
+    BLOCKED/UNPARSEABLE verdict both return False here: the former never had
+    an opinion to be non-authoritative about, and the latter is already
+    denied three rows earlier at row 4 regardless of this flag.
+    """
+    return danger is not None and danger.level is DangerLevel.SAFE and not danger.authoritative
+
+
 def evaluate(
     request: PermissionRequest, policy: Policy, grants: Grants = _NO_GRANTS
 ) -> PermissionResult:
@@ -258,11 +275,11 @@ def evaluate(
 
     # 8. rule.allow
     allowed = policy.rules.first_match("allow", request.tool, *subjects)
-    if allowed is not None:
+    if allowed is not None and not _unpromotable(request.danger):
         return PermissionResult(Decision.ALLOW, "rule.allow", f"allowed by {allowed.source}")
 
     # 9. grant.session
-    if request.tool in grants.tools:
+    if request.tool in grants.tools and not _unpromotable(request.danger):
         return PermissionResult(
             Decision.ALLOW, "grant.session", f"{request.tool} was approved for this session"
         )
