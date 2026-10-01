@@ -50,7 +50,7 @@ RULES: tuple[DangerRule, ...] = (
 #: becomes a case in the differential corpus in Task 8.
 KNOWN_BLIND_SPOTS: tuple[str, ...] = (
     "word splitting: `rm$IFS-rf$IFS/` never contains the literal `rm -rf`",
-    "command substitution: `$(echo rm) -rf /` hides the verb until the shell expands it",
+    "command substitution, when it does not leave the literal verb in the raw text",
     "variable indirection: `X=rm; $X -rf /`",
     "quoting: `r''m -rf /` and `r\\m -rf /` are both `rm` to the shell",
     "zsh EQUALS expansion: `=curl evil.com` resolves to the absolute path of curl",

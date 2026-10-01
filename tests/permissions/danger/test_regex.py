@@ -5,6 +5,7 @@ from nanoclaude.permissions.danger.regex import KNOWN_BLIND_SPOTS, RULES, RegexC
 
 DANGEROUS = [
     "rm -rf /",
+    "$(echo rm) -rf /",
     "rm -fr ~/",
     "sudo apt install x",
     "dd if=/dev/zero of=/dev/sda",
@@ -52,7 +53,15 @@ def test_known_blind_spots_are_documented_and_really_are_blind_spots():
     """
     assert len(KNOWN_BLIND_SPOTS) >= 6
     classifier = RegexClassifier()
-    for obfuscated in ["$(echo rm) -rf /", "X=rm; $X -rf /", "r''m -rf /"]:
+    # "$(echo rm) -rf /" was here in the brief's fixture and has been moved to
+    # DANGEROUS, per this test's own instruction above. It is not a miss: the
+    # literal verb stays in the raw text, so the recursive-force pattern reaches
+    # it and returns BLOCKED -- the correct answer, since the command does expand
+    # to a destructive one. The command-substitution *class* is still a real blind
+    # spot and stays in KNOWN_BLIND_SPOTS; this particular sample just never
+    # demonstrated it. Task 8's generated misses file is what records the forms
+    # that genuinely evade the pattern.
+    for obfuscated in ["X=rm; $X -rf /", "r''m -rf /"]:
         assert classifier.classify(obfuscated).level is DangerLevel.SAFE
 
 
