@@ -45,17 +45,7 @@ class GlobTool:
     ) -> PermissionRequest:
         base = arguments.get("path")
         paths = (ctx.resolve(base),) if isinstance(base, str) and base else ()
-        # Not require_str: the generic registry test (test_registry.py) calls
-        # permission_request on every path-taking tool with only {"path": ...},
-        # to pin that the path argument alone gets resolved. pattern is this
-        # tool's own required argument (enforced by SCHEMA and, again, by
-        # run()'s require_str below) but has nothing to do with that contract,
-        # so a request missing it here should describe an empty subject rather
-        # than raise -- raising belongs to run(), where an actually malformed
-        # call is executed rather than merely described.
-        pattern = arguments.get("pattern")
-        subject = pattern if isinstance(pattern, str) else ""
-        return PermissionRequest(self.name, subject, paths)
+        return PermissionRequest(self.name, require_str(arguments, "pattern"), paths)
 
     async def run(
         self, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]

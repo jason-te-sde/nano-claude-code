@@ -4,6 +4,7 @@ from typing import Never
 
 import pytest
 
+from nanoclaude.tools.base import ToolArgumentError
 from nanoclaude.tools.grep import GrepTool
 
 EXPECTED_DESCRIPTION = """Search file contents with a regular expression.
@@ -72,6 +73,13 @@ def test_grep_is_read_only_and_needs_no_paths_resolved(ctx):
     assert GrepTool().read_only and request.is_write is False
 
 
+def test_permission_request_raises_on_a_missing_pattern(ctx):
+    """See test_glob.py's equivalent: a malformed call must raise here, not be
+    tolerated."""
+    with pytest.raises(ToolArgumentError, match="pattern must be a string"):
+        GrepTool().permission_request(ctx, {})
+
+
 def test_the_permission_request_resolves_a_path_argument_when_given(ctx, tmp_repo):
     request = GrepTool().permission_request(ctx, {"pattern": "hello", "path": "sub"})
     assert request.resolved_paths == (ctx.resolve("sub"),)
@@ -114,6 +122,132 @@ async def test_head_limit_caps_how_many_matches_come_back(ctx, tmp_repo):
     (tmp_repo / "a.py").write_text("hello\n" * 10)
     outcome = await GrepTool().run(ctx, "t1", {"pattern": "hello", "head_limit": 3})
     assert "3 match(es)" in outcome.content
+
+
+async def test_no_separator_between_far_apart_matches_without_context(ctx, tmp_repo):
+    """Without -A/-B/-C, two matches many lines apart are each their own
+    result, not two "groups" -- no `--` belongs between them, however far
+    apart they are (see _format_content's `merging` gate).
+    """
+    (tmp_repo / "a.py").write_text("MATCH_A\n" + "filler\n" * 10 + "MATCH_B\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH"})
+    assert "--" not in outcome.content.splitlines()
+    assert "a.py:1:MATCH_A" in outcome.content
+    assert "a.py:12:MATCH_B" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_dash_a_shows_only_after_context(ctx, tmp_repo, monkeypatch, force_python_fallback):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "a.py").write_text("before\nMATCH\nafter1\nafter2\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-A": 2})
+    assert "a.py:2:MATCH" in outcome.content
+    assert "a.py-3-after1" in outcome.content
+    assert "a.py-4-after2" in outcome.content
+    assert "before" not in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_dash_b_shows_only_before_context(ctx, tmp_repo, monkeypatch, force_python_fallback):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "a.py").write_text("before1\nbefore2\nMATCH\nafter\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-B": 2})
+    assert "a.py-1-before1" in outcome.content
+    assert "a.py-2-before2" in outcome.content
+    assert "a.py:3:MATCH" in outcome.content
+    assert "after" not in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_dash_c_sets_both_sides(ctx, tmp_repo, monkeypatch, force_python_fallback):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "a.py").write_text("before\nMATCH\nafter\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-C": 1})
+    assert "a.py-1-before" in outcome.content
+    assert "a.py:2:MATCH" in outcome.content
+    assert "a.py-3-after" in outcome.content
+
+
+async def test_explicit_dash_b_overrides_dash_c_on_that_side_only(ctx, tmp_repo):
+    (tmp_repo / "a.py").write_text("before\nMATCH\nafter1\nafter2\nafter3\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-C": 3, "-B": 0})
+    assert "before" not in outcome.content
+    assert "a.py:2:MATCH" in outcome.content
+    assert "a.py-3-after1" in outcome.content
+    assert "a.py-4-after2" in outcome.content
+    assert "a.py-5-after3" in outcome.content
+
+
+async def test_explicit_dash_a_overrides_dash_c_on_that_side_only(ctx, tmp_repo):
+    (tmp_repo / "a.py").write_text("before1\nbefore2\nbefore3\nMATCH\nafter\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-C": 3, "-A": 0})
+    assert "after" not in outcome.content
+    assert "a.py-1-before1" in outcome.content
+    assert "a.py-2-before2" in outcome.content
+    assert "a.py-3-before3" in outcome.content
+    assert "a.py:4:MATCH" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_non_adjacent_groups_get_a_separator(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "a.py").write_text("MATCH_A\n" + "filler\n" * 10 + "MATCH_B\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-C": 1})
+    assert "--" in outcome.content.splitlines()
+    assert "a.py:1:MATCH_A" in outcome.content
+    assert "a.py:12:MATCH_B" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_touching_groups_get_no_separator(ctx, tmp_repo, monkeypatch, force_python_fallback):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "a.py").write_text("MATCH_A\nmiddle\nMATCH_B\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-C": 1})
+    assert "--" not in outcome.content.splitlines()
+
+
+async def test_files_mode_ignores_context(ctx, tmp_repo):
+    (tmp_repo / "a.py").write_text("before\nMATCH\nafter\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-C": 1, "output_mode": "files"})
+    assert outcome.content.count("a.py") == 1
+    assert "before" not in outcome.content
+    assert "after" not in outcome.content
+
+
+async def test_count_mode_ignores_context(ctx, tmp_repo):
+    (tmp_repo / "a.py").write_text("before\nMATCH\nafter\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-C": 1, "output_mode": "count"})
+    assert "a.py: 1" in outcome.content
+
+
+async def test_head_limit_counts_matches_not_context_lines(ctx, tmp_repo):
+    """head_limit still counts matches (see search.py's _apply_match_limit):
+    a limit of 1 does not cut a single match's own surrounding context short,
+    it only stops a *second* match's group from starting.
+    """
+    (tmp_repo / "a.py").write_text("MATCH_A\nl2\nl3\nl4\nl5\nMATCH_B\nl7\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "MATCH", "-C": 1, "head_limit": 1})
+    assert "1 match(es)" in outcome.content
+    assert "a.py-2-l2" in outcome.content
+    assert "MATCH_B" not in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_context_lines_never_come_from_a_secret_file(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / ".env").write_text(
+        "before\nDATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod\nafter\n"
+    )
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "DATABASE_URL", "-C": 1})
+    assert not outcome.is_error
+    assert ".env" not in outcome.content
+    assert "hunter2" not in outcome.content
+    assert "before" not in outcome.content
+    assert "after" not in outcome.content
 
 
 async def test_no_matches_says_so(ctx, tmp_repo):

@@ -44,6 +44,9 @@ SCHEMA: Mapping[str, Any] = {
         "glob": {"type": "string"},
         "output_mode": {"type": "string", "enum": ["content", "files", "count"]},
         "-i": {"type": "boolean"},
+        "-A": {"type": "integer", "minimum": 0},
+        "-B": {"type": "integer", "minimum": 0},
+        "-C": {"type": "integer", "minimum": 0},
         "head_limit": {"type": "integer", "minimum": 1},
     },
     "required": ["pattern"],
@@ -63,10 +66,7 @@ class GrepTool:
     ) -> PermissionRequest:
         base = arguments.get("path")
         paths = (ctx.resolve(base),) if isinstance(base, str) and base else ()
-        # See glob.py's permission_request for why this is not require_str.
-        pattern = arguments.get("pattern")
-        subject = pattern if isinstance(pattern, str) else ""
-        return PermissionRequest(self.name, subject, paths)
+        return PermissionRequest(self.name, require_str(arguments, "pattern"), paths)
 
     async def run(
         self, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
@@ -75,7 +75,11 @@ class GrepTool:
         base = arguments.get("path")
         root = ctx.resolve(base) if isinstance(base, str) and base else ctx.root
         mode = arguments.get("output_mode", "content")
+        # head_limit counts matches, not lines: it caps how many matches are
+        # found (search.py's _apply_match_limit), and a kept match's own
+        # context is never separately capped or cut off partway through.
         limit = optional_int(arguments, "head_limit", 200, minimum=1)
+        before, after = self._resolve_context(arguments, mode)
 
         try:
             re.compile(pattern)
@@ -88,6 +92,8 @@ class GrepTool:
                 glob=arguments.get("glob"),
                 ignore_case=bool(arguments.get("-i", False)),
                 limit=limit,
+                before=before,
+                after=after,
             )
         except RuntimeError as exc:
             return failed(call_id, f"search failed: {exc}")
@@ -97,23 +103,65 @@ class GrepTool:
         if not matches:
             return ok(call_id, f"No matches for {pattern}")
 
+        match_count = sum(1 for m in matches if not m.is_context)
         if mode == "files":
             body = "\n".join(sorted({ctx.display(m.path) for m in matches}))
         elif mode == "count":
+            # before/after are forced to 0 above for this mode, so every
+            # entry here is a real match; nothing to exclude.
             counts = Counter(ctx.display(m.path) for m in matches)
             body = "\n".join(f"{path}: {n}" for path, n in counts.most_common())
         else:
-            body = "\n".join(
-                f"{ctx.display(m.path)}:{m.line_no}: {m.line.strip()}" for m in matches
-            )
+            body = self._format_content(ctx, matches, merging=bool(before or after))
         redacted, _ = ctx.redactor.scrub(body)
-        return ok(call_id, f"{len(matches)} match(es)\n{redacted}")
+        return ok(call_id, f"{match_count} match(es)\n{redacted}")
+
+    @staticmethod
+    def _resolve_context(arguments: Mapping[str, Any], mode: str) -> tuple[int, int]:
+        """-C sets both sides; an explicit -A or -B overrides that side (its
+        presence in `arguments`, not its truthiness, is what "explicit" means,
+        so an explicit `-B: 0` does override a nonzero -C). files and count
+        modes ignore context entirely -- -A/-B/-C are still validated (a
+        malformed value is still an error in those modes), just not acted on.
+        """
+        around = optional_int(arguments, "-C", 0, minimum=0)
+        before = optional_int(arguments, "-B", around, minimum=0)
+        after = optional_int(arguments, "-A", around, minimum=0)
+        if mode != "content":
+            return 0, 0
+        return before, after
+
+    @staticmethod
+    def _format_content(ctx: ToolContext, matches: list[Match], *, merging: bool) -> str:
+        """`path:N:line` for a match, `path-N-line` for context -- ripgrep's own
+        convention for ``--no-heading --line-number``. A `--` separator marks a
+        break between groups, where a group is a run of contiguous line numbers
+        in one file; crossing into a different file always counts as a break.
+        Only applied when context was actually requested (`merging`): with no
+        context, every match is its own result and no separator belongs
+        between two of them, however far apart they are in the file.
+        """
+        lines: list[str] = []
+        previous: tuple[str, int] | None = None
+        for m in matches:
+            contiguous = (
+                previous is not None and previous[0] == m.path and m.line_no == previous[1] + 1
+            )
+            if merging and previous is not None and not contiguous:
+                lines.append("--")
+            display = ctx.display(m.path)
+            sep = "-" if m.is_context else ":"
+            lines.append(f"{display}{sep}{m.line_no}{sep}{m.line.strip()}")
+            previous = (m.path, m.line_no)
+        return "\n".join(lines)
 
     @staticmethod
     def _drop_secret_files(ctx: ToolContext, matches: list[Match]) -> list[Match]:
         """Requirement (added 2026-10-01, task-14-brief.md): a credentials-shaped
         file discovered while walking the tree must not have its contents
-        surfaced, on either search backend, unless the policy explicitly opts in.
+        surfaced, on either search backend, unless the policy explicitly opts
+        in. Applies to a context line exactly as it does to a match: both carry
+        the same path, and is_secret_path is keyed on the path alone.
         """
         if ctx.policy.allow_secrets:
             return matches

@@ -1,3 +1,6 @@
+import pytest
+
+from nanoclaude.tools.base import ToolArgumentError
 from nanoclaude.tools.glob import GlobTool
 from nanoclaude.tools.search import DEFAULT_LIMIT
 
@@ -23,6 +26,18 @@ async def test_no_matches_says_so_rather_than_returning_nothing(ctx):
 def test_glob_is_read_only_and_needs_no_paths_resolved(ctx):
     request = GlobTool().permission_request(ctx, {"pattern": "**/*.py"})
     assert GlobTool().read_only and request.is_write is False
+
+
+def test_permission_request_raises_on_a_missing_pattern(ctx):
+    """A malformed call must raise here, not be tolerated: the dispatch loop's
+    first phase is what turns ToolArgumentError into a clean refusal, the same
+    way Read's and Edit's require_str-based permission_request already do
+    (test_edit.py's test_a_non_string_path_argument_raises_before_any_file_access).
+    The registry-wide test (test_registry.py) supplies a valid call instead of
+    relying on this method tolerating an incomplete one.
+    """
+    with pytest.raises(ToolArgumentError, match="pattern must be a string"):
+        GlobTool().permission_request(ctx, {})
 
 
 async def test_a_path_argument_limits_the_search_to_a_subdirectory(ctx, tmp_repo):

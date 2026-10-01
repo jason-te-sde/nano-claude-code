@@ -201,3 +201,115 @@ def test_search_falls_back_to_python_when_ripgrep_is_unavailable(monkeypatch, co
     monkeypatch.setattr(search_module, "python_search", fake_python)
     search_module.search("x", root=str(corpus), limit=10)
     assert used == ["py"]
+
+
+def test_match_is_context_defaults_to_false_so_old_call_sites_are_unchanged():
+    assert Match("p", 1, "line").is_context is False
+
+
+#: Context-aware behavior must agree between both backends. "ripgrep" is
+#: skipped where rg is not on PATH; "python-fallback" is the other half.
+CONTEXT_BACKENDS = [
+    pytest.param(
+        ripgrep_search,
+        marks=pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not on PATH"),
+        id="ripgrep",
+    ),
+    pytest.param(python_search, id="python-fallback"),
+]
+
+
+@pytest.mark.parametrize("backend", CONTEXT_BACKENDS)
+def test_context_before_only(backend, tmp_repo):
+    (tmp_repo / "a.py").write_text("line1\nline2\nMATCH\nline4\nline5\n")
+    matches = backend("MATCH", root=str(tmp_repo), glob="*.py", limit=10, before=2, after=0)
+    assert [(m.line_no, m.is_context) for m in matches] == [(1, True), (2, True), (3, False)]
+
+
+@pytest.mark.parametrize("backend", CONTEXT_BACKENDS)
+def test_context_after_only(backend, tmp_repo):
+    (tmp_repo / "a.py").write_text("line1\nline2\nMATCH\nline4\nline5\n")
+    matches = backend("MATCH", root=str(tmp_repo), glob="*.py", limit=10, before=0, after=2)
+    assert [(m.line_no, m.is_context) for m in matches] == [(3, False), (4, True), (5, True)]
+
+
+@pytest.mark.parametrize("backend", CONTEXT_BACKENDS)
+def test_context_both_sides(backend, tmp_repo):
+    (tmp_repo / "a.py").write_text("line1\nline2\nMATCH\nline4\nline5\n")
+    matches = backend("MATCH", root=str(tmp_repo), glob="*.py", limit=10, before=1, after=1)
+    assert [(m.line_no, m.is_context) for m in matches] == [(2, True), (3, False), (4, True)]
+
+
+@pytest.mark.parametrize("backend", CONTEXT_BACKENDS)
+def test_overlapping_windows_merge_without_duplicate_lines(backend, tmp_repo):
+    """MATCH_A (line 2) and MATCH_B (line 4), before=after=2: windows (1,4) and
+    (2,5) overlap and must merge into one (1,5) run with each line exactly once,
+    and the line that is itself MATCH_B must stay tagged as a match, not be
+    demoted to context merely because it also falls inside MATCH_A's window.
+    """
+    (tmp_repo / "a.py").write_text("l1\nMATCH_A\nl3\nMATCH_B\nl5\n")
+    matches = backend("MATCH", root=str(tmp_repo), glob="*.py", limit=10, before=2, after=2)
+    assert [(m.line_no, m.is_context) for m in matches] == [
+        (1, True),
+        (2, False),
+        (3, True),
+        (4, False),
+        (5, True),
+    ]
+    assert len({m.line_no for m in matches}) == len(matches), "a line was printed twice"
+
+
+@pytest.mark.parametrize("backend", CONTEXT_BACKENDS)
+def test_windows_are_clipped_at_the_start_of_a_file(backend, tmp_repo):
+    (tmp_repo / "a.py").write_text("MATCH\nline2\n")
+    matches = backend("MATCH", root=str(tmp_repo), glob="*.py", limit=10, before=5, after=0)
+    assert [m.line_no for m in matches] == [1]
+
+
+@pytest.mark.parametrize("backend", CONTEXT_BACKENDS)
+def test_windows_are_clipped_at_the_end_of_a_file(backend, tmp_repo):
+    (tmp_repo / "a.py").write_text("line1\nMATCH\n")
+    matches = backend("MATCH", root=str(tmp_repo), glob="*.py", limit=10, before=0, after=5)
+    assert [m.line_no for m in matches] == [2]
+
+
+@pytest.mark.parametrize("backend", CONTEXT_BACKENDS)
+def test_the_match_limit_keeps_a_whole_group_intact_when_context_is_requested(backend, tmp_repo):
+    """head_limit counts matches, not lines (see grep.py's _apply_match_limit):
+    once the limit-th match's group has started, that whole group -- including
+    a second match merged into it by an overlapping window -- is still emitted
+    in full, and only the *next* group is dropped. This is what lets a match's
+    own context never be printed partway through.
+    """
+    (tmp_repo / "a.py").write_text("l1\nMATCH_A\nl3\nMATCH_B\nl5\nl6\nl7\nl8\nMATCH_C\nl10\n")
+    matches = backend("MATCH", root=str(tmp_repo), glob="*.py", limit=1, before=1, after=1)
+    assert [m.line_no for m in matches] == [1, 2, 3, 4, 5]
+    assert sum(1 for m in matches if not m.is_context) == 2
+
+
+@pytest.mark.parametrize("backend", CONTEXT_BACKENDS)
+def test_the_match_limit_without_context_is_an_exact_cutoff(backend, tmp_repo):
+    """The no-context case (before=after=0) must still cut off at exactly
+    `limit` matches, even when matches sit on consecutive lines -- two adjacent
+    matching lines must not be treated as one "group" when no context was ever
+    requested, which is exactly what the regression below pins.
+    """
+    (tmp_repo / "a.py").write_text("hello\n" * 10)
+    matches = backend("hello", root=str(tmp_repo), glob="*.py", limit=3, before=0, after=0)
+    assert len(matches) == 3
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not on PATH")
+def test_both_backends_produce_identical_context_output(tmp_repo):
+    (tmp_repo / "a.py").write_text("l1\nMATCH_A\nl3\nMATCH_B\nl5\nl6\nl7\nl8\nMATCH_C\nl10\n")
+    rg_matches = ripgrep_search(
+        "MATCH", root=str(tmp_repo), glob="*.py", limit=10, before=1, after=1
+    )
+    py_matches = python_search(
+        "MATCH", root=str(tmp_repo), glob="*.py", limit=10, before=1, after=1
+    )
+
+    def as_tuples(matches: list[Match]) -> list[tuple[int, str, bool]]:
+        return [(m.line_no, m.line, m.is_context) for m in matches]
+
+    assert as_tuples(rg_matches) == as_tuples(py_matches)

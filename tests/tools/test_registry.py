@@ -109,17 +109,33 @@ def test_every_path_taking_tool_resolves_its_path_into_resolved_paths(ctx, tmp_r
     covering all of them without being revisited -- the final assert makes it
     fail loudly, rather than vacuously pass, should some future registry drop
     every path-taking tool.
+
+    The call made on each tool is a *valid* one, not a minimal one: every other
+    `required` string property (Write's `content`, Glob's and Grep's `pattern`)
+    gets a placeholder value too, built from the tool's own schema rather than
+    hand-listed per tool. permission_request is expected to raise on a genuinely
+    missing required argument (see test_glob.py's and test_grep.py's own
+    "raises on a missing pattern" tests, mirroring test_edit.py's), so this test
+    must not be the thing supplying that missing argument.
     """
     (tmp_repo / "a.py").write_text("x = 1\n")
     expected = ctx.resolve("a.py")
 
     checked = 0
     for tool in default_registry():
-        properties = tool.spec().schema.get("properties", {})
+        schema = tool.spec().schema
+        properties = schema.get("properties", {})
         if not isinstance(properties, Mapping) or "path" not in properties:
             continue
         checked += 1
-        request = tool.permission_request(ctx, {"path": "a.py"})
+        arguments: dict[str, Any] = {"path": "a.py"}
+        for name in schema.get("required", []):
+            if name == "path":
+                continue
+            prop = properties.get(name, {})
+            if isinstance(prop, Mapping) and prop.get("type") == "string":
+                arguments[name] = "*"
+        request = tool.permission_request(ctx, arguments)
         assert expected in request.resolved_paths, (
             f"{tool.name}.permission_request() did not resolve its path "
             "argument into resolved_paths"
