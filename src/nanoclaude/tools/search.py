@@ -26,6 +26,11 @@ from pathspec.pattern import Pattern as PathspecPattern
 from nanoclaude.permissions.rules import GLOB_PATTERN_FACTORY
 
 BINARY_SNIFF_BYTES = 8192
+#: Files larger than this are not searched, by either backend. The fallback
+#: reads each file whole, so without a cap one large data file would make a
+#: search slow and memory-hungry; ripgrep is given the same limit so the two
+#: backends keep answering identically.
+MAX_SEARCH_BYTES = 10 * 1024 * 1024
 DEFAULT_LIMIT = 200
 
 
@@ -174,6 +179,8 @@ def ripgrep_search(
         "--line-number",
         "--no-heading",
         "--hidden",
+        "--max-filesize",
+        str(MAX_SEARCH_BYTES),
         "--glob",
         "!/.git/",
     ]
@@ -226,6 +233,8 @@ def python_search(
     matches: list[Match] = []
     for path in sorted(walk_files(root, pattern=glob and f"**/{glob}", limit=10_000)):
         try:
+            if Path(path).stat().st_size > MAX_SEARCH_BYTES:
+                continue
             data = Path(path).read_bytes()
         except OSError:
             continue

@@ -313,3 +313,22 @@ def test_both_backends_produce_identical_context_output(tmp_repo):
         return [(m.line_no, m.line, m.is_context) for m in matches]
 
     assert as_tuples(rg_matches) == as_tuples(py_matches)
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            ripgrep_search,
+            marks=pytest.mark.skipif(not ripgrep_available(), reason="ripgrep not on PATH"),
+        ),
+        python_search,
+    ],
+)
+def test_both_backends_skip_files_over_the_size_cap(backend, corpus, monkeypatch):
+    monkeypatch.setattr("nanoclaude.tools.search.MAX_SEARCH_BYTES", 64)
+    (corpus / "big.txt").write_text("needle\n" + "x" * 100 + "\n")
+    (corpus / "small.txt").write_text("needle\n")
+    found = {Path(m.path).name for m in backend("needle", root=str(corpus), glob=None, limit=100)}
+    assert "small.txt" in found
+    assert "big.txt" not in found
