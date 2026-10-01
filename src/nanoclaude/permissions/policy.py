@@ -14,12 +14,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
-
-import pathspec
+from pathlib import PurePosixPath
 
 from nanoclaude.permissions.danger import DangerLevel, DangerVerdict
-from nanoclaude.permissions.rules import RuleSet
-from nanoclaude.permissions.sandbox import Sandbox
+from nanoclaude.permissions.rules import RuleSet, glob_matches_any
+from nanoclaude.permissions.sandbox import Sandbox, is_within
 
 #: Tools that cannot change anything, and so never need confirming on their own.
 READ_ONLY_TOOLS = frozenset({"Read", "Grep", "Glob"})
@@ -65,6 +64,17 @@ class PermissionResult:
 class Grants:
     tools: frozenset[str] = field(default_factory=frozenset)
 
+    def __post_init__(self) -> None:
+        # Normalized rather than merely typed: tools: frozenset[str] is
+        # hashable only if a frozenset is actually what ends up stored there,
+        # and nothing before this stopped a caller from passing a plain,
+        # unhashable set instead -- frozen=True's generated __hash__ exists
+        # regardless of what the field holds, so isinstance(x, Hashable)
+        # would still report True, and only calling hash(x) would raise,
+        # naming "set" rather than this class. Mirrors Sandbox.__post_init__
+        # (sandbox.py), which normalizes its own roots the same way.
+        object.__setattr__(self, "tools", frozenset(self.tools))
+
     def with_tool(self, tool: str) -> Grants:
         return replace(self, tools=self.tools | {tool})
 
@@ -78,10 +88,31 @@ class Policy:
     allow_secrets: bool = False
 
     def relative(self, path: str) -> str:
+        # is_within, not str.startswith: a sibling directory that merely
+        # shares a root's string prefix -- "/psrc" against root "/p" -- is
+        # nowhere near inside it (sandbox.py's is_within docstring names this
+        # exact hazard for the same reason). str.startswith would chop "/p"
+        # off "/psrc/evil.py" and hand "src/evil.py" to the rule matcher as a
+        # plausible in-root relative path, which a rule like
+        # ``Read(src/**)`` would then wrongly allow.
+        #
+        # Non-absolute subjects ("npm test", "*.py" -- Bash commands and Glob
+        # patterns are not paths) are returned unchanged: is_within requires
+        # both sides absolute and raises otherwise, and there is no root to
+        # be relative to regardless.
+        candidate = PurePosixPath(path)
+        if not candidate.is_absolute():
+            return path
         for root in self.sandbox.roots:
-            if path.startswith(root):
-                return path[len(root) :].lstrip("/")
-        return path.lstrip("/")
+            if is_within(root, path):
+                return str(candidate.relative_to(root))
+        # Outside every root: returned unchanged rather than lstrip("/")-ed.
+        # A path that is not inside any root should not produce a fabricated
+        # relative candidate at all -- lstrip("/") on "/etc/passwd" yields
+        # "etc/passwd", which is exactly the shape a rule like
+        # ``Read(etc/**)`` would wrongly match, for a path nowhere near any
+        # sandboxed root.
+        return path
 
 
 #: evaluate()'s default when a caller has not granted anything yet this
@@ -106,12 +137,16 @@ def evaluate(
     # 2. secret.path
     if not policy.allow_secrets:
         for path in request.resolved_paths:
-            if _matches_any(policy.secret_paths, (path, policy.relative(path))):
+            if glob_matches_any(policy.secret_paths, (path, policy.relative(path))):
                 return PermissionResult(
                     Decision.DENY,
                     "secret.path",
                     f"{path} looks like a credentials file and is never read. "
-                    "Pass --allow-secrets, or add an allow rule for this exact path.",
+                    # Row 2 runs six rows before row 8 (rule.allow): no allow
+                    # rule, however exact, can ever reach this request. Only
+                    # --allow-secrets (this same row's own guard) or removing
+                    # the path from secret_paths changes the outcome.
+                    "Pass --allow-secrets to override.",
                 )
 
     # 3. sandbox.outside-root / sandbox.symlink-escape
@@ -123,11 +158,24 @@ def evaluate(
         )
         if violation is not None:
             roots = ", ".join(policy.sandbox.roots)
-            return PermissionResult(
-                Decision.DENY,
-                violation,
-                f"{path} is outside the working directory ({roots}). Use --add-dir to widen it.",
-            )
+            # Branched on violation, not one message for both ids: outside-root
+            # means the path itself is nowhere near any root, and --add-dir is
+            # the remedy. symlink-escape means the opposite -- the path *is*
+            # inside a root, only its resolved parent is not -- so "is outside
+            # the working directory" would be false and --add-dir would not
+            # help; the thing to do is inspect the symlink itself.
+            if violation == "sandbox.symlink-escape":
+                message = (
+                    f"{path} is inside the working directory ({roots}), but its "
+                    "containing directory resolves outside it once symlinks are "
+                    "followed. This looks like a symlink planted to escape the "
+                    "sandbox on write; inspect it by hand before writing here."
+                )
+            else:
+                message = (
+                    f"{path} is outside the working directory ({roots}). Use --add-dir to widen it."
+                )
+            return PermissionResult(Decision.DENY, violation, message)
 
     # 4. bash.dangerous / bash.unparseable
     if request.danger is not None:
@@ -135,7 +183,9 @@ def evaluate(
             return PermissionResult(
                 Decision.DENY,
                 "bash.dangerous",
-                f"refused by the {request.danger.classifier} classifier: {request.danger.reason}",
+                f"refused by the {request.danger.classifier} classifier: "
+                f"{request.danger.reason}. Rewrite the command to avoid the "
+                "flagged pattern, or run it yourself outside the agent.",
             )
         if request.danger.level is DangerLevel.UNPARSEABLE:
             return PermissionResult(
@@ -187,10 +237,3 @@ def evaluate(
     return PermissionResult(
         Decision.ASK, "default.ask", f"{request.tool} changes state and has no matching rule"
     )
-
-
-def _matches_any(patterns: tuple[str, ...], candidates: tuple[str, ...]) -> bool:
-    if not patterns:
-        return False
-    spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
-    return any(spec.match_file(c.lstrip("/")) or spec.match_file(c) for c in candidates)

@@ -9,7 +9,26 @@ the two dataclasses declared here are hashable.
 import re
 from collections.abc import Hashable
 
-from nanoclaude.permissions.danger import DangerLevel, DangerRule, DangerVerdict
+import pytest
+
+from nanoclaude.permissions.danger import DangerClassifier, DangerLevel, DangerRule, DangerVerdict
+
+
+class _StubClassifier:
+    """A minimal conforming DangerClassifier, for the two tests below only.
+
+    Not a classifier implementation for Tasks 7-8 to build on -- it exists
+    solely to give DangerClassifier, named in the brief's Produces list with
+    no test of its own, an actual object to check isinstance/issubclass
+    against.
+    """
+
+    @property
+    def name(self) -> str:
+        return "stub"
+
+    def classify(self, _command: str) -> DangerVerdict:
+        return DangerVerdict(DangerLevel.SAFE)
 
 
 def test_danger_rule_is_hashable():
@@ -48,3 +67,20 @@ def test_danger_verdict_reason_prefers_detail_over_matches():
 def test_danger_verdict_reason_names_no_pattern_matched_when_empty():
     verdict = DangerVerdict(DangerLevel.SAFE)
     assert verdict.reason == "no dangerous pattern matched"
+
+
+def test_danger_classifier_isinstance_check_works_on_a_conforming_stub():
+    assert isinstance(_StubClassifier(), DangerClassifier)
+
+
+def test_danger_classifier_issubclass_check_is_unusable_because_name_is_a_property():
+    """A documented limitation, not a defect to fix: @runtime_checkable only
+    supports isinstance() against an actual instance when a Protocol has a
+    non-method member -- here, the `name` property. issubclass() against the
+    class itself raises instead of returning an answer either way.
+    """
+    with pytest.raises(TypeError, match="non-method members"):
+        # mypy flags this call too, correctly predicting the exact runtime
+        # TypeError this test exists to pin -- the ignore is for that static
+        # finding, not a disagreement with it.
+        issubclass(_StubClassifier, DangerClassifier)  # type: ignore[misc]

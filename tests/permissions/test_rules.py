@@ -46,6 +46,22 @@ def test_a_lone_closing_paren_with_no_opening_one_is_also_rejected():
         Rule.parse("Bash)")
 
 
+def test_an_empty_subject_is_rejected_at_parse_time():
+    """Read() parses without error and silently matches nothing, ever.
+
+    That is the dangerous failure direction for a deny rule: a user who
+    writes one believes it refuses something, and it never fires.
+    """
+    with pytest.raises(ValueError, match="empty subject"):
+        Rule.parse("Read()")
+
+
+def test_an_empty_prefix_subject_is_also_rejected():
+    """Same hazard, reached through the :* prefix form instead: Read(:*)."""
+    with pytest.raises(ValueError, match="empty subject"):
+        Rule.parse("Read(:*)")
+
+
 def test_ruleset_returns_the_first_matching_rule():
     rules = RuleSet.build(allow=["Read", "Glob"], ask=["Bash"], deny=["Read(**/.env*)"])
     assert rules.first_match("deny", "Read", "/p/.env", ".env") is not None

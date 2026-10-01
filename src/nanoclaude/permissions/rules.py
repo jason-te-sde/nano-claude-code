@@ -15,12 +15,24 @@ user can write either and be understood.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 from typing import Literal
 
 import pathspec
+from pathspec.pattern import Pattern as PathspecPattern
 
 RuleKind = Literal["allow", "ask", "deny"]
+
+#: The pathspec pattern-matching dialect every glob in this project uses, named
+#: once rather than repeated as a literal at each call site. pathspec >=1.0
+#: renamed this factory to ``"gitignore"`` and turned uses of this name into a
+#: DeprecationWarning (narrowly silenced in pyproject.toml's filterwarnings --
+#: see that entry's comment); migrating to the new name is a pending decision
+#: for the final review, alongside raising the pathspec floor, and the point of
+#: this constant is to make that a one-line change instead of a search across
+#: every file that matches a glob.
+GLOB_PATTERN_FACTORY = "gitwildmatch"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,8 +53,21 @@ class Rule:
             raise ValueError(f"unbalanced parentheses in rule {text!r}")
         tool, _, rest = raw.partition("(")
         subject = rest[:-1]
+        # Tool() parses without error and silently matches nothing, ever --
+        # glob_matches_any on an empty pattern compiles to a spec with no
+        # patterns at all, since a blank line is not a pattern in gitignore
+        # syntax. For an allow or ask rule that is merely useless; for a deny
+        # rule it is the dangerous direction, a rule a user believes is
+        # refusing something that in fact never fires. Rejected here
+        # alongside the unbalanced-paren cases rather than left to be
+        # discovered at match time.
+        if not subject:
+            raise ValueError(f"empty subject in rule {text!r}")
         if subject.endswith(":*"):
-            return Rule(tool.strip(), subject[:-2], True, raw)
+            prefix = subject[:-2]
+            if not prefix:
+                raise ValueError(f"empty subject in rule {text!r}")
+            return Rule(tool.strip(), prefix, True, raw)
         return Rule(tool.strip(), subject, False, raw)
 
     def matches(self, tool: str, subject: str, relative_subject: str) -> bool:
@@ -54,7 +79,7 @@ class Rule:
             return _prefix_match(subject, self.subject)
         if subject == self.subject:
             return True
-        return _glob_match(self.subject, (subject, relative_subject))
+        return glob_matches_any((self.subject,), (subject, relative_subject))
 
 
 def _prefix_match(subject: str, prefix: str) -> bool:
@@ -65,11 +90,32 @@ def _prefix_match(subject: str, prefix: str) -> bool:
     return rest == "" or rest[0].isspace()
 
 
-def _glob_match(pattern: str, candidates: tuple[str, ...]) -> bool:
-    spec = pathspec.PathSpec.from_lines("gitwildmatch", [pattern])
-    return any(spec.match_file(candidate.lstrip("/")) for candidate in candidates) or any(
-        spec.match_file(candidate) for candidate in candidates
-    )
+@functools.cache
+def _compiled(patterns: tuple[str, ...]) -> pathspec.PathSpec[PathspecPattern]:
+    # Cached rather than recompiled per call: both RuleSet and Policy are
+    # frozen, so the set of distinct ``patterns`` tuples a process will ever
+    # ask for is fixed once they are built -- typically once per CLI session
+    # -- and compiling the same gitignore-style spec on every single
+    # evaluate() call was pure waste. Keyed on ``patterns`` alone, not on the
+    # candidates being matched, since the same compiled spec is reused across
+    # every candidate checked against it.
+    return pathspec.PathSpec.from_lines(GLOB_PATTERN_FACTORY, patterns)
+
+
+def glob_matches_any(patterns: tuple[str, ...], candidates: tuple[str, ...]) -> bool:
+    """True if any of ``candidates`` matches any of ``patterns``.
+
+    Shared by :meth:`Rule.matches` (one pattern, a rule's own subject) and
+    policy.py's secret-path check (many patterns, ``Policy.secret_paths``) --
+    the one place this project turns a list of gitignore-style globs into a
+    yes/no answer. Each candidate is tried both as given and with a leading
+    slash stripped, so a caller working with absolute and root-relative
+    spellings of the same path does not need to pick one.
+    """
+    if not patterns:
+        return False
+    spec = _compiled(patterns)
+    return any(spec.match_file(c.lstrip("/")) or spec.match_file(c) for c in candidates)
 
 
 @dataclass(frozen=True, slots=True)

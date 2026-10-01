@@ -1,5 +1,7 @@
 from typing import Any
 
+import pytest
+
 from nanoclaude.permissions.danger import DangerLevel, DangerVerdict
 from nanoclaude.permissions.policy import (
     Decision,
@@ -47,11 +49,63 @@ def test_a_deny_rule_beats_everything():
 def test_secret_paths_are_denied_before_the_sandbox_is_even_consulted():
     result = evaluate(req(subject="/p/.env", paths=("/p/.env",)), policy(), Grants())
     assert (result.decision, result.rule) == (Decision.DENY, "secret.path")
+    # Row 2 runs six rows before row 8 (rule.allow): no allow rule can ever
+    # override it, so the message must not suggest one can.
+    assert "allow rule" not in result.reason
 
 
 def test_outside_the_sandbox_is_denied():
     result = evaluate(req(subject="/etc/passwd", paths=("/etc/passwd",)), policy(), Grants())
     assert result.rule == "sandbox.outside-root"
+
+
+def test_a_sibling_directory_sharing_a_roots_string_prefix_does_not_reach_rule_allow():
+    """Policy.relative used str.startswith, so a sibling like /psrc (sharing
+    the string prefix of root /p without being inside it, the same hazard
+    sandbox.is_within's own docstring names for /tmp/project-evil against
+    /tmp/project) got "/p" chopped off and the rest -- "src/evil.py" --
+    handed to the rule matcher as a plausible in-root relative path, which
+    an allow rule meant for the real root's src/** would then wrongly match.
+
+    Write, not Read: Read is read-only and would fall through to
+    tool.read-only regardless of whether rule.allow fires, which would still
+    prove row 8 is closed but leave the overall decision ambiguous. Write has
+    no such fallback -- the only way this reaches anything but default.ask is
+    if row 8 (wrongly) fires.
+    """
+    p = Policy(Sandbox(("/p",)), RuleSet.build(allow=["Write(src/**)"]))
+    request = PermissionRequest("Write", "/psrc/evil.py", (), True, None)
+    result = evaluate(request, p, Grants())
+    assert result.rule != "rule.allow"
+    assert (result.decision, result.rule) == (Decision.ASK, "default.ask")
+
+
+def test_a_symlink_escape_violation_reaches_evaluate_with_its_own_rule_id(tmp_path):
+    """sandbox.symlink-escape never flowed through evaluate() in any test
+    before this one -- nothing pinned that row 3 passes it through unchanged
+    rather than rewriting it to sandbox.outside-root. Setup mirrors
+    test_check_write_catches_a_symlinked_parent_that_was_never_resolved in
+    test_sandbox.py: a path built by plain string-joining, never passed
+    through Sandbox.resolve(), whose parent directory is a symlink escaping
+    the root -- check_read is fooled (textually inside root); only
+    check_write's own parent re-resolution catches it.
+    """
+    outside = tmp_path.parent / "outside_dir_for_policy_symlink_test"
+    outside.mkdir(exist_ok=True)
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "escape").symlink_to(outside, target_is_directory=True)
+
+    p = Policy(Sandbox((str(root),)), RuleSet.build())
+    target = str(root / "escape" / "new.txt")
+    result = evaluate(PermissionRequest("Write", target, (target,), True, None), p, Grants())
+
+    assert result.rule == "sandbox.symlink-escape"
+    # The message must not be outside-root's -- the path *is* textually
+    # inside the root; only its resolved parent is not -- so "is outside the
+    # working directory" would be false here, and --add-dir is not the fix.
+    assert "is outside the working directory" not in result.reason
+    assert "--add-dir" not in result.reason
 
 
 def test_a_dangerous_command_is_denied():
@@ -88,6 +142,18 @@ def test_bypass_skips_confirmation_but_not_the_hard_denials():
         evaluate(req(tool="Bash", subject="rm -rf /", paths=(), danger=verdict), p, Grants()).rule
         == "bash.dangerous"
     )
+    # Row 1 beats row 6 too. Before this assertion, deny= appeared in exactly
+    # one test (test_a_deny_rule_beats_everything), which runs in DEFAULT mode
+    # with no grants -- rows 2-7 never fire for that request either way, so
+    # row 1 could have been moved anywhere between rows 2 and 7, including
+    # below mode.bypass, and that test alone would stay green.
+    p_bypass_with_deny = policy(
+        mode=PermissionMode.BYPASS, rules=RuleSet.build(deny=["Read(**/secret.txt)"])
+    )
+    denied_under_bypass = evaluate(
+        req(subject="/p/secret.txt", paths=("/p/secret.txt",)), p_bypass_with_deny, Grants()
+    )
+    assert denied_under_bypass.rule == "rule.deny"
 
 
 def test_accept_edits_allows_file_edits_and_still_asks_for_bash():
@@ -105,6 +171,18 @@ def test_a_session_grant_upgrades_ask_to_allow():
     )
     assert (result.decision, result.rule) == (Decision.ALLOW, "grant.session")
 
+    # Row 1 beats row 9 too: a deny rule fires even when the same tool has a
+    # session grant. The grant is for Read specifically -- the tool being
+    # denied -- so that if row 1 were ever moved below row 9, this would
+    # flip to ALLOW via grant.session instead of catching the misordering.
+    p_with_deny = policy(rules=RuleSet.build(deny=["Read(**/secret.txt)"]))
+    denied = evaluate(
+        req(subject="/p/secret.txt", paths=("/p/secret.txt",)),
+        p_with_deny,
+        Grants(frozenset({"Read"})),
+    )
+    assert denied.rule == "rule.deny"
+
 
 def test_a_read_only_tool_with_no_matching_rule_is_still_allowed():
     p = policy(rules=RuleSet.build(ask=["Bash"]))
@@ -119,9 +197,135 @@ def test_anything_unmatched_falls_through_to_ask():
     assert (result.decision, result.rule) == (Decision.ASK, "default.ask")
 
 
-def test_the_reason_always_names_something_actionable():
-    result = evaluate(req(subject="/etc/passwd", paths=("/etc/passwd",)), policy(), Grants())
-    assert "/etc/passwd" in result.reason and ROOT in result.reason
+_REASON_CASES = [
+    pytest.param(
+        lambda: evaluate(
+            req(subject="/p/secret.txt", paths=("/p/secret.txt",)),
+            policy(rules=RuleSet.build(allow=["Read"], deny=["Read(**/secret.txt)"])),
+            Grants(),
+        ),
+        "rule.deny",
+        "Read(**/secret.txt)",
+        id="rule.deny",
+    ),
+    pytest.param(
+        lambda: evaluate(req(subject="/p/.env", paths=("/p/.env",)), policy(), Grants()),
+        "secret.path",
+        "--allow-secrets",
+        id="secret.path",
+    ),
+    pytest.param(
+        lambda: evaluate(req(subject="/etc/passwd", paths=("/etc/passwd",)), policy(), Grants()),
+        "sandbox.outside-root",
+        "--add-dir",
+        id="sandbox.outside-root",
+    ),
+    pytest.param(
+        lambda: evaluate(
+            req(
+                tool="Bash",
+                subject="rm -rf /",
+                paths=(),
+                danger=DangerVerdict(DangerLevel.BLOCKED, ("rm.recursive-force",), "regex"),
+            ),
+            policy(),
+            Grants(),
+        ),
+        "bash.dangerous",
+        "rm.recursive-force",
+        id="bash.dangerous",
+    ),
+    pytest.param(
+        lambda: evaluate(
+            req(
+                tool="Bash",
+                subject="$(",
+                paths=(),
+                danger=DangerVerdict(DangerLevel.UNPARSEABLE, (), "ast"),
+            ),
+            policy(),
+            Grants(),
+        ),
+        "bash.unparseable",
+        "Rewrite",
+        id="bash.unparseable",
+    ),
+    pytest.param(
+        lambda: evaluate(
+            req(tool="Write", is_write=True), policy(mode=PermissionMode.PLAN), Grants()
+        ),
+        "mode.plan-read-only",
+        "exit plan mode",
+        id="mode.plan-read-only",
+    ),
+    pytest.param(
+        lambda: evaluate(
+            req(tool="Bash", subject="ls", paths=()), policy(mode=PermissionMode.BYPASS), Grants()
+        ),
+        "mode.bypass",
+        "disabled",
+        id="mode.bypass",
+    ),
+    pytest.param(
+        lambda: evaluate(
+            req(tool="Edit", is_write=True), policy(mode=PermissionMode.ACCEPT_EDITS), Grants()
+        ),
+        "mode.accept-edits",
+        "auto-approved",
+        id="mode.accept-edits",
+    ),
+    pytest.param(
+        lambda: evaluate(
+            req(tool="Bash", subject="ls", paths=()),
+            policy(rules=RuleSet.build(allow=["Bash"])),
+            Grants(),
+        ),
+        "rule.allow",
+        "allowed by Bash",
+        id="rule.allow",
+    ),
+    pytest.param(
+        lambda: evaluate(
+            req(tool="Bash", subject="ls", paths=()), policy(), Grants(frozenset({"Bash"}))
+        ),
+        "grant.session",
+        "approved for this session",
+        id="grant.session",
+    ),
+    pytest.param(
+        lambda: evaluate(
+            req(tool="Glob", subject="*.py", paths=()),
+            policy(rules=RuleSet.build(ask=["Bash"])),
+            Grants(),
+        ),
+        "tool.read-only",
+        "only reads",
+        id="tool.read-only",
+    ),
+    pytest.param(
+        lambda: evaluate(req(tool="Bash", subject="ls", paths=()), policy(), Grants()),
+        "rule.ask",
+        "requires confirmation",
+        id="rule.ask",
+    ),
+    pytest.param(
+        lambda: evaluate(req(tool="Write", is_write=True), policy(rules=RuleSet.build()), Grants()),
+        "default.ask",
+        "no matching rule",
+        id="default.ask",
+    ),
+]
+
+
+@pytest.mark.parametrize("make_result, expected_rule, fragment", _REASON_CASES)
+def test_the_reason_always_names_something_actionable(make_result, expected_rule, fragment):
+    """Every one of the twelve rows, not just sandbox.outside-root -- the
+    original, single-case form of this test exercised one row in twelve
+    despite its own name's "always".
+    """
+    result = make_result()
+    assert result.rule == expected_rule
+    assert fragment in result.reason
 
 
 # The tests below pin names from the brief's Interfaces -> Produces list, or
@@ -168,13 +372,31 @@ def test_permission_result_is_hashable():
 
 
 def test_grants_is_hashable():
-    # tools: frozenset[str] -- hashable as long as it is actually built as a
-    # frozenset (see test_a_session_grant_upgrades_ask_to_allow, which pins
-    # the one call site here that has to pass a real frozenset rather than a
-    # plain set for exactly this reason).
+    # tools: frozenset[str] -- hashable because __post_init__ normalizes
+    # whatever it is given into a real frozenset (see the next test for the
+    # trap that existed before that normalization).
     one = Grants(frozenset({"Bash"}))
     other = Grants(frozenset({"Bash"}))
     assert hash(one) == hash(other)
+
+
+def test_grants_normalizes_a_plain_set_into_a_hashable_frozenset():
+    """The conditional-hashability trap this task's global constraints name,
+    word for word: Grants({"Bash"}) used to store the plain set unchanged.
+    isinstance(x, Hashable) still reported True -- frozen=True's generated
+    __hash__ exists regardless of what tools actually holds -- and only
+    calling hash(x) raised, naming "set" rather than Grants.
+
+    Grants({"Bash"}) is itself a type mypy --strict correctly refuses for a
+    *typed* caller (tools is declared frozenset[str], and a plain set is a
+    different, unrelated type) -- hence the ignore below. The point of this
+    test is the untyped or dynamically-built caller __post_init__ now
+    protects regardless: Tasks 7-8's session-grant consumers, a config
+    loader, anything that hands Grants a set it built elsewhere.
+    """
+    grants = Grants({"Bash"})  # type: ignore[arg-type]
+    assert isinstance(grants.tools, frozenset)
+    assert hash(grants) == hash(Grants(frozenset({"Bash"})))
 
 
 def test_policy_is_hashable():
@@ -241,4 +463,18 @@ def test_an_explicit_ask_rule_produces_rule_ask():
     made that request fall through to row 12 and nothing noticed.
     """
     result = evaluate(req(tool="Bash", subject="ls", paths=()), policy(), Grants())
+    assert (result.decision, result.rule) == (Decision.ASK, "rule.ask")
+
+
+def test_evaluate_defaults_to_no_grants_when_the_argument_is_omitted():
+    """_NO_GRANTS (evaluate()'s module-level default for its grants
+    parameter) was constructed at import time but never actually exercised
+    as a default anywhere above -- every call passed Grants() explicitly, so
+    line coverage reported it covered only because the assignment statement
+    itself runs at import. Bash has no grant here, so omitting the argument
+    must still fall through to row 11 (rule.ask), not row 9 (grant.session),
+    proving the default really does behave like an empty Grants rather than,
+    say, None or a crash.
+    """
+    result = evaluate(req(tool="Bash", subject="ls", paths=()), policy())
     assert (result.decision, result.rule) == (Decision.ASK, "rule.ask")
