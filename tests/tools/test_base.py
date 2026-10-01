@@ -91,3 +91,9 @@ def test_tool_context_is_declared_unhashable(ctx):
     assert not isinstance(ctx, Hashable)
     with pytest.raises(TypeError, match="ToolContext"):
         hash(ctx)
+
+
+@pytest.mark.parametrize("value", ["fifty", 2.5, None, [1]])
+def test_optional_int_refuses_a_value_that_is_not_an_integer(value):
+    with pytest.raises(ToolArgumentError, match="offset must be an integer, got"):
+        optional_int({"offset": value}, "offset", 1, minimum=1)

@@ -103,3 +103,18 @@ def test_file_snapshot_is_hashable():
     snapshot = FileSnapshot("hi\n", FileStamp("deadbeef", 4, 123))
     assert isinstance(snapshot, Hashable)
     hash(snapshot)  # must not raise
+
+
+def test_stamp_of_a_directory_is_none(tmp_path):
+    assert stamp_of(str(tmp_path)) is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a mode-000 file")
+def test_stamp_of_an_unreadable_file_is_none(tmp_path):
+    target = tmp_path / "locked.txt"
+    target.write_text("x")
+    target.chmod(0)
+    try:
+        assert stamp_of(str(target)) is None
+    finally:
+        target.chmod(0o600)
