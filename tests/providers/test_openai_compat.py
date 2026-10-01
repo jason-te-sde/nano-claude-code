@@ -1,0 +1,595 @@
+import json
+from pathlib import Path
+
+import httpx
+import pytest
+
+from nanoclaude.conversation.transcript import (
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    Transcript,
+    user_text,
+)
+from nanoclaude.providers.base import ModelClient, ModelError, ModelRequest, StopKind, ToolSpec
+from nanoclaude.providers.openai_compat import (
+    ChunkAccumulator,
+    OpenAICompatClient,
+    encode_messages,
+    encode_tools,
+    parse_arguments,
+)
+
+CASSETTES = Path(__file__).resolve().parents[1] / "cassettes"
+
+
+def replay(name: str, *, model: str = "gpt-5") -> ChunkAccumulator:
+    """Decode one cassette straight into a ChunkAccumulator, line by line.
+
+    Each line is either a chunk object (fed to ``.handle()``) or the JSON
+    string ``"[DONE]"``, which carries no information for the accumulator and
+    is skipped -- the same sentinel ``OpenAICompatClient.complete()`` strips
+    before it ever reaches ``.handle()`` on the wire.
+    """
+    accumulator = ChunkAccumulator(model=model)
+    for line in (CASSETTES / name).read_text().splitlines():
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        if payload == "[DONE]":
+            continue
+        accumulator.handle(payload)
+    return accumulator
+
+
+def wire_body(name: str) -> bytes:
+    """Reconstruct the literal SSE wire text a server would have sent.
+
+    This is what lets a cassette be checked against the *real* HTTP-streaming
+    parser, not just against ChunkAccumulator directly: every stored line is
+    turned back into ``data: ...\\n\\n``, including the bare (unquoted)
+    ``[DONE]`` token real servers send, and fed through
+    ``OpenAICompatClient.complete()`` over ``httpx.MockTransport``.
+    """
+    out = []
+    for line in (CASSETTES / name).read_text().splitlines():
+        if not line.strip():
+            continue
+        payload = json.loads(line)
+        text = "[DONE]" if payload == "[DONE]" else json.dumps(payload)
+        out.append(f"data: {text}\n\n")
+    return "".join(out).encode()
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"path": "a.py"}', {"path": "a.py"}),  # the documented shape
+        ({"path": "a.py"}, {"path": "a.py"}),  # already an object
+        ("{}", {}),
+        ("", {}),
+        (None, {}),
+    ],
+)
+def test_arguments_arrive_as_a_string_or_an_object_and_both_work(raw, expected):
+    """Review Focus #2. The spec says string; several endpoints send an object."""
+    assert parse_arguments(raw) == expected
+
+
+def test_arguments_that_are_not_valid_json_are_a_clear_error():
+    with pytest.raises(ModelError, match="not valid JSON"):
+        parse_arguments('{"path": "a.py"')
+
+
+def test_arguments_that_are_neither_a_string_nor_a_mapping_are_a_clear_error():
+    # The branch between the two above: not None/"", not a dict, not a str
+    # either -- an int or a list must not reach json.loads with the wrong type.
+    with pytest.raises(ModelError, match="tool arguments arrived as list"):
+        parse_arguments([1, 2, 3])
+
+
+def test_arguments_that_decode_to_a_non_mapping_are_a_clear_error():
+    # The far side of the JSON-decode guard: valid JSON that is not an object.
+    with pytest.raises(ModelError, match="decoded to list"):
+        parse_arguments("[1, 2, 3]")
+
+
+def test_a_tool_result_becomes_a_tool_role_message_not_a_content_block():
+    transcript = Transcript(
+        (
+            user_text("hi"),
+            Message("assistant", (ToolUseBlock("t1", "Read", {"path": "a"}),)),
+            Message("user", (ToolResultBlock("t1", "1\tx"),)),
+        )
+    )
+    encoded = encode_messages(transcript)
+    assert encoded[1]["tool_calls"][0]["function"]["name"] == "Read"
+    # The other half of "content: text or None" -- a call with no text at all
+    # must not become an empty-string content field.
+    assert encoded[1]["content"] is None
+    assert encoded[2]["role"] == "tool"
+    assert encoded[2]["tool_call_id"] == "t1"
+
+
+def test_an_assistant_turn_with_text_and_a_call_keeps_both():
+    transcript = Transcript(
+        (
+            user_text("hi"),
+            Message("assistant", (TextBlock("looking"), ToolUseBlock("t1", "Read", {}))),
+        )
+    )
+    encoded = encode_messages(transcript)
+    assert encoded[1]["content"] == "looking"
+    assert len(encoded[1]["tool_calls"]) == 1
+
+
+def test_an_assistant_turn_with_no_tool_calls_omits_the_key():
+    # The other half of "if calls:" -- a plain-text reply must not grow an
+    # empty tool_calls list that the next request would send back as "[]".
+    transcript = Transcript(
+        (
+            user_text("hi"),
+            Message("assistant", (TextBlock("just text"),)),
+        )
+    )
+    encoded = encode_messages(transcript)
+    assert "tool_calls" not in encoded[1]
+    assert encoded[1]["content"] == "just text"
+
+
+def test_encode_tools_maps_each_spec_to_its_wire_shape():
+    specs = (ToolSpec("Read", "Reads a file", {"type": "object", "properties": {}}),)
+    assert encode_tools(specs) == [
+        {
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "description": "Reads a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+
+def test_streamed_tool_call_fragments_are_reassembled_by_index():
+    accumulator = ChunkAccumulator(model="gpt-5")
+    accumulator.handle(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "function": {"name": "Read", "arguments": '{"pa'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    accumulator.handle(
+        {
+            "choices": [
+                {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'th": "a.py"}'}}]}}
+            ]
+        }
+    )
+    accumulator.handle({"choices": [{"finish_reason": "tool_calls", "delta": {}}]})
+    reply = accumulator.result()
+    call = reply.blocks[0]
+    assert isinstance(call, ToolUseBlock) and call.arguments == {"path": "a.py"}
+    assert reply.stop is StopKind.TOOL_USE
+
+
+def test_tool_call_arguments_split_across_many_chunks_reassemble_correctly():
+    # "Many", not two: five fragments after the declaring one, each far too
+    # small to parse on its own -- one key or string fragment at a time.
+    accumulator = ChunkAccumulator(model="gpt-5")
+    accumulator.handle(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "id": "c1", "function": {"name": "Write", "arguments": ""}}
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    for fragment in ('{"pa', 'th": ', '"a/b/', "c.py", '", "content": "x"}'):
+        accumulator.handle(
+            {
+                "choices": [
+                    {"delta": {"tool_calls": [{"index": 0, "function": {"arguments": fragment}}]}}
+                ]
+            }
+        )
+    accumulator.handle({"choices": [{"finish_reason": "tool_calls", "delta": {}}]})
+    call = accumulator.result().blocks[0]
+    assert isinstance(call, ToolUseBlock)
+    assert call.name == "Write"
+    assert call.arguments == {"path": "a/b/c.py", "content": "x"}
+
+
+def test_parallel_tool_calls_keep_their_order_by_index():
+    # Fragments arrive for index 1 before index 0 -- order in the reply must
+    # still follow the index, not arrival order.
+    accumulator = ChunkAccumulator(model="gpt-5")
+    accumulator.handle(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 1,
+                                "id": "c2",
+                                "function": {"name": "Read", "arguments": '{"path": "b"}'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    accumulator.handle(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "function": {"name": "Read", "arguments": '{"path": "a"}'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    accumulator.handle({"choices": [{"finish_reason": "tool_calls", "delta": {}}]})
+    reply = accumulator.result()
+    calls = [b for b in reply.blocks if isinstance(b, ToolUseBlock)]
+    assert len(calls) == 2
+    assert calls[0].id == "c1" and calls[0].arguments == {"path": "a"}
+    assert calls[1].id == "c2" and calls[1].arguments == {"path": "b"}
+
+
+def test_a_stream_truncated_mid_tool_call_raises_a_non_retryable_error():
+    # The connection drops while function.arguments is still open: no closing
+    # fragment, no finish_reason. Silently handing {} to the tool would be
+    # worse than refusing, and retrying is also wrong -- an earlier call in
+    # the same turn may already have run.
+    accumulator = ChunkAccumulator(model="gpt-5")
+    accumulator.handle(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "function": {"name": "Read", "arguments": '{"path": "a'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    with pytest.raises(ModelError) as excinfo:
+        accumulator.result()
+    assert not excinfo.value.retryable
+
+
+def test_a_tool_call_that_never_receives_a_name_is_a_usable_error():
+    # A narrower truncation than the one above: the call is opened (an index
+    # exists) but the stream drops before function.name ever arrives --
+    # result()'s own explicit guard, distinct from parse_arguments's JSON error.
+    accumulator = ChunkAccumulator(model="gpt-5")
+    accumulator.handle({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1"}]}}]})
+    with pytest.raises(ModelError, match="no function name") as excinfo:
+        accumulator.result()
+    assert not excinfo.value.retryable
+
+
+def test_a_tool_call_with_no_id_falls_back_to_a_generated_one():
+    # The other half of "slot['id'] or f'call_{index}'" -- every other
+    # tool-call test supplies an id in the opening fragment; this one never
+    # does, so the call still needs an id the executor can refer back to.
+    accumulator = ChunkAccumulator(model="m")
+    accumulator.handle(
+        {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "Read"}}]}}]}
+    )
+    accumulator.handle({"choices": [{"finish_reason": "tool_calls", "delta": {}}]})
+    call = accumulator.result().blocks[0]
+    assert isinstance(call, ToolUseBlock)
+    assert call.id == "call_0"
+
+
+def test_an_error_chunk_raises_a_model_error():
+    accumulator = ChunkAccumulator(model="gpt-5")
+    with pytest.raises(ModelError, match="rate limited"):
+        accumulator.handle({"error": {"message": "rate limited"}})
+
+
+def test_a_stream_with_no_content_at_all_is_a_usable_error():
+    # Nothing was cut off here -- a complete stream that never carries text,
+    # reasoning or a tool call. result()'s other refusal branch, distinct from
+    # the truncation ones above.
+    accumulator = ChunkAccumulator(model="gpt-5")
+    accumulator.handle({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+    with pytest.raises(ModelError, match="no content"):
+        accumulator.result()
+
+
+def test_reasoning_content_is_preserved_so_it_can_be_sent_back():
+    accumulator = ChunkAccumulator(model="o-series")
+    accumulator.handle({"choices": [{"delta": {"reasoning_content": "thinking..."}}]})
+    accumulator.handle({"choices": [{"finish_reason": "stop", "delta": {"content": "done"}}]})
+    kinds = {type(b).__name__ for b in accumulator.result().blocks}
+    assert "ThinkingBlock" in kinds
+
+
+@pytest.mark.parametrize("key", ["reasoning_content", "reasoning", "thinking"])
+def test_all_three_reasoning_key_spellings_are_recognized(key):
+    # The module docstring's other documented divergence: "reasoning content
+    # arrives under three different key names depending on who is serving."
+    # The brief's own test above only drives "reasoning_content"; this pins
+    # the other two as well, and that the recovered text is the right text.
+    accumulator = ChunkAccumulator(model="o-series")
+    accumulator.handle({"choices": [{"delta": {key: "because X"}}]})
+    accumulator.handle({"choices": [{"finish_reason": "stop", "delta": {"content": "done"}}]})
+    reasoning = next(b for b in accumulator.result().blocks if isinstance(b, ThinkingBlock))
+    assert reasoning.text == "because X"
+
+
+def test_finish_reason_length_maps_to_max_tokens():
+    accumulator = ChunkAccumulator(model="m")
+    accumulator.handle({"choices": [{"delta": {"content": "x"}, "finish_reason": "length"}]})
+    assert accumulator.result().stop is StopKind.MAX_TOKENS
+
+
+def test_finish_reason_content_filter_maps_to_refusal():
+    accumulator = ChunkAccumulator(model="m")
+    accumulator.handle(
+        {"choices": [{"delta": {"content": "no"}, "finish_reason": "content_filter"}]}
+    )
+    assert accumulator.result().stop is StopKind.REFUSAL
+
+
+def test_finish_reason_function_call_maps_to_tool_use():
+    # The deprecated single-function-call shape some endpoints still send
+    # instead of "tool_calls".
+    accumulator = ChunkAccumulator(model="m")
+    accumulator.handle(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "function": {"name": "Read", "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": "function_call",
+                }
+            ]
+        }
+    )
+    assert accumulator.result().stop is StopKind.TOOL_USE
+
+
+def test_an_unrecognized_finish_reason_defaults_to_end_turn():
+    accumulator = ChunkAccumulator(model="m")
+    accumulator.handle({"choices": [{"delta": {"content": "x"}, "finish_reason": "something_new"}]})
+    assert accumulator.result().stop is StopKind.END_TURN
+
+
+def test_usage_without_cached_token_detail_defaults_to_zero():
+    # The other half of "(usage.get('prompt_tokens_details') or {}).get(...)"
+    # -- a provider that sends prompt/completion tokens but no
+    # prompt_tokens_details at all.
+    accumulator = ChunkAccumulator(model="m")
+    accumulator.handle(
+        {
+            "choices": [{"delta": {"content": "x"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+        }
+    )
+    reply = accumulator.result()
+    assert reply.usage.input_tokens == 5
+    assert reply.usage.cache_read_tokens == 0
+
+
+def test_the_system_prompt_is_the_first_message_not_a_parameter():
+    client = OpenAICompatClient("k", model="gpt-5", base_url="https://x/v1")
+    payload = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), (), 64))
+    assert payload["messages"][0] == {"role": "system", "content": "sys"}
+
+
+def test_tools_are_included_in_the_payload_when_present():
+    client = OpenAICompatClient("k", model="gpt-5", base_url="https://x/v1")
+    tools = (ToolSpec("Read", "Reads a file", {"type": "object", "properties": {}}),)
+    payload = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), tools, 64))
+    assert payload["tools"] == encode_tools(tools)
+
+
+def test_no_tools_key_when_there_are_none():
+    # The other half of "if request.tools:" above.
+    client = OpenAICompatClient("k", model="gpt-5", base_url="https://x/v1")
+    payload = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), (), 64))
+    assert "tools" not in payload
+
+
+def test_a_missing_api_key_names_the_adapter_and_the_fix():
+    """Spec section 17.9, verbatim -- the exact wording and the em-dash both
+    matter here, so this checks equality rather than a substring."""
+    with pytest.raises(ModelError) as excinfo:
+        OpenAICompatClient("", model="gpt-5", base_url="https://x/v1")
+    assert str(excinfo.value) == (
+        'no API key for adapter "openai_compat" — set OPENAI_API_KEY or run: ncc init'
+    )
+    assert not excinfo.value.retryable
+
+
+def test_the_client_satisfies_the_model_client_protocol():
+    client = OpenAICompatClient("test-key", model="gpt-5", base_url="https://x/v1")
+    assert isinstance(client, ModelClient)
+    assert client.model_id == "gpt-5"
+
+
+async def test_aclose_closes_a_client_it_created_itself():
+    client = OpenAICompatClient("test-key", model="gpt-5", base_url="https://x/v1")
+    await client.aclose()
+    assert client._client.is_closed
+
+
+async def test_aclose_does_not_close_a_client_it_was_given():
+    # The other half of "if self._owns_client:" -- a caller-supplied client
+    # may still be in use elsewhere, and aclose() must not pull it out from
+    # under them.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = OpenAICompatClient("test-key", model="gpt-5", base_url="https://x/v1", client=http)
+        await client.aclose()
+        assert not http.is_closed
+
+
+async def test_an_http_error_is_classified_the_same_way_as_anthropic():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, json={"error": {"message": "slow down"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = OpenAICompatClient("k", model="m", base_url="https://x/v1", client=http)
+        with pytest.raises(ModelError) as caught:
+            await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 10))
+        assert caught.value.retryable
+
+
+async def test_a_timeout_is_classified_as_retryable():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = OpenAICompatClient("test-key", model="gpt-5", base_url="https://x/v1", client=http)
+        with pytest.raises(ModelError, match="timed out") as excinfo:
+            await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 10))
+    assert excinfo.value.retryable
+
+
+async def test_a_connection_failure_is_classified_as_retryable():
+    # httpx.ConnectError is a TransportError but not a TimeoutException -- the
+    # except clause after the timeout-specific one, which the test above never
+    # reaches.
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("could not connect", request=request)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = OpenAICompatClient("test-key", model="gpt-5", base_url="https://x/v1", client=http)
+        with pytest.raises(ModelError, match="could not reach the provider") as excinfo:
+            await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 10))
+    assert excinfo.value.retryable
+
+
+def test_openai_text_cassette_decodes_to_one_text_block():
+    reply = replay("openai_text.jsonl").result()
+    assert isinstance(reply.blocks[0], TextBlock)
+    assert reply.blocks[0].text == "hello"
+    assert reply.stop is StopKind.END_TURN
+    assert reply.usage.input_tokens == 11
+    assert reply.usage.output_tokens == 2
+
+
+def test_openai_tool_use_cassette_decodes_with_arguments_reassembled():
+    reply = replay("openai_tool_use.jsonl").result()
+    call = next(b for b in reply.blocks if isinstance(b, ToolUseBlock))
+    assert call.name == "Read"
+    assert call.id == "call_OpenAIReadFixture01"
+    assert call.arguments == {"path": "README.md"}
+    assert reply.stop is StopKind.TOOL_USE
+    assert reply.usage.cache_read_tokens == 32
+
+
+async def test_complete_streams_the_text_cassette_over_real_wire_text():
+    # The one test that drives OpenAICompatClient.complete() all the way
+    # through literal SSE wire text rebuilt from the committed cassette --
+    # every test above either calls ChunkAccumulator.handle() directly or
+    # replays decoded chunks, bypassing complete()'s own line-splitting,
+    # "data:" stripping and "[DONE]" handling entirely. A trailing slash on
+    # base_url is used here too, pinning that it does not produce "//".
+    body = wire_body("openai_text.jsonl")
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = OpenAICompatClient(
+            "test-key", model="gpt-5", base_url="https://x/v1/", client=http
+        )
+        reply = await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 10))
+    assert str(seen[0].url) == "https://x/v1/chat/completions"
+    assert isinstance(reply.blocks[0], TextBlock)
+    assert reply.blocks[0].text == "hello"
+    assert reply.stop is StopKind.END_TURN
+    assert reply.usage.input_tokens == 11
+    assert reply.usage.output_tokens == 2
+
+
+async def test_a_blank_data_line_is_skipped_without_error():
+    # The other half of "payload in ('', '[DONE]')" -- a keep-alive-style
+    # "data:" line with nothing after it, distinct from the "[DONE]" sentinel
+    # that every cassette-based test above already exercises.
+    body = (
+        b"data: \n\n"
+        b'data: {"choices": [{"delta": {"content": "hi"}, "finish_reason": "stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = OpenAICompatClient("test-key", model="gpt-5", base_url="https://x/v1", client=http)
+        reply = await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 10))
+    assert isinstance(reply.blocks[0], TextBlock)
+    assert reply.blocks[0].text == "hi"
+
+
+async def test_complete_streams_the_tool_use_cassette_over_real_wire_text():
+    body = wire_body("openai_tool_use.jsonl")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = OpenAICompatClient("test-key", model="gpt-5", base_url="https://x/v1", client=http)
+        reply = await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 10))
+    call = next(b for b in reply.blocks if isinstance(b, ToolUseBlock))
+    assert call.name == "Read"
+    assert call.arguments == {"path": "README.md"}
+    assert reply.stop is StopKind.TOOL_USE
+    assert reply.usage.cache_read_tokens == 32

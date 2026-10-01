@@ -1,0 +1,6 @@
+{"id": "chatcmpl-OpenAITextFixture01", "object": "chat.completion.chunk", "created": 1717200000, "model": "gpt-5", "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]}
+{"id": "chatcmpl-OpenAITextFixture01", "object": "chat.completion.chunk", "created": 1717200000, "model": "gpt-5", "choices": [{"index": 0, "delta": {"content": "hel"}, "finish_reason": null}]}
+{"id": "chatcmpl-OpenAITextFixture01", "object": "chat.completion.chunk", "created": 1717200000, "model": "gpt-5", "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": null}]}
+{"id": "chatcmpl-OpenAITextFixture01", "object": "chat.completion.chunk", "created": 1717200000, "model": "gpt-5", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+{"id": "chatcmpl-OpenAITextFixture01", "object": "chat.completion.chunk", "created": 1717200000, "model": "gpt-5", "choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13, "prompt_tokens_details": {"cached_tokens": 0}}}
+"[DONE]"
