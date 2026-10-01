@@ -189,10 +189,15 @@ class OpenAICompatClient:
         base_url: str,
         client: httpx.AsyncClient | None = None,
         timeout_s: float = 600.0,
+        api_key_env: str = "OPENAI_API_KEY",
     ) -> None:
+        # api_key_env only names the variable in the error. One adapter serves
+        # OpenRouter, Groq, DeepSeek and the rest, and each model alias in the
+        # config says which variable holds its key (spec 17.6, api_key_env), so
+        # telling an OpenRouter user to set OPENAI_API_KEY would be wrong.
         if not api_key:
             raise ModelError(
-                'no API key for adapter "openai_compat" — set OPENAI_API_KEY or run: ncc init',
+                f'no API key for adapter "openai_compat" — set {api_key_env} or run: ncc init',
                 retryable=False,
             )
         self._model = model

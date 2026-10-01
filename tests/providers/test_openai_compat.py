@@ -593,3 +593,16 @@ async def test_complete_streams_the_tool_use_cassette_over_real_wire_text():
     assert call.arguments == {"path": "README.md"}
     assert reply.stop is StopKind.TOOL_USE
     assert reply.usage.cache_read_tokens == 32
+
+
+def test_the_missing_key_message_names_the_variable_the_config_says_to_use():
+    with pytest.raises(ModelError) as excinfo:
+        OpenAICompatClient(
+            "",
+            model="deepseek/deepseek-v3",
+            base_url="https://x/v1",
+            api_key_env="OPENROUTER_API_KEY",
+        )
+    assert str(excinfo.value) == (
+        'no API key for adapter "openai_compat" \u2014 set OPENROUTER_API_KEY or run: ncc init'
+    )
