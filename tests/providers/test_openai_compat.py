@@ -293,11 +293,12 @@ def test_a_stream_truncated_mid_tool_call_raises_a_non_retryable_error():
 
 
 def test_a_tool_call_that_never_receives_a_name_is_a_usable_error():
-    # A narrower truncation than the one above: the call is opened (an index
-    # exists) but the stream drops before function.name ever arrives --
-    # result()'s own explicit guard, distinct from parse_arguments's JSON error.
+    # The call is opened (an index exists) and the stream reports it finished,
+    # yet function.name never arrived -- result()'s own guard for a server that
+    # sends a malformed call, distinct from the unfinished-stream check.
     accumulator = ChunkAccumulator(model="gpt-5")
     accumulator.handle({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1"}]}}]})
+    accumulator.handle({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
     with pytest.raises(ModelError, match="no function name") as excinfo:
         accumulator.result()
     assert not excinfo.value.retryable
@@ -333,7 +334,7 @@ def test_a_stream_with_no_content_at_all_is_a_usable_error():
         accumulator.result()
 
 
-def test_reasoning_content_is_preserved_so_it_can_be_sent_back():
+def test_reasoning_content_is_preserved_as_a_thinking_block():
     accumulator = ChunkAccumulator(model="o-series")
     accumulator.handle({"choices": [{"delta": {"reasoning_content": "thinking..."}}]})
     accumulator.handle({"choices": [{"finish_reason": "stop", "delta": {"content": "done"}}]})
@@ -606,3 +607,38 @@ def test_the_missing_key_message_names_the_variable_the_config_says_to_use():
     assert str(excinfo.value) == (
         'no API key for adapter "openai_compat" \u2014 set OPENROUTER_API_KEY or run: ncc init'
     )
+
+
+def _call_fragment(**function: object) -> dict[str, object]:
+    return {
+        "choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": function}]}}]
+    }
+
+
+def test_a_stream_that_stops_after_the_tool_name_raises_instead_of_inventing_empty_arguments():
+    accumulator = ChunkAccumulator(model="m")
+    accumulator.handle(_call_fragment(name="Write"))
+    with pytest.raises(ModelError, match="before its tool calls were complete") as excinfo:
+        accumulator.result()
+    assert excinfo.value.retryable is False
+
+
+def test_complete_looking_arguments_without_a_finish_reason_still_raise():
+    accumulator = ChunkAccumulator(model="m")
+    accumulator.handle(_call_fragment(name="Read", arguments='{"path": "a.py"}'))
+    with pytest.raises(ModelError, match="before its tool calls were complete"):
+        accumulator.result()
+
+
+def test_arguments_sent_as_an_object_are_used_as_is():
+    accumulator = ChunkAccumulator(model="m")
+    accumulator.handle(_call_fragment(name="Read", arguments={"path": "a.py"}))
+    accumulator.handle({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+    (block,) = accumulator.result().blocks
+    assert isinstance(block, ToolUseBlock)
+    assert dict(block.arguments) == {"path": "a.py"}
+
+
+def test_an_error_chunk_whose_error_is_a_bare_string_is_a_model_error():
+    with pytest.raises(ModelError, match="upstream exploded"):
+        ChunkAccumulator(model="m").handle({"error": "upstream exploded"})

@@ -123,11 +123,16 @@ class ChunkAccumulator:
         self._calls: dict[int, dict[str, Any]] = {}
         self._stop = StopKind.END_TURN
         self._usage = Usage()
+        # Whether any choice reported a finish_reason. Without it a tool call's
+        # arguments may simply have stopped arriving, and an empty or partial
+        # argument string must not be passed to a tool as if it were complete.
+        self._finished = False
 
     def handle(self, chunk: Mapping[str, Any]) -> None:
         if "error" in chunk:
             error = chunk["error"]
-            raise ModelError(str(error.get("message", error)))
+            message = error.get("message", error) if isinstance(error, Mapping) else error
+            raise ModelError(str(message))
         usage = chunk.get("usage")
         if usage:
             self._usage = Usage(
@@ -139,6 +144,7 @@ class ChunkAccumulator:
         for choice in chunk.get("choices", []):
             finish = choice.get("finish_reason")
             if finish:
+                self._finished = True
                 self._stop = _FINISH.get(finish, StopKind.END_TURN)
             delta = choice.get("delta") or {}
             if delta.get("content"):
@@ -155,8 +161,12 @@ class ChunkAccumulator:
                 function = fragment.get("function") or {}
                 if function.get("name"):
                     slot["name"] = function["name"]
-                if function.get("arguments"):
-                    slot["arguments"] += function["arguments"]
+                arguments = function.get("arguments")
+                if arguments:
+                    # Usually a string fragment; some servers send the whole object.
+                    slot["arguments"] += (
+                        arguments if isinstance(arguments, str) else json.dumps(arguments)
+                    )
 
     def result(self) -> ModelReply:
         blocks: list[Block] = []
@@ -164,6 +174,12 @@ class ChunkAccumulator:
             blocks.append(ThinkingBlock("".join(self._reasoning)))
         if self._text:
             blocks.append(TextBlock("".join(self._text)))
+        if self._calls and not self._finished:
+            raise ModelError(
+                "the response stream ended before its tool calls were complete; the turn "
+                "may have partially executed, so it is not retried automatically",
+                retryable=False,
+            )
         for index in sorted(self._calls):
             slot = self._calls[index]
             if not slot["name"]:
