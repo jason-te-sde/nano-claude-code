@@ -534,10 +534,10 @@ def test_evaluate_defaults_to_no_grants_when_the_argument_is_omitted():
 
 # Step 7b: the degradation guarantee (spec 6.4, 17) enforced in code, not just
 # in prose. A SAFE verdict whose classifier was not authoritative -- today
-# only reachable by constructing one directly, since best_classifier() (a
-# later task) is what will actually set the flag -- must not be promoted to
-# ALLOW by row 8 or row 9. All four directions are pinned, not just the
-# negative case: a guard proven only by its denial is the defect the
+# only reachable by constructing one directly, since the fallback wiring
+# that will actually set the flag is a later task's work -- must not be
+# promoted to ALLOW by row 8 or row 9. All four directions are pinned, not
+# just the negative case: a guard proven only by its denial is the defect the
 # completeness clause (spec, test-completeness) names.
 SAFE_AST = DangerVerdict(DangerLevel.SAFE, (), "ast")
 SAFE_REGEX_ONLY = DangerVerdict(DangerLevel.SAFE, (), "regex", authoritative=False)
