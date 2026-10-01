@@ -48,7 +48,9 @@ class ToolRegistry:
 
 def default_registry() -> ToolRegistry:
     from nanoclaude.tools.edit import EditTool
+    from nanoclaude.tools.glob import GlobTool
+    from nanoclaude.tools.grep import GrepTool
     from nanoclaude.tools.read import ReadTool
     from nanoclaude.tools.write import WriteTool
 
-    return ToolRegistry([ReadTool(), WriteTool(), EditTool()])
+    return ToolRegistry([ReadTool(), WriteTool(), EditTool(), GlobTool(), GrepTool()])

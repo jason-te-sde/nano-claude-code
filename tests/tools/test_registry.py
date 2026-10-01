@@ -85,12 +85,14 @@ def test_specs_are_sorted_by_name_regardless_of_registration_order():
     assert [spec.name for spec in registry.specs()] == ["Alpha", "Read", "Zeta"]
 
 
-def test_default_registry_includes_read_write_and_edit_and_nothing_else_yet():
+def test_default_registry_includes_read_write_edit_glob_and_grep():
     registry = default_registry()
     assert "Read" in registry
     assert "Write" in registry
     assert "Edit" in registry
-    assert len(registry) == 3
+    assert "Glob" in registry
+    assert "Grep" in registry
+    assert len(registry) == 5
 
 
 def test_every_path_taking_tool_resolves_its_path_into_resolved_paths(ctx, tmp_repo):
