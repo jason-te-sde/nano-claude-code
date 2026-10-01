@@ -6,6 +6,7 @@ into the repository itself.
 
 import json
 from collections.abc import Hashable
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,12 +84,43 @@ def test_a_transcript_reloads_identically(tmp_path):
     validate(reloaded)
 
 
-def test_latest_session_is_the_most_recently_started(tmp_path):
+def _fixed_clock(monkeypatch: pytest.MonkeyPatch, *instants: float) -> None:
+    # store.py reads time.time(); two back-to-back calls can return the same
+    # value, so tests that depend on order pin the clock instead of racing it.
+    # Only the store module's own reference is replaced, not the global clock.
+    ticks = iter(instants)
+    monkeypatch.setattr(
+        "nanoclaude.conversation.store.time", SimpleNamespace(time=lambda: next(ticks))
+    )
+
+
+def test_latest_session_is_the_most_recently_started(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, 1.0, 2.0)
     store = Store(tmp_path / "s.db")
     store.open()
     store.create_session("old", cwd="/p", roles={})
     store.create_session("new", cwd="/p", roles={})
     assert store.latest_session_id() == "new"
+
+
+def test_sessions_started_in_the_same_instant_resolve_to_the_later_insert(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, 5.0, 5.0)
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("first", cwd="/p", roles={})
+    store.create_session("second", cwd="/p", roles={})
+    assert store.latest_session_id() == "second"
+    assert [row.id for row in store.recent_sessions(10)] == ["second", "first"]
+
+
+def test_recent_sessions_are_newest_first_and_respect_the_limit(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, 1.0, 3.0, 2.0)
+    store = Store(tmp_path / "s.db")
+    store.open()
+    for session_id in ("a", "b", "c"):
+        store.create_session(session_id, cwd="/p", roles={})
+    assert [row.id for row in store.recent_sessions(10)] == ["b", "c", "a"]
+    assert [row.id for row in store.recent_sessions(2)] == ["b", "c"]
 
 
 def test_latest_session_id_is_none_for_an_empty_database(tmp_path):

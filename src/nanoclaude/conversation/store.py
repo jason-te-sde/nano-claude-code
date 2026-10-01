@@ -185,11 +185,13 @@ class Store:
     def recent_sessions(self, limit: int = 10) -> list[SessionRow]:
         rows = self.db.execute(
             "SELECT id, started_at, ended_at, cwd, total_cost_usd, total_input_tokens, "
-            "total_output_tokens FROM sessions ORDER BY started_at DESC LIMIT ?",
+            "total_output_tokens FROM sessions ORDER BY started_at DESC, rowid DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [SessionRow(**dict(row)) for row in rows]
 
     def latest_session_id(self) -> str | None:
-        row = self.db.execute("SELECT id FROM sessions ORDER BY started_at DESC LIMIT 1").fetchone()
+        row = self.db.execute(
+            "SELECT id FROM sessions ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
         return row["id"] if row else None
