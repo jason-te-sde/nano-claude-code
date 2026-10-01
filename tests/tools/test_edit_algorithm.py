@@ -115,3 +115,11 @@ def test_editspec_is_hashable_because_it_holds_only_strings_and_a_bool():
     None on purpose, EditSpec has nothing that would make hashing unsafe."""
     assert hash(EditSpec("a", "b")) == hash(EditSpec("a", "b"))
     assert len({EditSpec("a", "b"), EditSpec("a", "b", replace_all=True)}) == 2
+
+
+def test_crlf_inside_an_edit_is_folded_to_an_lf_file():
+    # The edit's own strings carry CRLF while the file is LF: the edit must
+    # still match, and must not introduce CRLF into the file.
+    content = "a\nb\nc\n"
+    result = apply_edits(content, [EditSpec("a\r\nb", "x\r\ny")])
+    assert result == "x\ny\nc\n"
