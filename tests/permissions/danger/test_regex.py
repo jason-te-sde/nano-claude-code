@@ -67,17 +67,17 @@ def test_known_blind_spots_are_documented_and_really_are_blind_spots():
 # Each command below was checked to fire exactly one rule_id, so asserting
 # that id in the verdict is a fragment unique to its own branch.
 ADDITIONAL_RULE_CASES = [
-    ("echo hi > /dev/sda", "redirect.device"),
-    ("chmod 777 /", "chmod.root"),
-    ("git clean -fd", "git.clean-force"),
-    ("base64 -d payload.b64 | sh", "base64-to-shell"),
-    ("drop table sessions", "sql.drop"),
-    ("find . -name '*.tmp' -delete", "find.delete"),
-    ("history -c", "history.wipe"),
+    pytest.param("echo hi > /dev/sda", "redirect.device", id="redirect.device"),
+    pytest.param("chmod 777 /", "chmod.root", id="chmod.root"),
+    pytest.param("git clean -fd", "git.clean-force", id="git.clean-force"),
+    pytest.param("base64 -d payload.b64 | sh", "base64-to-shell", id="base64-to-shell"),
+    pytest.param("drop table sessions", "sql.drop", id="sql.drop"),
+    pytest.param("find . -name '*.tmp' -delete", "find.delete", id="find.delete"),
+    pytest.param("history -c", "history.wipe", id="history.wipe"),
 ]
 
 
-@pytest.mark.parametrize("command,rule_id", ADDITIONAL_RULE_CASES)
+@pytest.mark.parametrize("command, rule_id", ADDITIONAL_RULE_CASES)
 def test_additional_rule_patterns_are_blocked_and_named(command, rule_id):
     verdict = RegexClassifier().classify(command)
     assert verdict.level is DangerLevel.BLOCKED
