@@ -9,10 +9,15 @@ the order the model asked, with nothing already half-done behind them, and a
 user who declines the first of five writes does not discover that the third one
 already landed.
 
-**Then execute by class.** Read-only calls go concurrently behind a semaphore;
-anything that changes state runs one at a time in the order requested, and two
-calls touching the same path are serialised whatever their class. Concurrency
-buys latency, and no amount of latency is worth an undefined outcome.
+**Then execute in request order, concurrent only within a read-only run.** A
+write is a barrier: everything requested before it finishes before it starts,
+and nothing requested after it starts until it is done -- a Read placed right
+after a Write in the same batch must see what the Write just produced, not
+what was there before it. Maximal runs of *consecutive* read-only calls
+between one barrier and the next still go concurrently, capped by a
+semaphore; a refused or declined call never executes and so cannot split a
+run of reads around it. Concurrency buys latency within one run; no amount of
+it is worth an undefined order between a write and whatever depends on it.
 """
 
 from __future__ import annotations
@@ -52,6 +57,28 @@ def _refusal_text(rule: str, reason: str) -> str:
     turn's tool_result.
     """
     return f"Refused ({rule}): {reason}"
+
+
+def _consecutive_read_only_runs(plans: Sequence[_Plan]) -> list[tuple[bool, list[_Plan]]]:
+    """Split ``plans`` into maximal runs of consecutive read-only / non-
+    read-only tools, preserving their relative order.
+
+    ``plans`` must already be filtered down to ones that actually execute --
+    refused and declined calls have their outcome already recorded and never
+    reach here, which is what keeps them from splitting a run of reads around
+    them: a run is computed over this filtered sequence, so a call that was
+    never going to run is simply not in it to begin with.
+    """
+    runs: list[tuple[bool, list[_Plan]]] = []
+    for plan in plans:
+        tool = plan.tool
+        assert tool is not None  # noqa: S101 - only plans that execute reach here
+        read_only = tool.read_only
+        if runs and runs[-1][0] is read_only:
+            runs[-1][1].append(plan)
+        else:
+            runs.append((read_only, [plan]))
+    return runs
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,24 +167,31 @@ class Executor:
             elif approval is Approval.ALWAYS:
                 self.grants = self.grants.with_tool(plan.call.name)
 
+        # Request order is preserved across tool classes, not just within one:
+        # a write must finish before whatever the model asked for next can
+        # start, because that next call may depend on what the write just
+        # did (a Read straight after a Write must see the new content, not
+        # whatever was on disk before the batch started). Only *consecutive*
+        # read-only calls -- a run with no write, refused, or declined call
+        # breaking it up -- share a semaphore-capped asyncio.gather. Every
+        # non-read-only call still runs by itself, one at a time, in the
+        # order requested, exactly as it always has.
         runnable = [p for p in plans if p.call.id not in results and p.tool is not None]
-        parallel = [p for p in runnable if p.tool is not None and p.tool.read_only]
-        serial = [p for p in runnable if p.tool is not None and not p.tool.read_only]
+        limit = asyncio.Semaphore(MAX_CONCURRENT_READS)
 
-        if parallel:
-            limit = asyncio.Semaphore(MAX_CONCURRENT_READS)
+        async def guarded(plan: _Plan) -> ToolOutcome:
+            async with limit:
+                return await self._run(ctx, plan)
 
-            async def guarded(plan: _Plan) -> ToolOutcome:
-                async with limit:
-                    return await self._run(ctx, plan)
-
-            for plan, outcome in zip(
-                parallel, await asyncio.gather(*(guarded(p) for p in parallel)), strict=True
-            ):
-                results[plan.call.id] = outcome
-
-        for plan in serial:
-            results[plan.call.id] = await self._run(ctx, plan)
+        for read_only, group in _consecutive_read_only_runs(runnable):
+            if read_only:
+                for plan, outcome in zip(
+                    group, await asyncio.gather(*(guarded(p) for p in group)), strict=True
+                ):
+                    results[plan.call.id] = outcome
+            else:
+                for plan in group:
+                    results[plan.call.id] = await self._run(ctx, plan)
 
         return tuple(results[call.id] for call in calls)
 
@@ -189,12 +223,18 @@ class Executor:
         return _Plan(call, tool, request, result, None)
 
     def _refused(self, call: ToolUseBlock, message: str, turn: int, rule: str) -> _Plan:
+        # Reaches here before evaluate() ever runs (an unknown tool name, or
+        # arguments bad enough that permission_request() itself raises), so
+        # there is no real PermissionRequest to report -- the same placeholder
+        # used below is what on_decision and the audit log both see.
+        request = PermissionRequest(call.name, "")
         result = PermissionResult(Decision.DENY, rule, message)
+        self.ui.on_decision(call, request, result)
         self._audit_decision(call, turn, result)
         return _Plan(
             call,
             None,
-            PermissionRequest(call.name, ""),
+            request,
             result,
             ToolOutcome(call.id, _refusal_text(rule, message), is_error=True),
         )

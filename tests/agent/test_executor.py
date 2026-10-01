@@ -39,12 +39,14 @@ from typing import Any, Never
 import pytest
 
 from nanoclaude.agent.executor import MAX_CONCURRENT_READS, Executor, _Plan
-from nanoclaude.agent.loop import start
+from nanoclaude.agent.loop import RunTools, observe, start, step
 from nanoclaude.agent.ui import UI, Approval, AutoApprove, AutoDecline, SilentUI
 from nanoclaude.conversation.store import Store
 from nanoclaude.conversation.transcript import ToolUseBlock
 from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
+from nanoclaude.testing.scripted import calls as model_calls
+from nanoclaude.testing.scripted import calls_many
 from nanoclaude.tools.base import ToolContext, ToolOutcome, ok
 from nanoclaude.tools.registry import default_registry
 
@@ -480,3 +482,217 @@ async def test_auto_decline_behaves_like_silent_ui():
     request = PermissionRequest("Write", "a.txt", is_write=True)
     result = PermissionResult(Decision.ASK, "default.ask", "needs confirmation")
     assert await ui.confirm(call, request, result) is Approval.NO
+
+
+# Tests below pin the coordinator's review-round fixes: a write is a barrier
+# that preserves request order across tool classes (not just within one), and
+# on_decision now fires for every refusal, not only the ones that reach
+# evaluate().
+
+
+async def test_a_write_immediately_followed_by_a_read_sees_the_write(policy, tmp_repo):
+    """The bug this section fixes: the old scheduling ran every read-only
+    call before every serial call regardless of request order, so a Read
+    placed after a Write in the same batch still saw whatever was on disk
+    *before* the batch ran.
+    """
+    calls = (
+        ToolUseBlock("t1", "Write", {"path": "x.txt", "content": "first\n"}),
+        ToolUseBlock("t2", "Read", {"path": "x.txt"}),
+    )
+    outcomes = await executor(policy).run_batch(calls, start("hi"))
+    assert not outcomes[0].is_error
+    assert "first" in outcomes[1].content
+
+
+async def test_scheduling_groups_consecutive_reads_and_runs_a_write_alone_between_them(
+    policy, tmp_repo, monkeypatch
+):
+    """[Read, Read, Write, Read, Read]: the first two overlap, the write runs
+    fully alone (no read overlaps it), and the last two overlap. Also covers
+    "a mixed batch keeps call order": outcomes come back in request order
+    regardless of which calls ran concurrently.
+    """
+    from nanoclaude.tools.read import ReadTool
+    from nanoclaude.tools.write import WriteTool
+
+    order: list[str] = []
+
+    async def tracked_read(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        order.append(f"{call_id}:start")
+        await asyncio.sleep(0.05)
+        order.append(f"{call_id}:end")
+        return ok(call_id, "read")
+
+    async def tracked_write(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        order.append(f"{call_id}:start")
+        await asyncio.sleep(0.05)
+        order.append(f"{call_id}:end")
+        return ok(call_id, "written")
+
+    monkeypatch.setattr(ReadTool, "run", tracked_read)
+    monkeypatch.setattr(WriteTool, "run", tracked_write)
+    calls = (
+        ToolUseBlock("t1", "Read", {"path": "a.py"}),
+        ToolUseBlock("t2", "Read", {"path": "b.py"}),
+        ToolUseBlock("t3", "Write", {"path": "c.txt", "content": "C"}),
+        ToolUseBlock("t4", "Read", {"path": "d.py"}),
+        ToolUseBlock("t5", "Read", {"path": "e.py"}),
+    )
+    outcomes = await executor(policy).run_batch(calls, start("hi"))
+    assert [o.tool_use_id for o in outcomes] == ["t1", "t2", "t3", "t4", "t5"]
+    assert order == [
+        "t1:start",
+        "t2:start",
+        "t1:end",
+        "t2:end",
+        "t3:start",
+        "t3:end",
+        "t4:start",
+        "t5:start",
+        "t4:end",
+        "t5:end",
+    ]
+
+
+async def test_the_cap_holds_within_a_read_group_inside_a_mixed_batch(
+    policy, tmp_repo, monkeypatch
+):
+    """test_concurrent_reads_are_capped_at_max_concurrent_reads (above) covers
+    an all-read batch, which is a single group under the new scheduling --
+    indistinguishable from the old one. This instead puts the oversized read
+    group ahead of a write in the same batch, so the group being measured is
+    not the whole batch.
+    """
+    from nanoclaude.tools.read import ReadTool
+    from nanoclaude.tools.write import WriteTool
+
+    current = 0
+    peak = 0
+
+    async def tracked_read(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        nonlocal current, peak
+        current += 1
+        peak = max(peak, current)
+        await asyncio.sleep(0.02)
+        current -= 1
+        return ok(call_id, "read")
+
+    async def stub_write(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        return ok(call_id, "written")
+
+    monkeypatch.setattr(ReadTool, "run", tracked_read)
+    monkeypatch.setattr(WriteTool, "run", stub_write)
+    reads = tuple(
+        ToolUseBlock(f"r{i}", "Read", {"path": "a.py"}) for i in range(MAX_CONCURRENT_READS + 4)
+    )
+    calls = (*reads, ToolUseBlock("w1", "Write", {"path": "x.txt", "content": "X"}))
+    await executor(policy).run_batch(calls, start("hi"))
+    assert peak == MAX_CONCURRENT_READS
+
+
+async def test_a_refused_call_between_two_reads_does_not_split_the_concurrent_group(
+    policy, tmp_repo, monkeypatch
+):
+    """A refused call never executes, so grouping is computed over the
+    sequence of calls that actually run -- not the raw request sequence -- and
+    this one, sitting between two reads, must not break them into two
+    sequential groups.
+    """
+    from nanoclaude.tools.read import ReadTool
+
+    order: list[str] = []
+
+    async def tracked_read(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        order.append(f"{call_id}:start")
+        await asyncio.sleep(0.05)
+        order.append(f"{call_id}:end")
+        return ok(call_id, "read")
+
+    monkeypatch.setattr(ReadTool, "run", tracked_read)
+    calls = (
+        ToolUseBlock("t1", "Read", {"path": "a.py"}),
+        ToolUseBlock("t2", "Read", {"path": "/etc/passwd"}),  # denied; never reaches run()
+        ToolUseBlock("t3", "Read", {"path": "b.py"}),
+    )
+    outcomes = await executor(policy).run_batch(calls, start("hi"))
+    assert outcomes[1].is_error
+    assert order == ["t1:start", "t3:start", "t1:end", "t3:end"]
+
+
+async def test_after_a_write_then_read_in_one_batch_a_later_edit_succeeds(policy, tmp_repo):
+    """End-to-end proof, through the real agent.loop machinery rather than
+    Executor alone, that the scheduling fix keeps read_state honest. Before
+    the fix, the Read in [Write(x), Read(x)] ran before the Write; once
+    observe() folded both outcomes in request order, the Read's stamp of the
+    OLD content overwrote the Write's stamp of the NEW one, and this Edit
+    would have been wrongly refused as "changed since it was read" even
+    though nothing touched the file outside the agent.
+    """
+    ex = executor(policy)
+    turn1 = step(
+        start("hi"),
+        calls_many(
+            ("Write", {"path": "x.txt", "content": "first\n"}, "t1"),
+            ("Read", {"path": "x.txt"}, "t2"),
+        ),
+    )
+    assert isinstance(turn1, RunTools)
+    outcomes = await ex.run_batch(turn1.calls, turn1.state)
+    assert "first" in outcomes[1].content
+    state = observe(turn1.state, outcomes)
+
+    turn2 = step(
+        state,
+        model_calls(
+            "Edit",
+            {"path": "x.txt", "edits": [{"old_string": "first", "new_string": "second"}]},
+            call_id="t3",
+        ),
+    )
+    assert isinstance(turn2, RunTools)
+    edit_outcomes = await ex.run_batch(turn2.calls, turn2.state)
+    assert not edit_outcomes[0].is_error
+    assert (tmp_repo / "x.txt").read_text() == "second\n"
+
+
+async def test_on_decision_is_called_for_refusals_that_never_reach_evaluate(policy, tmp_repo):
+    """_refused() covers two early-exit paths that never reach evaluate() at
+    all: an unknown tool name, and arguments bad enough that
+    permission_request() itself raises. Both must still notify the UI -- a
+    front end that renders decisions from on_decision alone must not silently
+    miss them just because the audit log already hears about them.
+    """
+
+    class RecordingUI(SilentUI):
+        def __init__(self) -> None:
+            self.decisions: list[tuple[str, str]] = []
+
+        def on_decision(
+            self, call: ToolUseBlock, _request: PermissionRequest, result: PermissionResult
+        ) -> None:
+            self.decisions.append((call.id, result.rule))
+
+    (tmp_repo / "a.py").write_text("x")
+    ui = RecordingUI()
+    calls = (
+        ToolUseBlock("t1", "Nope", {}),  # tool.unknown, never reaches evaluate()
+        ToolUseBlock("t2", "Read", {}),  # tool.bad-arguments, never reaches evaluate()
+        ToolUseBlock("t3", "Read", {"path": "a.py"}),  # ordinary decision, for contrast
+    )
+    await executor(policy, ui).run_batch(calls, start("hi"))
+    assert ui.decisions == [
+        ("t1", "tool.unknown"),
+        ("t2", "tool.bad-arguments"),
+        ("t3", "rule.allow"),
+    ]
