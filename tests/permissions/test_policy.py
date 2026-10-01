@@ -198,3 +198,47 @@ def test_a_policy_with_no_secret_paths_configured_never_denies_on_that_basis():
     p = policy(secret_paths=())
     result = evaluate(req(subject="/p/.env", paths=("/p/.env",)), p, Grants())
     assert (result.decision, result.rule) == (Decision.ALLOW, "rule.allow")
+
+
+# The three tests below were added after actually deleting rows from evaluate()
+# one at a time and finding that the full suite, including every test above,
+# stayed green -- the task's own standard for an unpinned branch. Each
+# docstring records what deleting the row did instead, with nothing left to
+# catch it.
+
+
+def test_allow_secrets_opts_out_of_the_secret_path_check():
+    """Row 2 is also gated by Policy.allow_secrets, default False.
+
+    Replacing ``if not policy.allow_secrets:`` with ``if True:`` left every
+    test above green, because none of them ever set allow_secrets=True.
+    """
+    p = policy(allow_secrets=True)
+    result = evaluate(req(subject="/p/.env", paths=("/p/.env",)), p, Grants())
+    assert (result.decision, result.rule) == (Decision.ALLOW, "rule.allow")
+
+
+def test_an_explicit_allow_rule_produces_rule_allow():
+    """Row 8. Deleting it left every test above green.
+
+    Every other ALLOW test above uses a read-only tool (Read/Glob/Grep),
+    which row 10 (tool.read-only) also allows -- deleting row 8 just made
+    those requests fall through to row 10 instead, and no test checked
+    .rule precisely enough to notice. Bash is never read-only, so an
+    explicit allow rule for it can only be satisfied by row 8.
+    """
+    p = policy(rules=RuleSet.build(allow=["Bash"]))
+    result = evaluate(req(tool="Bash", subject="ls", paths=()), p, Grants())
+    assert (result.decision, result.rule) == (Decision.ALLOW, "rule.allow")
+
+
+def test_an_explicit_ask_rule_produces_rule_ask():
+    """Row 11. Deleting it left every test above green.
+
+    test_accept_edits_allows_file_edits_and_still_asks_for_bash sends this
+    same Bash request through this same row, but asserts only .decision --
+    row 12 (default.ask) produces the same Decision.ASK, so deleting row 11
+    made that request fall through to row 12 and nothing noticed.
+    """
+    result = evaluate(req(tool="Bash", subject="ls", paths=()), policy(), Grants())
+    assert (result.decision, result.rule) == (Decision.ASK, "rule.ask")
