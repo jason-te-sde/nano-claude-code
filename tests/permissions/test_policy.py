@@ -399,6 +399,58 @@ def test_grants_normalizes_a_plain_set_into_a_hashable_frozenset():
     assert hash(grants) == hash(Grants(frozenset({"Bash"})))
 
 
+def test_policy_normalizes_a_list_of_secret_paths_so_evaluate_does_not_raise():
+    """The conditional-hashability trap this task's global constraints name,
+    for Policy.secret_paths rather than Grants.tools (see
+    test_grants_normalizes_a_plain_set_into_a_hashable_frozenset above):
+    RuleSet.build's own allow/ask/deny parameters are typed list[str] | None,
+    so a list is a natural shape for a caller to reach for here too, and
+    before this normalization isinstance(p, Hashable) still reported True
+    while hash(p) raised, naming "list" rather than Policy.
+
+    The call that actually matters is evaluate() itself, not an explicit
+    hash(p) nobody makes in real use: the secret.path check hands
+    secret_paths straight to glob_matches_any, whose @functools.cache-d
+    helper hashes its patterns argument on every call, so an unnormalized
+    list reached that cache and raised TypeError from inside the decision
+    path, for a request that used to return a normal DENY result.
+    """
+    p = Policy(Sandbox((ROOT,)), RuleSet.build(), secret_paths=["**/.env*"])  # type: ignore[arg-type]
+    assert isinstance(p.secret_paths, tuple)
+    assert hash(p) == hash(Policy(Sandbox((ROOT,)), RuleSet.build(), secret_paths=("**/.env*",)))
+    result = evaluate(PermissionRequest("Read", "/p/.env", ("/p/.env",), False, None), p, Grants())
+    assert (result.decision, result.rule) == (Decision.DENY, "secret.path")
+
+
+def test_grants_rejects_a_bare_string_instead_of_scattering_it_into_characters():
+    """frozenset() does not reject a string -- it iterates one like any
+    other sequence, so Grants("Bash") used to silently produce
+    frozenset({"B", "a", "s", "h"}): a grant that matches no real tool name,
+    not even "Bash" itself. mypy --strict already rejects this at a typed
+    call site (tools: frozenset[str] is not satisfied by str, hence the
+    ignore below), so this guards the untyped or dynamically-built caller
+    instead -- the same population Grants.__post_init__'s existing
+    normalization protects against an unhashable plain set.
+    """
+    with pytest.raises(TypeError, match="one grant per character"):
+        Grants("Bash")  # type: ignore[arg-type]
+
+
+def test_relative_of_a_path_equal_to_a_root_returns_a_single_dot():
+    """PurePosixPath.relative_to gives "." for a path equal to the root
+    itself; the pre-round-1 code (plain string slicing) gave "" for the same
+    input. Pinning the current behavior as a decision on record rather than
+    an accident: a rule written as "**" or "*" matches both "." and "" --
+    and, regardless, already matched this same request via the raw,
+    un-relativized candidate that also sits in evaluate()'s `subjects` tuple
+    -- so the only rule shape this could ever change the outcome for is one
+    whose subject is the literal "." itself (e.g. Read(.)), and nothing in
+    this suite, or the brief, writes one.
+    """
+    p = Policy(Sandbox((ROOT,)), RuleSet.build())
+    assert p.relative(ROOT) == "."
+
+
 def test_policy_is_hashable():
     # Fields are sandbox: Sandbox (hashable, tests/permissions/test_sandbox.py),
     # rules: RuleSet (hashable, tests/permissions/test_rules.py), mode: a str

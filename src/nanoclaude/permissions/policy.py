@@ -65,6 +65,32 @@ class Grants:
     tools: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
+        # Read through an object-typed local rather than checking self.tools
+        # directly: tools is declared frozenset[str], so mypy --strict can
+        # prove a direct `isinstance(self.tools, str)` dead (frozenset and
+        # str have "distinct disjoint bases") and refuses it as unreachable.
+        # That proof holds only for a *typed* caller -- the entire point of
+        # this guard is the untyped or Any-typed one the proof cannot see,
+        # e.g. a config loader -- so the check must survive at runtime; this
+        # local only widens what mypy believes, not what is actually there.
+        tools_as_given: object = self.tools
+        if isinstance(tools_as_given, str):
+            # frozenset() does not reject a string -- it iterates one, same
+            # as any other sequence, which turns a single tool name into a
+            # grant for each of its characters instead of a grant for the
+            # tool. That grant is strictly narrower than the caller intended
+            # rather than wider (it matches nothing a real tool name is ever
+            # equal to, including the very name that was passed), so this is
+            # a correctness and debuggability defect rather than a safety
+            # one -- but a silent wrong answer here is worth turning into a
+            # loud one before it reaches the normalization below.
+            raise TypeError(
+                f"Grants.tools got the string {tools_as_given!r}, not a "
+                "collection of tool names -- frozenset() would scatter it "
+                "into one grant per character instead of one grant for the "
+                'whole name. Pass a collection instead, such as {"Bash"} or '
+                '["Bash"].'
+            )
         # Normalized rather than merely typed: tools: frozenset[str] is
         # hashable only if a frozenset is actually what ends up stored there,
         # and nothing before this stopped a caller from passing a plain,
@@ -86,6 +112,23 @@ class Policy:
     mode: PermissionMode = PermissionMode.DEFAULT
     secret_paths: tuple[str, ...] = ()
     allow_secrets: bool = False
+
+    def __post_init__(self) -> None:
+        # Normalized rather than merely typed: secret_paths: tuple[str, ...]
+        # is hashable only if a tuple is actually what ends up stored there,
+        # and nothing before this stopped a caller from passing a plain,
+        # unhashable list instead -- frozen=True's generated __hash__ exists
+        # regardless of what the field holds, so isinstance(x, Hashable)
+        # would still report True, and only calling hash(x) would raise,
+        # naming "list" rather than this class. In practice the raise does
+        # not wait for some explicit hash(policy) nobody calls: evaluate()'s
+        # secret.path check hands this field straight to glob_matches_any,
+        # whose @functools.cache-d helper hashes its patterns argument on
+        # every call, so an unnormalized list reaches that cache and raises
+        # from inside the decision path itself. Mirrors Grants.__post_init__
+        # (above) and Sandbox.__post_init__ (sandbox.py), which normalize
+        # their own fields the same way.
+        object.__setattr__(self, "secret_paths", tuple(self.secret_paths))
 
     def relative(self, path: str) -> str:
         # is_within, not str.startswith: a sibling directory that merely
