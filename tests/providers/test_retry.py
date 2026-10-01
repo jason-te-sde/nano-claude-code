@@ -14,6 +14,8 @@ from nanoclaude.providers.retry import RetryPolicy, classify_status, with_retry
 @pytest.mark.parametrize(
     ("status", "retryable"),
     [
+        (408, True),
+        (425, True),
         (429, True),
         (500, True),
         (502, True),
@@ -195,3 +197,31 @@ def test_an_error_body_that_is_valid_json_but_not_an_object_still_classifies(bod
 def test_a_rejected_key_message_joins_what_and_what_to_do_with_an_em_dash():
     # Spec 17.9's user-facing form is "<what> \u2014 <what to do>".
     assert "\u2014 check the key" in str(classify_status(401, "{}"))
+
+
+async def test_the_smallest_jitter_halves_the_delay_and_never_goes_below_it():
+    delays: list[float] = []
+
+    async def always() -> Never:
+        raise ModelError("x", retryable=True, status=529)
+
+    with pytest.raises(ModelError):
+        await with_retry(
+            always,
+            policy=RetryPolicy(overload_attempts=3, base_delay_s=1.0, max_delay_s=30.0),
+            on_retry=lambda _attempt, d, _reason: delays.append(d),
+            sleep=_no_sleep,
+            jitter=lambda: 0.0,
+        )
+    full = []
+    with pytest.raises(ModelError):
+        await with_retry(
+            always,
+            policy=RetryPolicy(overload_attempts=3, base_delay_s=1.0, max_delay_s=30.0),
+            on_retry=lambda _attempt, d, _reason: full.append(d),
+            sleep=_no_sleep,
+            jitter=lambda: 1.0,
+        )
+    assert delays and all(
+        low == pytest.approx(high / 2) for low, high in zip(delays, full, strict=True)
+    )

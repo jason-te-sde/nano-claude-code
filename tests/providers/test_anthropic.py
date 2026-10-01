@@ -67,8 +67,9 @@ def test_a_stream_that_ends_mid_tool_call_is_a_usable_error():
     """Review Focus #1. Retrying is wrong: earlier tool calls in the turn may
     already have run. The caller must be told, not silently handed {}.
     """
-    with pytest.raises(ModelError, match="incomplete"):
+    with pytest.raises(ModelError, match="incomplete") as excinfo:
         replay("anthropic_truncated.jsonl").result()
+    assert excinfo.value.retryable is False
 
 
 def test_an_error_event_becomes_a_model_error():
@@ -413,3 +414,58 @@ async def test_complete_streams_a_successful_reply_over_http():
     assert reply.blocks[0].text == "hi"
     assert reply.stop is StopKind.END_TURN
     assert reply.usage.input_tokens == 9
+
+
+def _thinking_stream(accumulator: StreamAccumulator) -> None:
+    accumulator.handle("message_start", {"message": {"usage": {"input_tokens": 10}}})
+    accumulator.handle(
+        "content_block_start",
+        {"index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+    )
+    accumulator.handle(
+        "content_block_delta",
+        {"index": 0, "delta": {"type": "thinking_delta", "thinking": "weighing it"}},
+    )
+    for part in ("sig-part-one-", "sig-part-two"):
+        accumulator.handle(
+            "content_block_delta",
+            {"index": 0, "delta": {"type": "signature_delta", "signature": part}},
+        )
+    accumulator.handle("content_block_stop", {"index": 0})
+    accumulator.handle("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": {}})
+    accumulator.handle("message_stop", {})
+
+
+def test_a_thinking_block_keeps_its_streamed_signature():
+    accumulator = StreamAccumulator()
+    _thinking_stream(accumulator)
+    assert accumulator.result().blocks == (
+        ThinkingBlock("weighing it", "sig-part-one-sig-part-two"),
+    )
+
+
+def test_a_thinking_signature_survives_the_round_trip_back_to_the_api():
+    accumulator = StreamAccumulator()
+    _thinking_stream(accumulator)
+    reply = accumulator.result()
+    encoded = encode_messages(
+        Transcript((user_text("q"), Message("assistant", reply.blocks), user_text("next")))
+    )
+    thinking = next(b for m in encoded for b in m["content"] if b.get("type") == "thinking")
+    assert thinking["signature"] == "sig-part-one-sig-part-two"
+
+
+def test_the_tool_list_is_byte_stable_across_turns():
+    tools = (
+        ToolSpec(
+            "Read", "read a file", {"type": "object", "properties": {"path": {"type": "string"}}}
+        ),
+        ToolSpec(
+            "Grep", "search", {"type": "object", "properties": {"pattern": {"type": "string"}}}
+        ),
+    )
+    client = AnthropicClient("k")
+    first = client.payload(ModelRequest("sys", Transcript((user_text("a"),)), tools, 10))
+    second = client.payload(ModelRequest("sys", Transcript((user_text("b"),)), tools, 10))
+    assert first["tools"]
+    assert json.dumps(first["tools"]) == json.dumps(second["tools"])

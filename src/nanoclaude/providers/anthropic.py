@@ -104,6 +104,9 @@ class StreamAccumulator:
         self._kinds: dict[int, tuple[str, Any]] = {}
         self._json: dict[int, list[str]] = {}
         self._text: dict[int, list[str]] = {}
+        # A thinking block's signature streams separately from its text and must
+        # be sent back verbatim on the next turn, so it is kept per block.
+        self._signature: dict[int, list[str]] = {}
         self._closed: set[int] = set()
         self._stop = StopKind.END_TURN
         self._usage = Usage()
@@ -129,6 +132,7 @@ class StreamAccumulator:
             elif kind == "thinking":
                 self._kinds[index] = ("thinking", None)
                 self._text[index] = []
+                self._signature[index] = [str(block.get("signature", ""))]
             elif kind == "tool_use":
                 self._kinds[index] = ("tool_use", (block["id"], block["name"]))
                 self._json[index] = []
@@ -141,6 +145,8 @@ class StreamAccumulator:
                 )
             elif kind == "input_json_delta":
                 self._json.setdefault(index, []).append(delta["partial_json"])
+            elif kind == "signature_delta":
+                self._signature.setdefault(index, []).append(delta["signature"])
         elif event == "content_block_stop":
             self._closed.add(int(data["index"]))
         elif event == "message_delta":
@@ -178,7 +184,12 @@ class StreamAccumulator:
             if kind == "text":
                 blocks.append(TextBlock("".join(self._text.get(index, ()))))
             elif kind == "thinking":
-                blocks.append(ThinkingBlock("".join(self._text.get(index, ()))))
+                blocks.append(
+                    ThinkingBlock(
+                        "".join(self._text.get(index, ())),
+                        "".join(self._signature.get(index, ())),
+                    )
+                )
             else:
                 call_id, name = meta
                 blocks.append(ToolUseBlock(call_id, name, self._decode(index, name)))
