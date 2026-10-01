@@ -184,3 +184,14 @@ def test_retry_policy_is_hashable():
 
 async def _no_sleep(_seconds: float) -> None:
     return None
+
+
+@pytest.mark.parametrize("body", ['"just a string"', "[1, 2, 3]", "42", "null"])
+def test_an_error_body_that_is_valid_json_but_not_an_object_still_classifies(body):
+    error = classify_status(500, body)
+    assert body[:20] in str(error)
+
+
+def test_a_rejected_key_message_joins_what_and_what_to_do_with_an_em_dash():
+    # Spec 17.9's user-facing form is "<what> \u2014 <what to do>".
+    assert "\u2014 check the key" in str(classify_status(401, "{}"))

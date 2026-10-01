@@ -47,6 +47,10 @@ def _message_from(body: str) -> str:
         payload = json.loads(body)
     except ValueError:
         return body[:500]
+    if not isinstance(payload, dict):
+        # Valid JSON need not be an object: a proxy can return a bare string or
+        # a list. Fall back to the raw text rather than raising from .get().
+        return body[:500]
     error = payload.get("error")
     if isinstance(error, dict):
         return str(error.get("message", body))[:500]
@@ -57,7 +61,7 @@ def classify_status(status: int, body: str) -> ModelError:
     detail = _message_from(body)
     if status in (401, 403):
         return ModelError(
-            f"the provider rejected your credentials (HTTP {status}): {detail} - "
+            f"the provider rejected your credentials (HTTP {status}): {detail} — "
             "check the key, or run: ncc init",
             retryable=False,
             status=status,
