@@ -11,7 +11,7 @@ from collections.abc import Hashable
 
 import pytest
 
-from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
+from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor, shannon_entropy
 
 AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 GITHUB_CLASSIC = "ghp_" + "A" * 36
@@ -120,3 +120,13 @@ def test_redactor_is_hashable():
     # a Mapping. Pinned so a later unhashable field is caught.
     assert isinstance(Redactor(), Hashable)
     assert hash(Redactor()) == hash(Redactor())
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("", 0.0), ("aaaa", 0.0), ("ab", 1.0), ("abcd", 2.0)],
+)
+def test_shannon_entropy_is_bits_per_character(value, expected):
+    # scrub() never passes an empty value (the assignment rule needs 16+
+    # characters), so the empty case is pinned here directly.
+    assert shannon_entropy(value) == pytest.approx(expected)
