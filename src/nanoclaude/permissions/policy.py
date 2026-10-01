@@ -179,7 +179,7 @@ def _unpromotable(danger: DangerVerdict | None) -> bool:
     not treat it as a clearance. ``danger is None`` (every file tool) and a
     BLOCKED/UNPARSEABLE verdict both return False here: the former never had
     an opinion to be non-authoritative about, and the latter is already
-    denied three rows earlier at row 4 regardless of this flag.
+    denied earlier, at row 4, regardless of this flag.
     """
     return danger is not None and danger.level is DangerLevel.SAFE and not danger.authoritative
 
