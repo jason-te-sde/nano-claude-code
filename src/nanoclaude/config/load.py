@@ -42,6 +42,7 @@ what to do about it.
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import stat
@@ -198,7 +199,10 @@ def _boolean(value: object, where: str, path: Path) -> bool:
 def _number(value: object, where: str, path: Path) -> float:
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise _wrong(where, path, "a number", value, "write it without quotes")
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError:  # an integer with more digits than a float can hold
+        raise ConfigError(f"{where} in {path} is too large to use — set a smaller number") from None
 
 
 def _whole(minimum: int) -> Checker:
@@ -219,9 +223,9 @@ def _whole(minimum: int) -> Checker:
 
 def _seconds(value: object, where: str, path: Path) -> float:
     number = _number(value, where, path)
-    # Written as "not above zero" rather than "at or below" so that nan, which
-    # compares false both ways, is refused too.
-    if not number > 0:
+    # Written as a range that must hold, rather than one that must not, so that
+    # nan, which compares false both ways, is refused along with inf.
+    if not 0 < number < math.inf:
         raise ConfigError(f"{where} in {path} is {value} — set a positive number of seconds")
     return number
 
@@ -345,6 +349,10 @@ def _models(value: object, where: str, path: Path) -> dict[str, Any]:
     return {alias: _model_entry(entry, f"{where}.{alias}", path) for alias, entry in table.items()}
 
 
+# Any section here may appear in a project's file, which is untrusted. The spec's
+# hooks, mcp, verify and tools sections run commands or load code: when they are
+# added, a project's file must be refused for them, the way it is for allow and
+# base_url. Today they are refused only because no file may have them.
 _SECTION_CHECKS: dict[str, Checker] = {
     "models": _models,
     "roles": _section(dict.fromkeys(ROLES, _alias), noun="role"),
@@ -367,10 +375,12 @@ _SECTION_CHECKS: dict[str, Checker] = {
 
 
 class _Home(NamedTuple):
-    """What lies beneath a project's file: where the home config is, and the models it defines."""
+    """What lies beneath a project's file: where the home config is, the models it
+    defines, and the limits in effect."""
 
     path: Path
     models: Mapping[str, Mapping[str, Any]]
+    limits: Mapping[str, Any]
 
 
 #: What a project config may not say about a model, and why it is the person's to say.
@@ -443,6 +453,27 @@ def _refuse_adapter_change(layer: dict[str, Any], path: Path, home: _Home) -> No
             )
 
 
+#: The limits that bound how long a session runs and how much it reads back. A
+#: project config may lower them but not raise them: a cloned repository should not
+#: give itself more turns, longer commands or larger outputs than the person allows.
+_CEILINGS = ("max_turns", "bash_timeout_s", "output_cap_bytes")
+
+
+def _refuse_raising(layer: dict[str, Any], path: Path, home: _Home) -> None:
+    """Refuse a project config that raises a limit above the one in effect beneath it.
+
+    Run on the checked layer, so each value is known to be a number.
+    """
+    limits = layer.get("limits", {})
+    for key in _CEILINGS:
+        if key in limits and limits[key] > home.limits[key]:
+            raise ConfigError(
+                f"limits.{key} in {path} is {limits[key]}, above your limit of "
+                f"{home.limits[key]} — a project config may lower a limit but not raise it; "
+                f"to allow more, set it in {home.path}"
+            )
+
+
 def _check_layer(raw: dict[str, Any], path: Path, *, home: _Home | None = None) -> dict[str, Any]:
     """Check one file. ``home`` is given for a project's file: where the person's own file
     is, and what it defines, which a project's file may not overstep."""
@@ -458,6 +489,7 @@ def _check_layer(raw: dict[str, Any], path: Path, *, home: _Home | None = None) 
     layer = {name: _SECTION_CHECKS[name](value, name, path) for name, value in raw.items()}
     if home is not None:
         _refuse_adapter_change(layer, path, home)
+        _refuse_raising(layer, path, home)
     return layer
 
 
@@ -589,7 +621,8 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
     ``.nanoclaude/config.toml``; a leading ``~`` in either is expanded. At least
     one of the two files must exist. A project's deny and ask lists stack onto the
     home lists, it may not add allow rules, its models may not name a ``base_url`` or
-    ``api_key_env``, and it may not re-point an alias the home file defines.
+    ``api_key_env``, it may not re-point an alias the home file defines, and it may
+    lower but not raise the limits in ``_CEILINGS``.
     """
     user_path = _expand(home) / CONFIG_DIRNAME / CONFIG_FILENAME
     layers = [(user_path, False)]  # (file, is it a project's)
@@ -602,13 +635,19 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
 
     found: list[Path] = []
     # The permission lists begin as the defaults, so that a project, which adds to
-    # the list beneath it, adds to the defaults when the home file says nothing.
-    merged: dict[str, Any] = {"permissions": asdict(PermissionsConfig())}
+    # the list beneath it, adds to the defaults when the home file says nothing; the
+    # limits likewise, so that a project's are measured against the ones in effect.
+    merged: dict[str, Any] = {
+        "permissions": asdict(PermissionsConfig()),
+        "limits": asdict(LimitsConfig()),
+    }
     for path, is_project in layers:
         raw = _read(path)
         if raw is not None:
             found.append(path)
-            beneath = _Home(user_path, merged.get("models", {})) if is_project else None
+            beneath = (
+                _Home(user_path, merged.get("models", {}), merged["limits"]) if is_project else None
+            )
             layer = _check_layer(raw, path, home=beneath)
             merged = _merge(merged, layer, stack=is_project)
     if not found:

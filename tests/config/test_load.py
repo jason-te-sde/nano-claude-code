@@ -1835,3 +1835,110 @@ def test_any_two_files_give_a_usable_config_or_a_refusal_in_spec_form(home, proj
                 isinstance(entry.context_window, int) and entry.context_window >= 1
             )
             assert entry.native_tools is None or isinstance(entry.native_tools, bool)
+
+
+# --------------------------------------------------------------------------
+# A project may lower a limit but not raise it
+# --------------------------------------------------------------------------
+
+CEILINGS = ["max_turns", "bash_timeout_s", "output_cap_bytes"]
+
+
+@pytest.mark.parametrize("key", CEILINGS)
+def test_a_project_config_cannot_raise_a_limit(tmp_path, key):
+    default = getattr(LimitsConfig(), key)
+    message = refusal(tmp_path, BASE, f"[limits]\n{key} = {default * 2}\n")
+    assert f"limits.{key} in {project_file(tmp_path)}" in message
+    assert f"above your limit of {default}" in message
+    assert f"set it in {home_file(tmp_path)}" in message
+
+
+@pytest.mark.parametrize("key", CEILINGS)
+@pytest.mark.parametrize("share", [0.5, 1], ids=["lower", "the same"])
+def test_a_project_config_may_lower_or_restate_a_limit(tmp_path, key, share):
+    value = type(getattr(LimitsConfig(), key))(getattr(LimitsConfig(), key) * share)
+    config = load(tmp_path, BASE, f"[limits]\n{key} = {value}\n")
+    assert getattr(config.limits, key) == value
+
+
+def test_a_project_limit_is_measured_against_the_home_limit_not_the_default(tmp_path):
+    raised = load(tmp_path, BASE + "[limits]\nmax_turns = 100\n", "[limits]\nmax_turns = 80\n")
+    assert raised.limits.max_turns == 80
+    lowered = refusal(tmp_path, BASE + "[limits]\nmax_turns = 10\n", "[limits]\nmax_turns = 20\n")
+    assert "above your limit of 10" in lowered
+
+
+def test_a_project_config_may_still_set_the_limits_that_bound_nothing(tmp_path):
+    # These shape what compaction keeps; they do not bound how long a session runs.
+    config = load(tmp_path, BASE, "[limits]\ncompact_hard = 0.95\nkeep_recent_turns = 6\n")
+    assert config.limits.compact_hard == 0.95
+    assert config.limits.keep_recent_turns == 6
+
+
+def test_an_infinite_timeout_is_refused(tmp_path):
+    message = refusal(tmp_path, BASE + "[limits]\nbash_timeout_s = inf\n")
+    assert f"limits.bash_timeout_s in {home_file(tmp_path)}" in message
+
+
+def test_a_number_too_large_for_a_float_is_reported_not_raised(tmp_path):
+    message = refusal(tmp_path, BASE + "[limits]\nbash_timeout_s = 1" + "0" * 400 + "\n")
+    assert "is too large to use" in message
+
+
+# --------------------------------------------------------------------------
+# The refusals read the parsed tables, so every TOML spelling is refused alike
+# --------------------------------------------------------------------------
+
+SPELLINGS = ["table", "dotted key", "inline table", "quoted key"]
+
+
+@pytest.mark.parametrize(
+    "project_text",
+    [
+        '[permissions]\nallow = ["Bash"]\n',
+        'permissions.allow = ["Bash"]\n',
+        'permissions = { allow = ["Bash"] }\n',
+        '[permissions]\n"allow" = ["Bash"]\n',
+    ],
+    ids=SPELLINGS,
+)
+def test_a_project_allow_is_refused_however_it_is_spelled(tmp_path, project_text):
+    assert "permissions.allow in" in refusal(tmp_path, BASE, project_text)
+
+
+@pytest.mark.parametrize(
+    "project_text",
+    [
+        '[models.m]\nbase_url = "http://localhost:1"\n',
+        'models.m.base_url = "http://localhost:1"\n',
+        'models = { m = { base_url = "http://localhost:1" } }\n',
+        '[models."m"]\nbase_url = "http://localhost:1"\n',
+    ],
+    ids=SPELLINGS,
+)
+def test_a_project_base_url_is_refused_however_it_is_spelled(tmp_path, project_text):
+    assert "models.m.base_url in" in refusal(tmp_path, BASE, project_text)
+
+
+@pytest.mark.parametrize(
+    "project_text",
+    [
+        '[models.m]\nadapter = "ollama"\n',
+        'models.m.adapter = "ollama"\n',
+        'models = { m = { adapter = "ollama" } }\n',
+        '[models."m"]\nadapter = "ollama"\n',
+    ],
+    ids=SPELLINGS,
+)
+def test_a_project_adapter_change_is_refused_however_it_is_spelled(tmp_path, project_text):
+    assert "models.m.adapter in" in refusal(tmp_path, BASE, project_text)
+
+
+@pytest.mark.parametrize(
+    "project_text",
+    ['[[permissions]]\nallow = ["Bash"]\n', '[permissions]\nAllow = ["Bash"]\n'],
+    ids=["array of tables", "other case"],
+)
+def test_other_shapes_of_a_project_allow_are_refused_too(tmp_path, project_text):
+    message = refusal(tmp_path, BASE, project_text)
+    assert str(project_file(tmp_path)) in message
