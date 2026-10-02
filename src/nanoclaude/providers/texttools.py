@@ -31,7 +31,10 @@ _CLOSE = re.compile(r"</tool\s*>", re.IGNORECASE)
 #: Any opening tag at all, well-formed or not. A match that _OPEN rejected is a
 #: call the model meant to make in the wrong form, and it is reported as such
 #: rather than passed through silently as prose.
-_ANY_OPEN = re.compile(r"<tool\b[^>]*>", re.IGNORECASE)
+#: The attribute run is bounded: with no ">" anywhere after a "<tool", an
+#: unbounded [^>]* rescans to the end of the text from every occurrence, which is
+#: quadratic. No real opening tag is 256 characters long.
+_ANY_OPEN = re.compile(r"<tool\b[^>]{0,256}>", re.IGNORECASE)
 
 TOOL_PROTOCOL_PROMPT = """\
 You do not have a function-calling interface. To use a tool, write a block in \

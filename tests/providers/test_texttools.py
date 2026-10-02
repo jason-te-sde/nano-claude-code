@@ -303,3 +303,15 @@ def test_an_opening_tag_in_the_wrong_form_is_reported_not_ignored(tag):
     assert not any(isinstance(b, ToolUseBlock) for b in blocks)
     assert len(problems) == 1
     assert "not in the expected form" in problems[0]
+
+
+def test_many_tag_fragments_with_no_closing_bracket_parse_quickly():
+    # Regression guard for the malformed-tag check: an unbounded pattern took
+    # about 1.5s on this input and grew quadratically. Bounded, it is linear;
+    # the threshold leaves a wide margin for a slow machine.
+    import time
+
+    text = ("<tool" + " " * 50) * 8_000
+    started = time.perf_counter()
+    parse_text_tools(text, next_id=_ids())
+    assert time.perf_counter() - started < 0.5
