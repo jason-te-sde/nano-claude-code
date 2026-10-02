@@ -326,3 +326,19 @@ async def test_a_programming_error_in_the_probe_is_not_disguised_as_a_capability
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         with pytest.raises(RuntimeError, match="bug"):
             await probe_ollama("m", base_url="http://x", client=http)
+
+
+async def test_an_unexpected_error_inside_the_probe_request_is_not_swallowed(monkeypatch):
+    # Distinct from the test above: this one raises inside the try block, so
+    # it pins that the except clause names its failure types rather than
+    # catching Exception.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"template": "", "model_info": {}})
+
+    def broken_json(_self: httpx.Response) -> Never:
+        raise RuntimeError("bug while parsing")
+
+    monkeypatch.setattr(httpx.Response, "json", broken_json)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(RuntimeError, match="bug while parsing"):
+            await probe_ollama("m", base_url="http://x", client=http)
