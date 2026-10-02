@@ -2,7 +2,10 @@
 
 Two files, project over user, merged key by key rather than wholesale -- a
 project that wants a tighter turn limit should not have to restate its models.
-A list is a single value, so a list the project sets replaces the user's.
+A list in the user's file replaces the default, because the person's own file
+says what they want. A list in the project's file stacks onto the one beneath it,
+each rule once and in order, because a repository's config is not the person's
+own: it can add a rule and can never take one away, and an empty list is a no-op.
 
 Validation happens here rather than at first use. "Role explore points at a
 model you have not defined" is a sentence worth reading before the first
@@ -29,6 +32,7 @@ from __future__ import annotations
 import re
 import tomllib
 from collections.abc import Callable, Mapping
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -384,11 +388,21 @@ def check_roles(roles: RolesConfig, models: Mapping[str, ModelConfig]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+def _union(first: tuple[str, ...], second: tuple[str, ...]) -> tuple[str, ...]:
+    """Both lists in order, each entry once."""
+    return tuple(dict.fromkeys((*first, *second)))
+
+
+def _merge(base: dict[str, Any], overlay: dict[str, Any], *, stack: bool) -> dict[str, Any]:
+    """Tables merge key by key, a list stacks onto the one beneath it when ``stack``, and
+    anything else is replaced. A list is a tuple here: ``_rules`` made it one."""
     merged = dict(base)
     for key, value in overlay.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _merge(merged[key], value)
+        beneath = merged.get(key)
+        if isinstance(value, dict) and isinstance(beneath, dict):
+            merged[key] = _merge(beneath, value, stack=stack)
+        elif stack and isinstance(value, tuple) and isinstance(beneath, tuple):
+            merged[key] = _union(beneath, value)
         else:
             merged[key] = value
     return merged
@@ -431,17 +445,19 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
     one of the two files must exist.
     """
     user_path = _expand(home) / CONFIG_DIRNAME / CONFIG_FILENAME
-    paths = [user_path]
+    layers = [(user_path, False)]  # (file, is it a project's)
     if project:
-        paths.append(_expand(project) / CONFIG_DIRNAME / CONFIG_FILENAME)
+        layers.append((_expand(project) / CONFIG_DIRNAME / CONFIG_FILENAME, True))
 
     found: list[Path] = []
-    merged: dict[str, Any] = {}
-    for path in paths:
+    # The permission lists begin as the defaults, so that a project, which adds to
+    # the list beneath it, adds to the defaults when the home file says nothing.
+    merged: dict[str, Any] = {"permissions": asdict(PermissionsConfig())}
+    for path, is_project in layers:
         raw = _read(path)
         if raw is not None:
             found.append(path)
-            merged = _merge(merged, _check_layer(raw, path))
+            merged = _merge(merged, _check_layer(raw, path), stack=is_project)
     if not found:
         raise ConfigError(f"no configuration found — run: ncc init (it writes {user_path})")
     return _build(merged, found, env)

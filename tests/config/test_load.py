@@ -295,20 +295,75 @@ def test_a_project_changes_one_key_of_a_model_the_home_file_defines(tmp_path):
     assert config.models["m"].api_key_env == "MY_KEY"  # the home file's
 
 
-def test_a_list_the_project_sets_replaces_the_home_list_instead_of_adding_to_it(tmp_path):
-    # The merge is key by key and a list is one value, so the project's list wins
-    # outright. That is the rule; it is pinned so that changing it, to a union say,
-    # is a decision someone makes rather than something that happens.
-    home = BASE + '[permissions]\ndeny = ["Read(**/.env*)"]\n'
+# A repository's config is not the person's own, so it may add rules but never
+# take one away: a list the project sets stacks onto the home list (spec 6.2, "the
+# project config overlays the user's").
+RULES_DEFAULTS = {
+    "allow": ("Read", "Grep", "Glob"),
+    "ask": ("Bash", "Write", "Edit", "Git", "TodoWrite"),
+    "deny": (),
+}
+
+
+@pytest.mark.parametrize("key", ["allow", "ask", "deny"])
+def test_a_list_the_project_sets_is_added_to_the_home_list_not_put_in_its_place(tmp_path, key):
+    home = BASE + f'[permissions]\n{key} = ["Read(**/.env*)"]\n'
+    config = load(tmp_path, home, f'[permissions]\n{key} = ["Bash(curl:*)"]\n')
+    assert getattr(config.permissions, key) == ("Read(**/.env*)", "Bash(curl:*)")
+
+
+def test_a_home_deny_rule_still_applies_when_the_project_has_its_own_deny_list(tmp_path):
+    home = BASE + '[permissions]\ndeny = ["Read(~/.ssh/**)"]\n'
     config = load(tmp_path, home, '[permissions]\ndeny = ["Bash(curl:*)"]\n')
-    assert config.permissions.deny == ("Bash(curl:*)",)
+    assert "Read(~/.ssh/**)" in config.permissions.deny
+    assert "Bash(curl:*)" in config.permissions.deny
+
+
+@pytest.mark.parametrize("key", ["allow", "ask", "deny"])
+def test_an_empty_list_in_the_project_removes_nothing_from_the_home_list(tmp_path, key):
+    home = BASE + f'[permissions]\n{key} = ["Read(**/.env*)"]\n'
+    config = load(tmp_path, home, f"[permissions]\n{key} = []\n")
+    assert getattr(config.permissions, key) == ("Read(**/.env*)",)
+
+
+def test_a_project_allow_or_ask_rule_is_added_to_the_home_rules(tmp_path):
+    home = BASE + '[permissions]\nallow = ["Read"]\nask = ["Bash"]\n'
+    project = '[permissions]\nallow = ["Bash(npm test:*)"]\nask = ["Write(src/**)"]\n'
+    config = load(tmp_path, home, project)
+    assert config.permissions.allow == ("Read", "Bash(npm test:*)")
+    assert config.permissions.ask == ("Bash", "Write(src/**)")
+
+
+def test_stacking_keeps_the_home_order_and_drops_duplicates(tmp_path):
+    home = BASE + '[permissions]\ndeny = ["Read", "Bash(curl:*)", "Read"]\n'
+    config = load(tmp_path, home, '[permissions]\ndeny = ["Bash(curl:*)", "Write", "Read"]\n')
+    assert config.permissions.deny == ("Read", "Bash(curl:*)", "Write")
+
+
+@pytest.mark.parametrize("key", ["allow", "ask"])
+def test_when_the_home_file_sets_no_list_the_project_adds_to_the_default_one(tmp_path, key):
+    config = load(tmp_path, BASE, f'[permissions]\n{key} = ["WebFetch"]\n')
+    assert getattr(config.permissions, key) == (*RULES_DEFAULTS[key], "WebFetch")
+
+
+@pytest.mark.parametrize("key", ["allow", "ask", "deny"])
+def test_an_empty_project_list_leaves_the_default_alone_too(tmp_path, key):
+    config = load(tmp_path, BASE, f"[permissions]\n{key} = []\n")
+    assert getattr(config.permissions, key) == RULES_DEFAULTS[key]
+
+
+def test_a_home_list_still_replaces_the_default_instead_of_stacking_onto_it(tmp_path):
+    # Stacking is what a project does. The person's own file says what they want
+    # and the defaults are only what applies when it says nothing.
+    config = load(tmp_path, BASE + '[permissions]\nallow = ["Read"]\n', "[limits]\nmax_turns = 5\n")
+    assert config.permissions.allow == ("Read",)
 
 
 def test_a_list_the_project_does_not_set_keeps_the_home_list(tmp_path):
     home = BASE + '[permissions]\ndeny = ["Read(**/.env*)"]\n'
-    config = load(tmp_path, home, '[permissions]\nallow = ["Read"]\n')
+    config = load(tmp_path, home, '[permissions]\nallow = ["WebFetch"]\n')
     assert config.permissions.deny == ("Read(**/.env*)",)
-    assert config.permissions.allow == ("Read",)
+    assert config.permissions.allow == ("Read", "Grep", "Glob", "WebFetch")
 
 
 TWO_MODELS = """
@@ -1188,6 +1243,47 @@ def test_check_roles_names_the_first_role_that_points_nowhere():
 def test_check_roles_accepts_roles_that_all_point_at_defined_models():
     models = {"a": ModelConfig("anthropic", "x")}
     check_roles(RolesConfig("a", "a", "a", "a", "a", "a"), models)  # does not raise
+
+
+_POOL = ["Read", "Grep", "Bash", "Bash(npm test:*)", "Read(**/.env*)", "Write(src/**)", "Git"]
+
+
+def _rule_list(rules: list[str]) -> str:
+    return "[" + ", ".join(f'"{rule}"' for rule in rules) + "]"
+
+
+@settings(
+    max_examples=150,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    key=st.sampled_from(["allow", "ask", "deny"]),
+    home=st.one_of(st.none(), st.lists(st.sampled_from(_POOL), max_size=5)),
+    project=st.lists(st.sampled_from(_POOL), max_size=5),
+)
+def test_a_project_file_only_ever_adds_rules(key, home, project):
+    """Whatever the lists are, adding a project file removes no rule that applied without it."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        home_text = BASE + (
+            f"[permissions]\n{key} = {_rule_list(home)}\n" if home is not None else ""
+        )
+        write(root / "home" / ".nanoclaude" / "config.toml", home_text)
+        write(
+            root / "proj" / ".nanoclaude" / "config.toml",
+            f"[permissions]\n{key} = {_rule_list(project)}\n",
+        )
+        without = getattr(
+            load_config(home=str(root / "home"), project=None, env={}).permissions, key
+        )
+        stacked = load_config(home=str(root / "home"), project=str(root / "proj"), env={})
+        with_project = getattr(stacked.permissions, key)
+    assert all(rule in with_project for rule in without), "a rule that applied was removed"
+    assert all(rule in with_project for rule in project), "a project rule was not added"
+    assert len(with_project) == len(set(with_project)), "a rule is listed twice"
+    kept = [rule for rule in with_project if rule in without]
+    assert kept == list(dict.fromkeys(without)), "the order of the rules beneath was disturbed"
 
 
 # --------------------------------------------------------------------------
