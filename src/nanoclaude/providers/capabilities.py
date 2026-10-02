@@ -147,10 +147,15 @@ async def resolve_capabilities(
     model: str,
     *,
     cache: CapabilityCache,
-    probe: Callable[[], Awaitable[Capabilities]] | None = None,
+    probe: Callable[[], Awaitable[Capabilities | None]] | None = None,
     overrides: dict[str, object] | None = None,
 ) -> Capabilities:
-    """Table, then cache, then probe, then the conservative default."""
+    """Table, then cache, then probe, then the conservative default.
+
+    A probe returns None when it could not find out (the server is not up yet, the
+    request timed out). That is not an answer, so it is not remembered: this call
+    assumes the conservative default and the next one asks again.
+    """
     known = capabilities_for(adapter, model)
     if known is not CONSERVATIVE_DEFAULT:
         return _apply(known, overrides)
@@ -160,6 +165,8 @@ async def resolve_capabilities(
     if probe is None:
         return _apply(CONSERVATIVE_DEFAULT, overrides)
     probed = await probe()
+    if probed is None:
+        return _apply(CONSERVATIVE_DEFAULT, overrides)
     cache.put(adapter, model, probed)
     return _apply(probed, overrides)
 

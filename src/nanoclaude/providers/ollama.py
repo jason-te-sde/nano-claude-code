@@ -203,26 +203,29 @@ class OllamaClient:
 
 async def probe_ollama(
     model: str, *, base_url: str = DEFAULT_BASE_URL, client: httpx.AsyncClient | None = None
-) -> Capabilities:
-    """Ask the server what this model's template supports.
+) -> Capabilities | None:
+    """Ask the server what this model's template supports, or None if it could not say.
 
-    Anything unexpected -- server down, model not pulled, template unreadable,
-    a response that is valid JSON but not the object this endpoint documents --
-    returns the conservative default. Being wrong in that direction costs
-    speed; the other direction costs someone's first session.
+    Anything unexpected -- server down or not up yet, a timeout, model not pulled,
+    template unreadable, a response that is valid JSON but not the object this
+    endpoint documents -- is None. It is deliberately not the conservative default:
+    a caller that remembered that would remember "no native tools" for a model that
+    was only unreachable for a moment. The caller falls back to the default for now
+    and asks again next time. Being wrong in that direction costs speed; the other
+    direction costs someone's first session.
     """
     owns = client is None
     http = client or httpx.AsyncClient(timeout=10)
     try:
         response = await http.post(f"{base_url.rstrip('/')}/api/show", json={"model": model})
         if response.status_code >= 400:
-            return CONSERVATIVE_DEFAULT
+            return None
         data = response.json()
         if not isinstance(data, dict):
             # Valid JSON need not be an object: an unexpected response (a
             # proxy's error page, a bare string or list) must degrade to "we
             # do not know" rather than raise out of .get() below.
-            return CONSERVATIVE_DEFAULT
+            return None
         template = str(data.get("template", ""))
         info = data.get("model_info")
         if not isinstance(info, dict):
@@ -237,7 +240,7 @@ async def probe_ollama(
         # not a number. Named rather than caught as Exception, so that a
         # programming error below surfaces instead of quietly making every
         # model look tool-less.
-        return CONSERVATIVE_DEFAULT
+        return None
     finally:
         if owns:
             await http.aclose()
