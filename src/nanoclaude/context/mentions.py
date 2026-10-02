@@ -40,6 +40,10 @@ def expand_mentions(
     # Resolved like the candidate is: a root reached through a symlink (on macOS,
     # anything under /tmp or /var) would otherwise never contain any resolved
     # candidate, and every mention would be silently dropped.
+    if not Path(root).is_absolute():
+        # Resolving a relative root would anchor it to whatever directory the
+        # process happens to be in -- the ambient state Sandbox refuses too.
+        raise ValueError(f"root must be an absolute path, got {root!r}")
     real_root = os.path.realpath(root)
     for match in _MENTION.finditer(text):
         raw = match.group(1)

@@ -79,6 +79,7 @@ def test_mentions_expand_when_the_root_is_reached_through_a_symlink(tmp_path):
     alias.symlink_to(real, target_is_directory=True)
     text, paths = expand_mentions("@a.py", root=str(alias), redactor=Redactor())
     assert "x = 1" in text and len(paths) == 1
+    assert '<file path="a.py">' in text  # shown relative to the resolved root
 
 
 def test_a_symlink_inside_the_project_to_a_file_outside_is_not_expanded(tmp_path):
@@ -121,3 +122,19 @@ def test_the_mention_size_cap_counts_bytes_and_says_it_truncated(tmp_repo, monke
     body = text.split('<file path="wide.txt">\n', 1)[1].split("\n[truncated", 1)[0]
     assert len(body.encode("utf-8")) <= 10
     assert "[truncated at 10 bytes]" in text
+
+
+def test_a_credential_straddling_the_size_cap_is_scrubbed_before_the_cut(tmp_repo, monkeypatch):
+    import nanoclaude.context.mentions as mentions
+
+    monkeypatch.setattr(mentions, "MAX_MENTION_BYTES", 12)
+    (tmp_repo / "cfg.txt").write_text("xxxx " + "AKIAIOSFODNN7EXAMPLE")
+    text, _ = expand_mentions("@cfg.txt", root=str(tmp_repo), redactor=Redactor())
+    assert "AKIA" not in text
+
+
+def test_a_relative_root_is_refused():
+    import pytest
+
+    with pytest.raises(ValueError, match="absolute"):
+        expand_mentions("@a.py", root="relative/dir", redactor=Redactor())

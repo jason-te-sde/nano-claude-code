@@ -89,3 +89,16 @@ def test_a_symlink_to_a_directory_outside_the_project_is_listed_but_not_entered(
     rendered = project_map(str(project))
     assert "vendor/" in rendered
     assert "private-notes.txt" not in rendered
+
+
+def test_an_in_project_link_is_entered_when_the_root_is_reached_through_a_symlink(tmp_path):
+    # The target sits beyond the depth limit, so the link is the only way the
+    # walk can reach found.txt -- which makes the containment check decide it.
+    real = tmp_path / "real"
+    deep = real / "x" / "y" / "z"
+    deep.mkdir(parents=True)
+    (deep / "found.txt").write_text("x")
+    (real / "a_link").symlink_to(deep, target_is_directory=True)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    assert "found.txt" in project_map(str(alias), depth=2)
