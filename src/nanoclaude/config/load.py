@@ -14,6 +14,14 @@ merged, so that a message can name the file that holds the mistake; what only th
 merged result can show -- a model with no adapter, a role that points nowhere --
 is checked afterwards.
 
+A repository's file is not the person's own, so a project config may choose
+models and roles but may not say where requests go or which key to send: naming
+`base_url` or `api_key_env` there is an error, and belongs in the home file. A
+project config that could would let a cloned repository aim the person's key at
+whatever host it liked. The consequence is that a project config cannot define an
+`openai_compat` model, which needs a base_url; it can select one the home file
+defines.
+
 Nothing here is silently ignored. A key that nothing reads, a section this
 version does not have, a misspelled role: each is an error, because the
 alternative is a setting the person believes is in force and is not.
@@ -328,13 +336,47 @@ _SECTION_CHECKS: dict[str, Checker] = {
 }
 
 
-def _check_layer(raw: dict[str, Any], path: Path) -> dict[str, Any]:
+#: What a project config may not say about a model, and why it is the person's to say.
+_NOT_IN_A_PROJECT = {
+    "base_url": (
+        "say where requests go",
+        "; that also means a project config cannot define an openai_compat model, which needs one",
+    ),
+    "api_key_env": ("say which key to send", ""),
+}
+
+
+def _refuse_credential_routing(raw: dict[str, Any], path: Path, home: Path) -> None:
+    """Refuse a project config that names a model's endpoint or key variable.
+
+    Checked on presence, not on value, and before the types are: a wrong value is
+    still an attempt, and the useful answer is where the key belongs.
+    """
+    models = raw.get("models")
+    if not isinstance(models, dict):
+        return
+    for alias, entry in models.items():
+        if not isinstance(entry, dict):
+            continue
+        for key, (what, note) in _NOT_IN_A_PROJECT.items():
+            if key in entry:
+                raise ConfigError(
+                    f"models.{alias}.{key} in {path} is not allowed in a project config "
+                    f"— a repository's file is not trusted to {what}, so set it in {home}{note}"
+                )
+
+
+def _check_layer(raw: dict[str, Any], path: Path, *, home: Path | None = None) -> dict[str, Any]:
+    """Check one file. ``home`` is given for a project's file, and is where it may not
+    put what only the person's own file may say."""
     for name in raw:
         if name not in _SECTION_CHECKS:
             raise ConfigError(
                 f"unknown section {name!r} in {path} "
                 f"— the sections are {', '.join(_SECTION_CHECKS)}"
             )
+    if home is not None:
+        _refuse_credential_routing(raw, path, home)
     return {name: _SECTION_CHECKS[name](value, name, path) for name, value in raw.items()}
 
 
@@ -343,12 +385,20 @@ def _check_layer(raw: dict[str, Any], path: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def check_model(alias: str, adapter: str | None, model: str | None, base_url: str | None) -> None:
+def check_model(
+    alias: str,
+    adapter: str | None,
+    model: str | None,
+    base_url: str | None,
+    *,
+    home_config: Path | None = None,
+) -> None:
     """Refuse a model entry that cannot be used, naming what it lacks.
 
     Also called by the router before it builds a client, so a ``ModelConfig`` made
     by hand gets the same answer as one read from a file instead of being sent to
-    whichever adapter happens to be the fallback.
+    whichever adapter happens to be the fallback. The loader passes ``home_config``,
+    the one file that may give an ``openai_compat`` model its base_url.
     """
     known = ", ".join(KNOWN_ADAPTERS)
     if adapter is None:
@@ -360,9 +410,15 @@ def check_model(alias: str, adapter: str | None, model: str | None, base_url: st
             f'model {alias!r} has no model id — set model = "<id>" in [models.{alias}]'
         )
     if adapter == "openai_compat" and not base_url:
+        where = (
+            f", in {home_config}; a project config cannot set it, so the model has to be "
+            "defined there"
+            if home_config is not None
+            else ""
+        )
         raise ConfigError(
             f"model {alias!r} uses openai_compat but has no base_url — set base_url to "
-            "the endpoint, such as https://api.openai.com/v1"
+            f"the endpoint, such as https://api.openai.com/v1{where}"
         )
 
 
@@ -408,10 +464,18 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any], *, stack: bool) -> dic
     return merged
 
 
-def _build(raw: dict[str, Any], paths: list[Path], env: Mapping[str, str]) -> Config:
+def _build(
+    raw: dict[str, Any], paths: list[Path], env: Mapping[str, str], user_path: Path
+) -> Config:
     models: dict[str, ModelConfig] = {}
     for alias, entry in raw.get("models", {}).items():
-        check_model(alias, entry.get("adapter"), entry.get("model"), entry.get("base_url"))
+        check_model(
+            alias,
+            entry.get("adapter"),
+            entry.get("model"),
+            entry.get("base_url"),
+            home_config=user_path,
+        )
         models[alias] = ModelConfig(**entry)
     if not models:
         raise ConfigError(
@@ -447,7 +511,11 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
     user_path = _expand(home) / CONFIG_DIRNAME / CONFIG_FILENAME
     layers = [(user_path, False)]  # (file, is it a project's)
     if project:
-        layers.append((_expand(project) / CONFIG_DIRNAME / CONFIG_FILENAME, True))
+        project_path = _expand(project) / CONFIG_DIRNAME / CONFIG_FILENAME
+        # Run from the home directory, the "project" file is the home file: the
+        # person's own, read once as that, not a second time as a repository's.
+        if project_path.resolve() != user_path.resolve():
+            layers.append((project_path, True))
 
     found: list[Path] = []
     # The permission lists begin as the defaults, so that a project, which adds to
@@ -457,7 +525,8 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
         raw = _read(path)
         if raw is not None:
             found.append(path)
-            merged = _merge(merged, _check_layer(raw, path), stack=is_project)
+            layer = _check_layer(raw, path, home=user_path if is_project else None)
+            merged = _merge(merged, layer, stack=is_project)
     if not found:
         raise ConfigError(f"no configuration found — run: ncc init (it writes {user_path})")
-    return _build(merged, found, env)
+    return _build(merged, found, env, user_path)

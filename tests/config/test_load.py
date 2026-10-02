@@ -468,10 +468,13 @@ model = "qwen3-coder"
 
 
 def test_a_model_only_the_project_defines_has_its_key_kept_too(tmp_path):
-    project = '[models.p]\nadapter = "anthropic"\nmodel = "claude-opus-5"\napi_key_env = "P_KEY"\n'
-    config = load(tmp_path, BASE, project, env={"P_KEY": "pk", "OTHER": "no"})
+    # The home model needs no key, so the one variable held is there only because the
+    # project's model uses it: its adapter's own, since a project may not name another.
+    home = '[models.m]\nadapter = "ollama"\nmodel = "qwen3-coder"\n'
+    project = '[models.p]\nadapter = "anthropic"\nmodel = "claude-opus-5"\n'
+    config = load(tmp_path, home, project, env={"ANTHROPIC_API_KEY": "pk", "OTHER": "no"})
     assert config.api_key_for("p") == "pk"
-    assert config.env == {"P_KEY": "pk"}
+    assert config.env == {"ANTHROPIC_API_KEY": "pk"}
 
 
 def test_the_config_does_not_share_the_dictionary_it_was_given(tmp_path):
@@ -1135,6 +1138,164 @@ def test_the_config_ncc_init_writes_for_an_openai_compatible_endpoint_loads(tmp_
 
 
 # --------------------------------------------------------------------------
+# A repository's config is not the person's own. It may choose models and roles,
+# but where requests go and which key is sent are the person's to say, in their
+# home file: a project config that could say them could aim the person's key at
+# whatever host the repository liked.
+# --------------------------------------------------------------------------
+
+OPENAI_HOME = """
+[models.cheap]
+adapter     = "openai_compat"
+model       = "deepseek/deepseek-v3"
+base_url    = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+"""
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "reason"),
+    [
+        ("base_url", '"https://x/v1"', "say where requests go"),
+        ("api_key_env", '"MY_KEY"', "say which key to send"),
+    ],
+)
+def test_a_project_config_may_not_name_an_endpoint_or_a_key_variable(tmp_path, key, value, reason):
+    message = refusal(tmp_path, BASE, f"[models.m]\n{key} = {value}\n")
+    assert (
+        f"models.m.{key} in {project_file(tmp_path)} is not allowed in a project config" in message
+    )
+    assert f"not trusted to {reason}, so set it in {home_file(tmp_path)}" in message
+
+
+@pytest.mark.parametrize("key", ["base_url", "api_key_env"])
+@pytest.mark.parametrize("value", ['"https://x/v1"', '""', "5", '["x"]'])
+def test_the_refusal_is_for_naming_the_key_whatever_it_is_given(tmp_path, key, value):
+    # Presence, not value: a wrong value does not turn the refusal into a type error.
+    project = f'[models.p]\nadapter = "anthropic"\nmodel = "claude-opus-5"\n{key} = {value}\n'
+    message = refusal(tmp_path, BASE, project)
+    assert (
+        f"models.p.{key} in {project_file(tmp_path)} is not allowed in a project config" in message
+    )
+
+
+def test_a_project_config_cannot_define_an_openai_compat_model_and_says_why(tmp_path):
+    project = '[models.p]\nadapter = "openai_compat"\nmodel = "gpt-5"\nbase_url = "https://x/v1"\n'
+    message = refusal(tmp_path, BASE, project)
+    assert "models.p.base_url" in message
+    assert "a project config cannot define an openai_compat model, which needs one" in message
+
+
+def test_a_project_openai_compat_model_without_a_base_url_is_sent_to_the_home_file(tmp_path):
+    message = refusal(tmp_path, BASE, '[models.p]\nadapter = "openai_compat"\nmodel = "gpt-5"\n')
+    assert "model 'p' uses openai_compat but has no base_url" in message
+    assert f"in {home_file(tmp_path)}; a project config cannot set it" in message
+    assert "so the model has to be defined there" in message
+
+
+@pytest.mark.parametrize(
+    ("project", "where", "problem"),
+    [
+        ("models = 'x'\n", "models in", "must be a table, not a string"),
+        ("[models]\nm = 'x'\n", "models.m in", "must be a table, not a string"),
+        ("[models]\nm = 5\n", "models.m in", "must be a table, not a whole number"),
+        # Containing the name of a key is not naming it: a string or a list that
+        # merely holds the word is not a model that sets base_url.
+        ("[models]\nm = 'base_url'\n", "models.m in", "must be a table, not a string"),
+        ("[models]\nm = ['base_url']\n", "models.m in", "must be a table, not a list"),
+    ],
+    ids=[
+        "models-a-string",
+        "alias-a-string",
+        "alias-a-number",
+        "alias-says-base_url",
+        "alias-lists-it",
+    ],
+)
+def test_a_project_file_whose_models_have_the_wrong_shape_gets_the_type_error(
+    tmp_path, project, where, problem
+):
+    # The check for the keys a project may not name looks inside the models; where
+    # there is nothing of the right shape to look inside, the ordinary error follows.
+    message = refusal(tmp_path, BASE, project)
+    assert f"{where} {project_file(tmp_path)} {problem}" in message
+
+
+def test_the_home_file_is_still_told_to_give_an_openai_compat_model_a_base_url(tmp_path):
+    message = refusal(tmp_path, '[models.p]\nadapter = "openai_compat"\nmodel = "gpt-5"\n')
+    assert f"in {home_file(tmp_path)}; a project config cannot set it" in message
+
+
+def test_both_keys_are_accepted_in_the_home_config_with_a_project_config_beside_it(tmp_path):
+    config = load(
+        tmp_path, OPENAI_HOME, "[limits]\nmax_turns = 5\n", env={"OPENROUTER_API_KEY": "k"}
+    )
+    assert config.models["cheap"].base_url == "https://openrouter.ai/api/v1"
+    assert config.models["cheap"].api_key_env == "OPENROUTER_API_KEY"
+    assert config.api_key_for("cheap") == "k"
+
+
+def test_a_project_config_may_choose_an_anthropic_model_and_a_role(tmp_path):
+    project = '[models.p]\nadapter = "anthropic"\nmodel = "claude-opus-5"\n[roles]\nplan = "p"\n'
+    config = load(tmp_path, BASE, project, env={"ANTHROPIC_API_KEY": "k"})
+    assert config.models["p"].model == "claude-opus-5"
+    assert config.roles.plan == "p"
+    assert config.roles.main == "m"  # the home file's
+    assert config.api_key_for("p") == "k"  # the adapter's own variable
+
+
+def test_a_project_config_may_choose_an_ollama_model_and_a_role(tmp_path):
+    project = '[models.l]\nadapter = "ollama"\nmodel = "qwen3-coder"\n[roles]\nexplore = "l"\n'
+    config = load(tmp_path, BASE, project)
+    assert config.roles.explore == "l"
+    assert config.models["l"].base_url is None
+
+
+def test_a_project_config_may_change_the_model_of_a_home_alias_and_keeps_its_endpoint(tmp_path):
+    project = '[models.cheap]\nmodel = "deepseek/deepseek-v3.1"\n[roles]\nexplore = "cheap"\n'
+    config = load(tmp_path, OPENAI_HOME + BASE, project)
+    cheap = config.models["cheap"]
+    assert cheap.model == "deepseek/deepseek-v3.1"  # the project's
+    assert cheap.base_url == "https://openrouter.ai/api/v1"  # the home file's, untouched
+    assert cheap.api_key_env == "OPENROUTER_API_KEY"  # the home file's, untouched
+    assert config.roles.explore == "cheap"
+
+
+def test_a_project_directory_that_is_the_home_directory_is_not_treated_as_a_project(tmp_path):
+    # Run from the home directory, the "project" file is the home file: the
+    # person's own, read once, and free to name an endpoint and a key variable.
+    write(home_file(tmp_path), OPENAI_HOME)
+    config = load_config(
+        home=str(tmp_path / "home"),
+        project=str(tmp_path / "home"),
+        env={"OPENROUTER_API_KEY": "k"},
+    )
+    assert config.models["cheap"].base_url == "https://openrouter.ai/api/v1"
+
+
+def test_a_project_directory_that_reaches_the_home_file_through_a_link_is_the_home_file(tmp_path):
+    write(home_file(tmp_path), OPENAI_HOME)
+    (tmp_path / "link").symlink_to(tmp_path / "home", target_is_directory=True)
+    config = load_config(home=str(tmp_path / "home"), project=str(tmp_path / "link"), env={})
+    assert config.models["cheap"].api_key_env == "OPENROUTER_API_KEY"
+
+
+def test_check_model_does_not_mention_a_home_file_when_it_is_given_none():
+    with pytest.raises(ConfigError) as caught:
+        check_model("m", "openai_compat", "gpt-5", None)
+    assert str(caught.value).endswith("such as https://api.openai.com/v1")
+
+
+def test_check_model_names_the_home_file_when_it_is_given_one():
+    with pytest.raises(ConfigError) as caught:
+        check_model(
+            "m", "openai_compat", "gpt-5", None, home_config=Path("/h/.nanoclaude/config.toml")
+        )
+    message = str(caught.value)
+    assert "such as https://api.openai.com/v1, in /h/.nanoclaude/config.toml; a project" in message
+
+
+# --------------------------------------------------------------------------
 # Sandbox roots. Sandbox refuses a root that is not absolute, by design, so a
 # root never depends on where the process happens to be standing. People write
 # "~/src/lib" in a command line and in a config file all the same.
@@ -1340,17 +1501,22 @@ _REFUSALS = [
 _PRELUDES = [""] * 6 + ["limits = 5\n", 'models = "x"\n', "stray = 1\n"]
 
 
+# What a project's file may not say about a model; the person's own file may.
+_HOME_ONLY = ("base_url", "api_key_env")
+
+
 @st.composite
-def _file_text(draw: st.DrawFn, *, with_model: bool) -> str:
+def _file_text(draw: st.DrawFn, *, home: bool) -> str:
+    """A file that is valid but for, now and then, one value; ``home`` says whose it is."""
     tables: dict[str, dict[str, str]] = {}
-    if with_model:
+    if home:
         tables["models.m"] = {"adapter": '"anthropic"', "model": '"claude-sonnet-5"'}
     for header in draw(st.lists(st.sampled_from(list(_SECTIONS)), max_size=5, unique=True)):
         for key in draw(
             st.lists(st.sampled_from(list(_SECTIONS[header])), max_size=5, unique=True)
         ):
             accepted, _ = _SECTIONS[header][key]
-            if accepted:
+            if accepted and (home or key not in _HOME_ONLY):
                 tables.setdefault(header, {})[key] = draw(st.sampled_from(accepted))
     if draw(st.booleans()):  # and now and then one value that should be refused
         header, key, value = draw(st.sampled_from(_REFUSALS))
@@ -1370,8 +1536,8 @@ def _file_text(draw: st.DrawFn, *, with_model: bool) -> str:
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 @given(
-    home=_file_text(with_model=True),
-    project=_file_text(with_model=False),
+    home=_file_text(home=True),
+    project=_file_text(home=False),
     with_project=st.booleans(),
 )
 def test_any_two_files_give_a_usable_config_or_a_refusal_in_spec_form(home, project, with_project):
