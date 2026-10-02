@@ -55,3 +55,13 @@ jobs:
         with: { python-version: "3.11" }
       - run: pipx install .
       - run: ncc --version
+      # Every other job installs with -e, which reads the source tree, so a data
+      # file the wheel forgot to ship would pass them all. This install is not
+      # editable and imports from outside the checkout, so it sees only what was
+      # packaged.
+      - name: The installed package carries its data files
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-check"
+          "$RUNNER_TEMP/wheel-check/bin/pip" install .
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-check/bin/python" -c "from nanoclaude.providers.pricing import PriceBook; PriceBook.load()"
