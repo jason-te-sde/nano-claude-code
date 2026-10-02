@@ -568,6 +568,43 @@ async def test_an_ollama_model_is_probed_once_at_its_own_server_and_remembered(m
     assert probes == [("qwen3-coder", "http://gpu-box:11434")]
 
 
+async def test_a_probe_that_found_nothing_out_is_not_remembered_between_sessions(
+    make, monkeypatch, tmp_path
+):
+    # Ollama not up yet: the session assumes the conservative default, once, and the
+    # next session asks again. Nothing is written that would make "no native tools"
+    # the permanent answer for a model that was merely unreachable.
+    probes: list[str] = []
+
+    async def unreachable(model: str, *, base_url: str) -> Capabilities | None:
+        probes.append(model)
+        return None
+
+    monkeypatch.setattr("nanoclaude.agent.router.probe_ollama", unreachable)
+    config = Config(models={"l": ModelConfig("ollama", "qwen3-coder")}, roles=roles_all("l"))
+    router = make(config)
+    first = await router.capabilities_for("main")
+    assert first == CONSERVATIVE_DEFAULT
+    assert await router.capabilities_for("explore") is first  # same session: not asked again
+    assert probes == ["qwen3-coder"]
+    assert not (tmp_path / "caps.json").exists()  # nothing was remembered on disk
+    await make(config).capabilities_for("main")  # the next session
+    assert probes == ["qwen3-coder", "qwen3-coder"]
+
+
+async def test_what_the_config_declares_still_applies_when_the_probe_found_nothing_out(
+    make, monkeypatch
+):
+    async def unreachable(model: str, *, base_url: str) -> Capabilities | None:
+        return None
+
+    monkeypatch.setattr("nanoclaude.agent.router.probe_ollama", unreachable)
+    models = {"l": ModelConfig("ollama", "qwen3-coder", context_window=65_536, native_tools=True)}
+    caps = await make(Config(models=models, roles=roles_all("l"))).capabilities_for("main")
+    assert caps.context_window == 65_536
+    assert caps.native_tools is True
+
+
 async def test_an_ollama_model_with_no_server_configured_is_probed_at_the_local_default(
     make, monkeypatch
 ):

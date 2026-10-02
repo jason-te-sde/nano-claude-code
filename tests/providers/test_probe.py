@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 from typing import Never
@@ -29,6 +30,7 @@ async def test_a_model_whose_template_declares_tools_gets_native_tools():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         caps = await probe_ollama("qwen3-coder", base_url="http://x", client=http)
+    assert caps is not None
     assert caps.native_tools and caps.context_window == 32768
 
 
@@ -38,16 +40,19 @@ async def test_a_model_without_a_tools_template_falls_back_to_text_tools():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         caps = await probe_ollama("llama3", base_url="http://x", client=http)
+    assert caps is not None
     assert not caps.native_tools
 
 
-async def test_a_probe_failure_yields_the_conservative_default():
+async def test_a_probe_failure_reports_that_it_found_nothing_out():
+    # None, not the conservative default: a caller that remembered the default would
+    # remember "no native tools" for a model that was only unreachable just now.
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, text="boom")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         caps = await probe_ollama("m", base_url="http://x", client=http)
-    assert caps == CONSERVATIVE_DEFAULT
+    assert caps is None
 
 
 async def test_probe_results_are_cached_on_disk(tmp_path):
@@ -77,7 +82,7 @@ async def test_a_known_model_is_never_probed(tmp_path):
 
 
 @pytest.mark.parametrize("body", [["unexpected"], "just a string", 42, None])
-async def test_a_non_object_probe_response_yields_the_conservative_default(body):
+async def test_a_non_object_probe_response_reports_that_it_found_nothing_out(body):
     # Review focus #3: valid JSON need not be an object. A bare list, string,
     # number or null must not raise an AttributeError out of data.get(...).
     def handler(request: httpx.Request) -> httpx.Response:
@@ -85,7 +90,7 @@ async def test_a_non_object_probe_response_yields_the_conservative_default(body)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         caps = await probe_ollama("m", base_url="http://x", client=http)
-    assert caps == CONSERVATIVE_DEFAULT
+    assert caps is None
 
 
 async def test_a_non_object_model_info_is_treated_as_empty():
@@ -96,19 +101,25 @@ async def test_a_non_object_model_info_is_treated_as_empty():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         caps = await probe_ollama("m", base_url="http://x", client=http)
+    assert caps is not None
     assert caps.native_tools is True
     assert caps.context_window == CONSERVATIVE_DEFAULT.context_window
 
 
-async def test_a_connection_failure_during_probe_yields_the_conservative_default():
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ConnectError("connection refused"), httpx.ReadTimeout("timed out")],
+    ids=["not running yet", "timeout"],
+)
+async def test_a_connection_failure_during_probe_reports_that_it_found_nothing_out(failure):
     # Do not assume ollama is running: probing it must degrade the same way
     # a hard probe failure does, not raise out of the adapter.
     def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused")
+        raise failure
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         caps = await probe_ollama("m", base_url="http://x", client=http)
-    assert caps == CONSERVATIVE_DEFAULT
+    assert caps is None
 
 
 async def test_probe_creates_and_closes_its_own_client_when_none_is_given(monkeypatch):
@@ -136,6 +147,7 @@ async def test_probe_creates_and_closes_its_own_client_when_none_is_given(monkey
 
     caps = await probe_ollama("m", base_url="http://x")
 
+    assert caps is not None
     assert caps.native_tools is True
     assert caps.context_window == 4096
     assert closed["value"] is True
@@ -245,6 +257,76 @@ def test_put_overwrites_an_existing_cache_file(tmp_path):
     second = Capabilities(True, True, "explicit", 100_000, 8_000)
     cache.put("ollama", "m", second)
     assert cache.get("ollama", "m") == second
+
+
+# -- resolve_capabilities: only a probe that found something out is remembered --
+
+
+async def test_a_probe_that_found_nothing_out_is_not_remembered(tmp_path):
+    cache = CapabilityCache(tmp_path / "caps.json")
+    calls = {"n": 0}
+
+    async def probe() -> Capabilities | None:
+        calls["n"] += 1
+        return None
+
+    first = await resolve_capabilities("ollama", "m", cache=cache, probe=probe)
+    assert first == CONSERVATIVE_DEFAULT  # what to assume for now
+    assert cache.get("ollama", "m") is None
+    assert not (tmp_path / "caps.json").exists()  # nothing was written at all
+    await resolve_capabilities("ollama", "m", cache=cache, probe=probe)
+    assert calls["n"] == 2, "the next session has to ask again"
+
+
+async def test_what_the_config_says_still_applies_when_the_probe_found_nothing_out(tmp_path):
+    async def probe() -> Capabilities | None:
+        return None
+
+    caps = await resolve_capabilities(
+        "ollama",
+        "m",
+        cache=CapabilityCache(tmp_path / "caps.json"),
+        probe=probe,
+        overrides={"context_window": 99_999, "native_tools": True},
+    )
+    assert caps.context_window == 99_999
+    assert caps.native_tools is True
+    assert caps.parallel_tools is CONSERVATIVE_DEFAULT.parallel_tools  # the rest: the default
+
+
+async def test_a_probe_that_succeeded_is_remembered_with_what_it_found(tmp_path):
+    cache = CapabilityCache(tmp_path / "caps.json")
+    found = Capabilities(True, False, "none", 32_768, 4_096)
+    calls = {"n": 0}
+
+    async def probe() -> Capabilities | None:
+        calls["n"] += 1
+        return found
+
+    assert await resolve_capabilities("ollama", "m", cache=cache, probe=probe) == found
+    assert cache.get("ollama", "m") == found
+    assert await resolve_capabilities("ollama", "m", cache=cache, probe=probe) == found
+    assert calls["n"] == 1
+
+
+async def test_a_successful_probe_that_matches_the_conservative_default_is_still_remembered(
+    tmp_path,
+):
+    # A model with no tools support and a small window is a real answer that happens
+    # to equal the default. Failure is signalled, not inferred from the value, so it
+    # is remembered like any other result.
+    cache = CapabilityCache(tmp_path / "caps.json")
+    same_values = dataclasses.replace(CONSERVATIVE_DEFAULT)
+    assert same_values == CONSERVATIVE_DEFAULT and same_values is not CONSERVATIVE_DEFAULT
+    calls = {"n": 0}
+
+    async def probe() -> Capabilities | None:
+        calls["n"] += 1
+        return same_values
+
+    await resolve_capabilities("ollama", "m", cache=cache, probe=probe)
+    await resolve_capabilities("ollama", "m", cache=cache, probe=probe)
+    assert calls["n"] == 1, "a successful answer was treated as a failed one"
 
 
 # -- resolve_capabilities: precedence and overrides --------------------------
