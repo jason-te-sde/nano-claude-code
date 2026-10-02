@@ -1,6 +1,9 @@
+import tempfile
 from pathlib import Path
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from nanoclaude.config.load import (
     CONFIG_FILENAME,
@@ -11,6 +14,10 @@ from nanoclaude.config.load import (
     load_config,
 )
 from nanoclaude.config.schema import (
+    DIFF_STYLES,
+    KNOWN_ADAPTERS,
+    ROLES,
+    THEMES,
     Config,
     LimitsConfig,
     ModelConfig,
@@ -18,6 +25,7 @@ from nanoclaude.config.schema import (
     RolesConfig,
     UiConfig,
 )
+from nanoclaude.permissions.rules import Rule
 from nanoclaude.permissions.sandbox import Sandbox
 
 EM_DASH = "—"
@@ -1180,3 +1188,135 @@ def test_check_roles_names_the_first_role_that_points_nowhere():
 def test_check_roles_accepts_roles_that_all_point_at_defined_models():
     models = {"a": ModelConfig("anthropic", "x")}
     check_roles(RolesConfig("a", "a", "a", "a", "a", "a"), models)  # does not raise
+
+
+# --------------------------------------------------------------------------
+# No traceback reaches the user: whatever two files say, the answer is a Config
+# the rest of the program can rely on, or a ConfigError in spec 17.9's form.
+# --------------------------------------------------------------------------
+
+# For each key, what it accepts and what it refuses. A file is built from the
+# first and then given, now and then, one value from the second: files drawn from
+# random values alone would be refused before the boundaries were reached, and a
+# refusal that is the only thing wrong is the one whose branch is under test.
+_Values = tuple[list[str], list[str]]  # (what a key accepts, what it refuses)
+
+_MODEL_KEYS: dict[str, _Values] = {
+    "adapter": (['"anthropic"', '"ollama"'], ['"openai_compat"', '"telepathy"', '""', "3"]),
+    "model": (['"claude-sonnet-5"', '"x"'], ['""', "[1]"]),
+    "base_url": (['"https://x/v1"', '"http://h:1"'], ['"localhost"', '""', "5"]),
+    "api_key_env": (['"MY_KEY"', '"A1"'], ['"sk-ant-aaaa"', '""', "5"]),
+    "context_window": (["1", "64000"], ["0", "1.5", '"big"']),
+    "native_tools": (["true", "false"], ['"yes"']),
+    "api_key": ([], ['"sk-ant-aaaa"']),
+}
+_RULES: _Values = (
+    ['["Read"]', '["Bash(npm test:*)"]', "[]"],
+    ['["Bash("]', '["Bash()"]', '["Read", 1]', '"Read"'],
+)
+_SECTIONS: dict[str, dict[str, _Values]] = {
+    "models.m": _MODEL_KEYS,
+    "roles": {
+        **{role: (['"m"'], ['""', "5", '"nope"']) for role in ROLES},
+        "reviewer": ([], ['"m"']),
+    },
+    "permissions": {"allow": _RULES, "ask": _RULES, "deny": _RULES},
+    "limits": {
+        "max_turns": (["1", "40"], ["0", "-1", "1.5", '"40"', "true"]),
+        "bash_timeout_s": (["30", "0.5"], ["0", "-1", "nan", '"30"']),
+        "output_cap_bytes": (["1", "100000"], ["0", "2.5"]),
+        "compact_soft": (["0.5", "1"], ["0", "1.5", "nan", '"0.5"']),
+        "compact_hard": (["0.85", "1"], ["0", "2", "nan", '"x"']),
+        "keep_recent_turns": (["1", "3"], ["0", "-1", "2.5", '"3"', "true"]),
+    },
+    "ui": {
+        "theme": (['"auto"', '"dark"'], ['"blue"', "1"]),
+        "diff_style": (['"unified"'], ['"split"', "true"]),
+    },
+    "hooks": {"pre_tool_use": ([], ['["x"]'])},
+}  # fmt: skip
+_REFUSALS = [
+    (header, key, value)
+    for header, table in _SECTIONS.items()
+    for key, (_, refused) in table.items()
+    for value in refused
+]
+_PRELUDES = [""] * 6 + ["limits = 5\n", 'models = "x"\n', "stray = 1\n"]
+
+
+@st.composite
+def _file_text(draw: st.DrawFn, *, with_model: bool) -> str:
+    tables: dict[str, dict[str, str]] = {}
+    if with_model:
+        tables["models.m"] = {"adapter": '"anthropic"', "model": '"claude-sonnet-5"'}
+    for header in draw(st.lists(st.sampled_from(list(_SECTIONS)), max_size=5, unique=True)):
+        for key in draw(
+            st.lists(st.sampled_from(list(_SECTIONS[header])), max_size=5, unique=True)
+        ):
+            accepted, _ = _SECTIONS[header][key]
+            if accepted:
+                tables.setdefault(header, {})[key] = draw(st.sampled_from(accepted))
+    if draw(st.booleans()):  # and now and then one value that should be refused
+        header, key, value = draw(st.sampled_from(_REFUSALS))
+        tables.setdefault(header, {})[key] = value
+    lines = [draw(st.sampled_from(_PRELUDES))]
+    for header, values in tables.items():
+        lines.append(f"[{header}]")
+        lines.extend(f"{key} = {value}" for key, value in values.items())
+    return "\n".join(lines) + "\n"
+
+
+@settings(
+    max_examples=500,
+    deadline=None,
+    # The autouse fixture only points HOME somewhere harmless, the same way for
+    # every example, so sharing it between them cannot change what one finds.
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    home=_file_text(with_model=True),
+    project=_file_text(with_model=False),
+    with_project=st.booleans(),
+)
+def test_any_two_files_give_a_usable_config_or_a_refusal_in_spec_form(home, project, with_project):
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        write(root / "home" / ".nanoclaude" / "config.toml", home)
+        if with_project:
+            write(root / "proj" / ".nanoclaude" / "config.toml", project)
+        try:
+            config = load_config(
+                home=str(root / "home"),
+                project=str(root / "proj") if with_project else None,
+                env={"ANTHROPIC_API_KEY": "k"},
+            )
+        except ConfigError as refused:
+            message = str(refused)
+            assert f" {EM_DASH} " in message and message[:1].islower(), message
+            return
+        # What the rest of the program relies on, for anything that was accepted:
+        # the ranges, and the types the dataclasses claim, which nothing else checks
+        # of data that came out of a file.
+        limits = config.limits
+        assert isinstance(limits.max_turns, int) and limits.max_turns >= 1
+        assert isinstance(limits.output_cap_bytes, int) and limits.output_cap_bytes >= 1
+        assert isinstance(limits.keep_recent_turns, int) and limits.keep_recent_turns >= 1
+        assert isinstance(limits.bash_timeout_s, float) and limits.bash_timeout_s > 0
+        assert isinstance(limits.compact_soft, float) and 0 < limits.compact_soft <= 1
+        assert isinstance(limits.compact_hard, float) and 0 < limits.compact_hard <= 1
+        assert config.ui.theme in THEMES and config.ui.diff_style in DIFF_STYLES
+        for rules in (config.permissions.allow, config.permissions.ask, config.permissions.deny):
+            assert isinstance(rules, tuple)
+            for rule in rules:
+                assert isinstance(rule, str)
+                Rule.parse(rule)  # does not raise
+        assert all(config.roles.alias_for(role) in config.models for role in ROLES)
+        for entry in config.models.values():
+            assert entry.adapter in KNOWN_ADAPTERS and entry.model
+            assert entry.adapter != "openai_compat" or entry.base_url
+            assert entry.base_url is None or entry.base_url.startswith(("http://", "https://"))
+            assert entry.api_key_env is None or entry.api_key_env.isidentifier()
+            assert entry.context_window is None or (
+                isinstance(entry.context_window, int) and entry.context_window >= 1
+            )
+            assert entry.native_tools is None or isinstance(entry.native_tools, bool)
