@@ -77,3 +77,15 @@ def test_an_unreadable_subdirectory_is_listed_but_not_descended_into(tmp_repo):
         assert "locked" in rendered  # listed, even though its contents could not be
     finally:
         locked.chmod(0o700)
+
+
+def test_a_symlink_to_a_directory_outside_the_project_is_listed_but_not_entered(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "private-notes.txt").write_text("x")
+    (project / "vendor").symlink_to(outside, target_is_directory=True)
+    rendered = project_map(str(project))
+    assert "vendor/" in rendered
+    assert "private-notes.txt" not in rendered

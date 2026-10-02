@@ -14,6 +14,7 @@ from pathlib import Path
 import pathspec
 
 from nanoclaude.permissions.rules import GLOB_PATTERN_FACTORY
+from nanoclaude.permissions.sandbox import is_within
 
 DEFAULT_DEPTH = 3
 DEFAULT_MAX_ENTRIES = 200
@@ -57,10 +58,14 @@ def project_map(
             indent = "  " * (level - 1)
             if entry.is_dir():
                 lines.append(f"{indent}{entry.name}/")
-                walk(entry, level + 1)
+                # A symlink pointing outside the project is listed but not entered:
+                # what lies beyond the project root is not the model's to see.
+                if not entry.is_symlink() or is_within(real_root, os.path.realpath(entry)):
+                    walk(entry, level + 1)
             else:
                 lines.append(f"{indent}{entry.name}")
 
+    real_root = os.path.realpath(root)
     walk(Path(root), 1)
     body = "\n".join(lines)
     if truncated:

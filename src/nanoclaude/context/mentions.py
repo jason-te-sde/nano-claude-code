@@ -25,8 +25,9 @@ from nanoclaude.permissions.redact import Redactor
 from nanoclaude.permissions.sandbox import is_within
 from nanoclaude.tools.fs import FileSystemError, read_text
 
-#: Not preceded by a word character, so an email address is not a mention.
-_MENTION = re.compile(r"(?<![\w@])@([\w./~-]+)")
+#: Not preceded by a word character, so an email address is not a mention, and
+#: not ending in a dot, so "see @main.py." at the end of a sentence still works.
+_MENTION = re.compile(r"(?<![\w@])@([\w./~-]*[\w/~-])")
 MAX_MENTION_BYTES = 100_000
 
 
@@ -36,19 +37,31 @@ def expand_mentions(
     expanded: list[str] = []
     paths: list[str] = []
     position = 0
+    # Resolved like the candidate is: a root reached through a symlink (on macOS,
+    # anything under /tmp or /var) would otherwise never contain any resolved
+    # candidate, and every mention would be silently dropped.
+    real_root = os.path.realpath(root)
     for match in _MENTION.finditer(text):
         raw = match.group(1)
-        candidate = os.path.realpath(raw if Path(raw).is_absolute() else Path(root) / raw)
-        if not is_within(root, candidate) or not Path(candidate).is_file():
+        candidate = os.path.realpath(raw if Path(raw).is_absolute() else Path(real_root) / raw)
+        if not is_within(real_root, candidate) or not Path(candidate).is_file():
             continue
-        relative = os.path.relpath(candidate, root)
+        if candidate in paths:
+            continue  # inline each file once, however often it is mentioned
+        relative = os.path.relpath(candidate, real_root)
         if redactor.is_secret_path(candidate, relative) and not allow_secrets:
             continue
         try:
             snapshot = read_text(candidate)
         except (OSError, FileSystemError):
             continue
-        body, _ = redactor.scrub(snapshot.content[:MAX_MENTION_BYTES])
+        # Scrub the whole file before cutting it, so a credential that straddles the
+        # cut cannot survive as an unrecognised half. The cap is in bytes, as named.
+        scrubbed, _ = redactor.scrub(snapshot.content)
+        encoded = scrubbed.encode("utf-8")
+        body = encoded[:MAX_MENTION_BYTES].decode("utf-8", errors="ignore")
+        if len(encoded) > MAX_MENTION_BYTES:
+            body += f"\n[truncated at {MAX_MENTION_BYTES} bytes]"
         expanded.append(text[position : match.end()])
         expanded.append(f'\n\n<file path="{relative}">\n{body}\n</file>\n\n')
         paths.append(candidate)
