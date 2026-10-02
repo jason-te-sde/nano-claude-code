@@ -585,3 +585,21 @@ def test_a_blocked_verdict_is_refused_whether_or_not_it_is_authoritative():
         p = policy(rules=RuleSet.build(allow=["Bash"]))
         result = evaluate(req(tool="Bash", subject="rm -rf /", paths=(), danger=verdict), p)
         assert result.rule == "bash.dangerous"
+
+
+def test_todowrite_is_allowed_without_asking_like_a_read_only_tool():
+    # Spec 5.1: TodoWrite is not read-only, but its default tier is "allow" --
+    # it changes only the session's own task list.
+    result = evaluate(
+        req(tool="TodoWrite", subject="", paths=()), policy(rules=RuleSet.build()), Grants()
+    )
+    assert (result.decision, result.rule) == (Decision.ALLOW, "tool.read-only")
+
+
+def test_a_file_changing_tool_is_not_in_the_allowed_without_asking_set():
+    result = evaluate(
+        req(tool="Write", subject="/p/a.py", paths=("/p/a.py",)),
+        policy(rules=RuleSet.build()),
+        Grants(),
+    )
+    assert result.decision is Decision.ASK
