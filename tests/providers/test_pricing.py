@@ -12,8 +12,10 @@ from nanoclaude.providers.pricing import Price, PriceBook
 # pricing page (verified 2026-10-02). The table is the thing being pinned: a row
 # that is deleted, mistyped, or read into the wrong column fails its own case.
 SHIPPED_ROWS = [
+    ("claude-fable-5-1", Price(10.00, 50.00, 0.25, 12.50)),
     ("claude-opus-5-5", Price(4.00, 20.00, 0.20, 5.00)),
     ("claude-opus-5", Price(5.00, 25.00, 0.50, 6.25)),
+    ("claude-sonnet-5-5", Price(2.00, 10.00, 0.20, 2.50)),
     ("claude-sonnet-5", Price(2.00, 10.00, 0.20, 2.50)),
     ("claude-haiku-4-5", Price(1.00, 5.00, 0.10, 1.25)),
     ("claude-haiku-4-5-20251001", Price(1.00, 5.00, 0.10, 1.25)),
@@ -58,6 +60,11 @@ def test_the_table_carries_a_date_and_its_age_is_available():
 @pytest.mark.parametrize(("model", "expected"), SHIPPED_ROWS)
 def test_every_shipped_row_carries_its_four_verified_prices(model, expected):
     assert PriceBook.load().price_for("anthropic", model) == expected
+
+
+def test_no_row_ships_without_a_hand_checked_line_above():
+    shipped = {model for adapter, model in PriceBook.load().prices if adapter == "anthropic"}
+    assert shipped == {model for model, _ in SHIPPED_ROWS}
 
 
 def test_each_token_kind_is_priced_at_its_own_rate():
