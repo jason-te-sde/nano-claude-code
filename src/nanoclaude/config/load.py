@@ -8,6 +8,9 @@ each rule once and in order, because a repository's config is not the person's
 own: it can add a rule and can never take one away, and an empty list is a no-op.
 It can add deny and ask rules, which only narrow what runs. It cannot add allow
 rules, which widen it: a repository must not be able to grant itself permissions.
+Nor can it re-point an alias the home file defines at another adapter, which would
+send the key set up for one vendor to another's endpoint; it can change that
+alias's model and the other fields that do not route.
 
 Validation happens here rather than at first use. "Role explore points at a
 model you have not defined" is a sentence worth reading before the first
@@ -44,7 +47,7 @@ import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from nanoclaude.config.schema import (
     DIFF_STYLES,
@@ -340,6 +343,13 @@ _SECTION_CHECKS: dict[str, Checker] = {
 }
 
 
+class _Home(NamedTuple):
+    """What lies beneath a project's file: where the home config is, and the models it defines."""
+
+    path: Path
+    models: Mapping[str, Mapping[str, Any]]
+
+
 #: What a project config may not say about a model, and why it is the person's to say.
 _NOT_IN_A_PROJECT = {
     "base_url": (
@@ -386,9 +396,33 @@ def _refuse_widening(raw: dict[str, Any], path: Path, home: Path) -> None:
         )
 
 
-def _check_layer(raw: dict[str, Any], path: Path, *, home: Path | None = None) -> dict[str, Any]:
-    """Check one file. ``home`` is given for a project's file, and is where it may not
-    put what only the person's own file may say."""
+def _refuse_adapter_change(layer: dict[str, Any], path: Path, home: _Home) -> None:
+    """Refuse a project config that re-points an alias the home config defines.
+
+    The key set up for one vendor would be sent to another's endpoint: an alias that
+    reaches the person's own Ollama box, given an Anthropic adapter, would carry
+    their Anthropic key there. An alias the project defines itself is not affected,
+    and neither is a field that does not route: the model, its window, its tools.
+    Run on the checked layer, so the adapter is known to be a string.
+    """
+    for alias, entry in layer.get("models", {}).items():
+        beneath = home.models.get(alias)
+        if beneath is None or "adapter" not in entry:
+            continue
+        was = beneath.get("adapter")
+        if entry["adapter"] != was:
+            what = f"adapter {was!r}" if was is not None else "no adapter"
+            raise ConfigError(
+                f"models.{alias}.adapter in {path} is {entry['adapter']!r}, but {home.path} "
+                f"defines {alias!r} with {what} — a project config cannot re-point a home "
+                "alias, because the key set up for one vendor would be sent to another's "
+                f"endpoint; give the project its own alias, or change the adapter in {home.path}"
+            )
+
+
+def _check_layer(raw: dict[str, Any], path: Path, *, home: _Home | None = None) -> dict[str, Any]:
+    """Check one file. ``home`` is given for a project's file: where the person's own file
+    is, and what it defines, which a project's file may not overstep."""
     for name in raw:
         if name not in _SECTION_CHECKS:
             raise ConfigError(
@@ -396,9 +430,12 @@ def _check_layer(raw: dict[str, Any], path: Path, *, home: Path | None = None) -
                 f"— the sections are {', '.join(_SECTION_CHECKS)}"
             )
     if home is not None:
-        _refuse_credential_routing(raw, path, home)
-        _refuse_widening(raw, path, home)
-    return {name: _SECTION_CHECKS[name](value, name, path) for name, value in raw.items()}
+        _refuse_credential_routing(raw, path, home.path)
+        _refuse_widening(raw, path, home.path)
+    layer = {name: _SECTION_CHECKS[name](value, name, path) for name, value in raw.items()}
+    if home is not None:
+        _refuse_adapter_change(layer, path, home)
+    return layer
 
 
 # ---------------------------------------------------------------------------
@@ -528,8 +565,8 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
     ``home`` and ``project`` are directories, each expected to hold a
     ``.nanoclaude/config.toml``; a leading ``~`` in either is expanded. At least
     one of the two files must exist. A project's deny and ask lists stack onto the
-    home lists, it may not add allow rules, and its models may not name a
-    ``base_url`` or ``api_key_env``.
+    home lists, it may not add allow rules, its models may not name a ``base_url`` or
+    ``api_key_env``, and it may not re-point an alias the home file defines.
     """
     user_path = _expand(home) / CONFIG_DIRNAME / CONFIG_FILENAME
     layers = [(user_path, False)]  # (file, is it a project's)
@@ -548,7 +585,8 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
         raw = _read(path)
         if raw is not None:
             found.append(path)
-            layer = _check_layer(raw, path, home=user_path if is_project else None)
+            beneath = _Home(user_path, merged.get("models", {})) if is_project else None
+            layer = _check_layer(raw, path, home=beneath)
             merged = _merge(merged, layer, stack=is_project)
     if not found:
         raise ConfigError(f"no configuration found — run: ncc init (it writes {user_path})")

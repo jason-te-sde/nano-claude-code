@@ -890,11 +890,11 @@ def test_a_model_with_no_adapter_is_refused_with_every_adapter_there_is(tmp_path
     assert "set adapter to one of: anthropic, openai_compat, ollama" in message
 
 
-def test_an_adapter_the_project_names_is_checked_after_the_files_are_merged(tmp_path):
-    # Neither file is wrong on its own terms: the home file gives the model, the
-    # project file gives a bad adapter for it.
-    message = refusal(tmp_path, BASE, '[models.m]\nadapter = "telepathy"\n')
-    assert "model 'm' uses adapter 'telepathy'" in message
+def test_an_adapter_a_project_gives_its_own_alias_is_checked_after_the_files_are_merged(tmp_path):
+    # Neither file is wrong on its own terms: what is wrong is only visible once the
+    # project's alias is whole.
+    message = refusal(tmp_path, BASE, '[models.p]\nadapter = "telepathy"\nmodel = "x"\n')
+    assert "model 'p' uses adapter 'telepathy'" in message
 
 
 @pytest.mark.parametrize("model_line", ["", 'model = ""\n'])
@@ -1361,6 +1361,107 @@ def test_check_model_names_the_home_file_when_it_is_given_one():
 
 
 # --------------------------------------------------------------------------
+# A project config may not re-point an alias the home file defines. The key set
+# up for one vendor would be sent to another vendor's endpoint: an alias that
+# reaches the person's own Ollama box, given an Anthropic adapter, would carry
+# their Anthropic key there.
+# --------------------------------------------------------------------------
+
+HOME_ALIASES = """
+[models.m]
+adapter = "anthropic"
+model   = "claude-sonnet-5"
+
+[models.box]
+adapter  = "ollama"
+model    = "qwen3-coder"
+base_url = "http://gpu-box:11434"
+"""
+
+
+@pytest.mark.parametrize(
+    ("alias", "was", "now"),
+    [
+        ("box", "ollama", "anthropic"),
+        ("m", "anthropic", "ollama"),
+        ("m", "anthropic", "telepathy"),
+    ],
+)
+def test_a_project_config_may_not_re_point_a_home_alias_to_another_adapter(
+    tmp_path, alias, was, now
+):
+    message = refusal(tmp_path, HOME_ALIASES, f'[models.{alias}]\nadapter = "{now}"\n')
+    assert f"models.{alias}.adapter in {project_file(tmp_path)} is {now!r}" in message
+    assert f"but {home_file(tmp_path)} defines {alias!r} with adapter {was!r}" in message
+    assert "the key set up for one vendor would be sent to another's endpoint" in message
+    assert (
+        f"give the project its own alias, or change the adapter in {home_file(tmp_path)}" in message
+    )
+
+
+def test_the_same_adapter_repeated_in_a_project_config_is_accepted(tmp_path):
+    project = '[models.m]\nadapter = "anthropic"\nmodel = "claude-opus-5"\n'
+    config = load(tmp_path, HOME_ALIASES, project)
+    assert config.models["m"].adapter == "anthropic"
+    assert config.models["m"].model == "claude-opus-5"
+
+
+def test_a_project_config_may_set_non_routing_fields_on_a_home_alias(tmp_path):
+    project = (
+        '[models.box]\nmodel = "llama3.3"\ncontext_window = 32768\nnative_tools = false\n'
+        '[roles]\nexplore = "box"\n'
+    )
+    config = load(tmp_path, HOME_ALIASES, project)
+    box = config.models["box"]
+    assert (box.model, box.context_window, box.native_tools) == ("llama3.3", 32_768, False)
+    assert (box.adapter, box.base_url) == ("ollama", "http://gpu-box:11434")  # the home file's
+    assert config.roles.explore == "box"
+
+
+def test_a_project_config_may_define_a_new_alias_with_any_adapter_that_needs_no_endpoint(tmp_path):
+    project = (
+        '[models.local]\nadapter = "ollama"\nmodel = "qwen3-coder"\n'
+        '[models.opus]\nadapter = "anthropic"\nmodel = "claude-opus-5"\n'
+    )
+    config = load(tmp_path, HOME_ALIASES, project)
+    assert config.models["local"].adapter == "ollama"
+    assert config.models["opus"].adapter == "anthropic"
+
+
+def test_an_alias_the_home_file_defines_without_an_adapter_is_not_the_projects_to_complete(
+    tmp_path,
+):
+    home = '[models.m]\nmodel = "claude-sonnet-5"\n'
+    message = refusal(tmp_path, home, '[models.m]\nadapter = "anthropic"\n')
+    assert f"but {home_file(tmp_path)} defines 'm' with no adapter" in message
+
+
+def test_with_no_home_file_a_project_config_defines_its_aliases_freely(tmp_path):
+    write(
+        project_file(tmp_path),
+        '[models.a]\nadapter = "anthropic"\nmodel = "x"\n'
+        '[models.l]\nadapter = "ollama"\nmodel = "y"\n',
+    )
+    config = load_config(home=str(tmp_path / "home"), project=str(tmp_path / "proj"), env={})
+    assert (config.models["a"].adapter, config.models["l"].adapter) == ("anthropic", "ollama")
+
+
+def test_a_project_adapter_of_the_wrong_type_gets_the_type_error(tmp_path):
+    message = refusal(tmp_path, HOME_ALIASES, "[models.m]\nadapter = 3\n")
+    assert (
+        f"models.m.adapter in {project_file(tmp_path)} must be a string, not a whole number"
+        in message
+    )
+
+
+def test_a_project_directory_that_is_the_home_directory_may_set_adapters(tmp_path):
+    # Run from the home directory, the "project" file is the person's own.
+    write(home_file(tmp_path), HOME_ALIASES)
+    config = load_config(home=str(tmp_path / "home"), project=str(tmp_path / "home"), env={})
+    assert config.models["box"].adapter == "ollama"
+
+
+# --------------------------------------------------------------------------
 # Sandbox roots. Sandbox refuses a root that is not absolute, by design, so a
 # root never depends on where the process happens to be standing. People write
 # "~/src/lib" in a command line and in a config file all the same.
@@ -1595,7 +1696,7 @@ _PRELUDES = [""] * 6 + ["limits = 5\n", 'models = "x"\n', "stray = 1\n"]
 
 
 # What a project's file may not say about a model; the person's own file may.
-_HOME_ONLY = ("base_url", "api_key_env")
+_HOME_ONLY = ("base_url", "api_key_env", "adapter")
 
 
 @st.composite
