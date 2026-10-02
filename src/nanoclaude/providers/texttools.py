@@ -123,5 +123,11 @@ def wrap_reply(reply: ModelReply, *, next_id: Callable[[], str]) -> ModelReply:
             reply.usage,
             reply.model,
         )
+    if problems:
+        # Some calls parsed and some did not. Run the ones that did, but keep the
+        # complaints in the reply: dropping them would make a malformed call
+        # vanish, and the model would never learn it did not run.
+        note = "\n".join(f"- {p}" for p in problems)
+        blocks = [*blocks, TextBlock(f"[tool protocol] {note}")]
     stop = StopKind.TOOL_USE if calls else reply.stop
     return ModelReply(tuple(blocks), stop, reply.usage, reply.model)

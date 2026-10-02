@@ -245,3 +245,16 @@ def test_render_tools_lists_every_spec_exactly_once():
     assert rendered.startswith(TOOL_PROTOCOL_PROMPT)
     assert rendered.count("### Read") == 1
     assert rendered.count("### Write") == 1
+
+
+def test_a_malformed_call_beside_a_valid_one_is_reported_not_dropped():
+    text = '<tool name="Read">{"path": "a.py"}</tool>\n<tool name="Grep">{not json}</tool>'
+    reply = ModelReply((TextBlock(text),), StopKind.END_TURN, Usage(), "m")
+    ids = iter(["c1", "c2"])
+    wrapped = wrap_reply(reply, next_id=lambda: next(ids))
+    calls = [b for b in wrapped.blocks if isinstance(b, ToolUseBlock)]
+    assert [c.name for c in calls] == ["Read"]
+    assert wrapped.stop is StopKind.TOOL_USE
+    last = wrapped.blocks[-1]
+    assert isinstance(last, TextBlock)
+    assert last.text.startswith("[tool protocol]")
