@@ -70,6 +70,9 @@ def default_registry(todo_state: TodoState | None = None) -> ToolRegistry:
             EditTool(),
             GlobTool(),
             GrepTool(),
-            TodoWriteTool(todo_state or TodoState()),
+            # `is not None`, not `or`: the session passes its own, initially empty
+            # TodoState and must get that same object back. `or` would silently
+            # swap in a fresh one the day TodoState gains a __len__.
+            TodoWriteTool(todo_state if todo_state is not None else TodoState()),
         ]
     )

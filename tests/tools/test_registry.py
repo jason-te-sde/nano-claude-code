@@ -163,3 +163,12 @@ def test_every_path_taking_tool_resolves_its_path_into_resolved_paths(ctx, tmp_r
         )
 
     assert checked > 0, "no tool in the registry declares a `path` argument"
+
+
+def test_the_registry_wires_in_the_exact_todo_state_it_was_given():
+    from nanoclaude.tools.todo import TodoState
+
+    state = TodoState()
+    tool = default_registry(state).get("TodoWrite")
+    held = [getattr(tool, name) for name in dir(tool) if getattr(tool, name, None) is state]
+    assert held, "TodoWriteTool must hold the very TodoState passed to default_registry"
