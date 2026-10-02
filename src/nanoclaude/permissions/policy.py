@@ -23,6 +23,13 @@ from nanoclaude.permissions.sandbox import Sandbox, is_within
 #: Tools that cannot change anything, and so never need confirming on their own.
 READ_ONLY_TOOLS = frozenset({"Read", "Grep", "Glob"})
 
+#: What row 10 (``tool.read-only``) allows without asking: tools that change nothing
+#: outside the session -- no file, no process, no network. TodoWrite edits only the
+#: session's own task list, so spec 5.1 gives it the default "allow" tier although
+#: it is not read-only. That is a separate question from concurrency: the executor
+#: still runs TodoWrite one call at a time, because two calls would race.
+ALLOWED_WITHOUT_ASKING = READ_ONLY_TOOLS | {"TodoWrite"}
+
 #: Tools ACCEPT_EDITS mode auto-approves.
 EDIT_TOOLS = frozenset({"Edit", "Write"})
 
@@ -285,7 +292,7 @@ def evaluate(
         )
 
     # 10. tool.read-only
-    if request.tool in READ_ONLY_TOOLS:
+    if request.tool in ALLOWED_WITHOUT_ASKING:
         return PermissionResult(Decision.ALLOW, "tool.read-only", f"{request.tool} only reads")
 
     # 11. rule.ask

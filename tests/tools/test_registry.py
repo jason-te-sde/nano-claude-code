@@ -15,6 +15,7 @@ from nanoclaude.providers.base import ToolSpec
 from nanoclaude.tools.base import ToolContext, ToolOutcome, ok
 from nanoclaude.tools.read import ReadTool
 from nanoclaude.tools.registry import ToolRegistry, UnknownToolError, default_registry
+from nanoclaude.tools.todo import TodoState, TodoWriteTool
 
 
 class _FakeTool:
@@ -85,14 +86,34 @@ def test_specs_are_sorted_by_name_regardless_of_registration_order():
     assert [spec.name for spec in registry.specs()] == ["Alpha", "Read", "Zeta"]
 
 
-def test_default_registry_includes_read_write_edit_glob_and_grep():
+def test_default_registry_includes_read_write_edit_glob_grep_and_todowrite():
     registry = default_registry()
     assert "Read" in registry
     assert "Write" in registry
     assert "Edit" in registry
     assert "Glob" in registry
     assert "Grep" in registry
-    assert len(registry) == 5
+    assert "TodoWrite" in registry
+    assert len(registry) == 6
+
+
+async def test_default_registry_wires_a_given_todo_state_into_todowrite(ctx):
+    """Tasks 24-26 construct a TodoState and call default_registry(todo) so
+    that later reads of the state see what TodoWrite wrote (task-15-brief.md's
+    split note). A registry that silently built its own TodoState instead
+    would leave the caller's instance permanently empty.
+    """
+    state = TodoState()
+    registry = default_registry(state)
+    await registry.get("TodoWrite").run(
+        ctx, "t1", {"todos": [{"content": "a", "status": "pending"}]}
+    )
+    assert [item.content for item in state.items] == ["a"]
+
+
+def test_default_registry_without_a_todo_state_builds_its_own():
+    registry = default_registry()
+    assert isinstance(registry.get("TodoWrite"), TodoWriteTool)
 
 
 def test_every_path_taking_tool_resolves_its_path_into_resolved_paths(ctx, tmp_repo):
@@ -142,3 +163,12 @@ def test_every_path_taking_tool_resolves_its_path_into_resolved_paths(ctx, tmp_r
         )
 
     assert checked > 0, "no tool in the registry declares a `path` argument"
+
+
+def test_the_registry_wires_in_the_exact_todo_state_it_was_given():
+    from nanoclaude.tools.todo import TodoState
+
+    state = TodoState()
+    tool = default_registry(state).get("TodoWrite")
+    held = [getattr(tool, name) for name in dir(tool) if getattr(tool, name, None) is state]
+    assert held, "TodoWriteTool must hold the very TodoState passed to default_registry"
