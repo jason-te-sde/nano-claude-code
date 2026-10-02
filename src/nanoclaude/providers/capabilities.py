@@ -114,6 +114,11 @@ class CapabilityCache:
             return None
 
     def put(self, adapter: str, model: str, caps: Capabilities) -> None:
+        # Read, modify, replace. The replace is atomic, so a reader never sees a
+        # torn file; but two processes putting different keys at the same moment
+        # can each write from a stale read, and the later one drops the earlier
+        # entry. That loses a cached answer, not correctness: the next session
+        # simply probes that model again.
         data = self._load()
         data[f"{adapter}/{model}"] = {
             "native_tools": caps.native_tools,

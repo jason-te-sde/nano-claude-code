@@ -231,18 +231,20 @@ async def probe_ollama(
             (int(v) for k, v in info.items() if k.endswith("context_length")),
             CONSERVATIVE_DEFAULT.context_window,
         )
-        return Capabilities(
-            native_tools=".Tools" in template or "tools" in template.lower(),
-            parallel_tools=False,  # no local model has been reliable at this
-            cache="none",
-            context_window=window,
-            max_output=min(4096, window // 4),
-        )
-    except Exception:
-        # Any other failure -- connection refused, a timeout, a context-length
-        # value that is present but not actually numeric -- means "we do not
-        # know", which is exactly what the conservative default encodes.
+    except (httpx.HTTPError, ValueError, TypeError):
+        # The failures that mean "we do not know": the server is unreachable or
+        # timed out, the body is not JSON, or a context length is present but
+        # not a number. Named rather than caught as Exception, so that a
+        # programming error below surfaces instead of quietly making every
+        # model look tool-less.
         return CONSERVATIVE_DEFAULT
     finally:
         if owns:
             await http.aclose()
+    return Capabilities(
+        native_tools=".Tools" in template or "tools" in template.lower(),
+        parallel_tools=False,  # no local model has been reliable at this
+        cache="none",
+        context_window=window,
+        max_output=min(4096, window // 4),
+    )

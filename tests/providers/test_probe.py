@@ -299,3 +299,30 @@ def test_apply_ignores_none_valued_overrides():
     # discovered value.
     result = _apply(CONSERVATIVE_DEFAULT, {"native_tools": None})
     assert result.native_tools == CONSERVATIVE_DEFAULT.native_tools
+
+
+async def test_the_probe_tolerates_a_trailing_slash_on_base_url():
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"template": "", "model_info": {}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        await probe_ollama("m", base_url="http://x/", client=http)
+    assert seen == ["http://x/api/show"]
+
+
+async def test_a_programming_error_in_the_probe_is_not_disguised_as_a_capability(monkeypatch):
+    # Only the named failure types mean "we do not know". Anything else is a
+    # bug, and must surface rather than make every model look tool-less.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"template": "", "model_info": {}})
+
+    def broken(*_args: object, **_kwargs: object) -> Never:
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr("nanoclaude.providers.ollama.Capabilities", broken)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(RuntimeError, match="bug"):
+            await probe_ollama("m", base_url="http://x", client=http)
