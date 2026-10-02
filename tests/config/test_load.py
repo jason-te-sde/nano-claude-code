@@ -1,3 +1,4 @@
+import os
 import tempfile
 from pathlib import Path
 
@@ -634,11 +635,67 @@ def test_an_empty_config_file_is_not_the_same_as_no_config_file(tmp_path):
     assert "no configuration found" not in message
 
 
-def test_a_config_path_that_cannot_be_read_is_reported_not_raised(tmp_path):
-    home_file(tmp_path).mkdir(parents=True)  # a directory where the file should be
+def test_a_directory_where_the_config_file_should_be_is_reported(tmp_path):
+    home_file(tmp_path).mkdir(parents=True)
     message = refusal(tmp_path)
+    assert f"the config path {home_file(tmp_path)} is not a regular file" in message
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a mode-000 file")
+def test_an_unreadable_config_file_is_reported_not_raised(tmp_path):
+    write(home_file(tmp_path), BASE)
+    home_file(tmp_path).chmod(0)
+    try:
+        message = refusal(tmp_path)
+    finally:
+        home_file(tmp_path).chmod(0o600)
     assert f"could not read {home_file(tmp_path)}" in message
-    assert "Is a directory" in message
+
+
+def test_a_project_config_that_is_a_symlink_loop_is_reported_not_raised(tmp_path):
+    # Path.resolve raised RuntimeError here on Python 3.11 and 3.12.
+    write(home_file(tmp_path), BASE)
+    target = project_file(tmp_path)
+    target.parent.mkdir(parents=True)
+    other = target.parent / "other.toml"
+    target.symlink_to(other)
+    other.symlink_to(target)
+    with pytest.raises(ConfigError, match="could not read"):
+        load_config(home=str(tmp_path / "home"), project=str(tmp_path / "proj"), env={})
+
+
+def test_an_oversized_config_file_is_refused_before_it_is_read(tmp_path, monkeypatch):
+    import nanoclaude.config.load as load_module
+
+    monkeypatch.setattr(load_module, "MAX_CONFIG_BYTES", 10)
+    message = refusal(tmp_path, BASE)
+    assert "over the 10-byte limit" in message
+
+
+def test_deeply_nested_toml_is_reported_not_raised(tmp_path):
+    message = refusal(tmp_path, "x = " + "[" * 3000 + "]" * 3000 + "\n")
+    assert "too deeply" in message
+
+
+def test_an_integer_too_long_to_parse_is_reported_not_raised(tmp_path):
+    message = refusal(tmp_path, "[limits]\nmax_turns = " + "9" * 5000 + "\n")
+    assert "is not valid TOML" in message
+
+
+def test_a_byte_order_mark_is_accepted(tmp_path):
+    home_file(tmp_path).parent.mkdir(parents=True)
+    home_file(tmp_path).write_bytes(
+        b"\xef\xbb\xbf" + (BASE + "[limits]\nmax_turns = 10\n").encode()
+    )
+    config = load_config(home=str(tmp_path / "home"), project=None, env={})
+    assert config.limits.max_turns == 10
+
+
+def test_expand_root_does_not_raise_on_a_symlink_loop(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.symlink_to(b)
+    b.symlink_to(a)
+    assert Path(expand_root(str(a))).is_absolute()
 
 
 def test_a_syntax_error_is_reported_with_the_file_and_where_in_it(tmp_path):

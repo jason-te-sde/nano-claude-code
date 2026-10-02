@@ -42,7 +42,9 @@ what to do about it.
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 import tomllib
 from collections.abc import Callable, Mapping
 from dataclasses import asdict
@@ -98,7 +100,10 @@ def expand_root(raw: str) -> str:
     is built, and anchor a relative path to the working directory, which is what
     a flag such as ``--add-dir ../lib`` means.
     """
-    return str(_expand(raw).resolve())
+    # os.path.realpath rather than Path.resolve: on Python 3.11 and 3.12 resolve
+    # raises RuntimeError on a symlink loop, while realpath returns a path on
+    # every version, and the loop then fails as an ordinary OSError where used.
+    return os.path.realpath(_expand(raw))
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +111,24 @@ def expand_root(raw: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: A config file is a few hundred bytes. Anything far larger is not one, and is
+#: refused before it is read into memory.
+MAX_CONFIG_BYTES = 1_000_000
+
+
 def _read(path: Path) -> dict[str, Any] | None:
     """The file's tables, or None when there is no such file."""
     try:
-        text = path.read_text(encoding="utf-8")
+        status = path.stat()
+        if not stat.S_ISREG(status.st_mode):
+            raise ConfigError(f"the config path {path} is not a regular file — replace it with one")
+        if status.st_size > MAX_CONFIG_BYTES:
+            raise ConfigError(
+                f"the config file {path} is {status.st_size} bytes, over the "
+                f"{MAX_CONFIG_BYTES}-byte limit — is it really a config file?"
+            )
+        # utf-8-sig, so that a byte-order mark some editors add is not an error.
+        text = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError:
         return None
     except UnicodeDecodeError as exc:
@@ -122,9 +141,13 @@ def _read(path: Path) -> dict[str, Any] | None:
         ) from exc
     try:
         return tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
+    except RecursionError as exc:
         raise ConfigError(
-            f"the config file {path} is not valid TOML ({exc}) — fix the syntax error it names"
+            f"the config file {path} nests arrays or tables too deeply to read — flatten it"
+        ) from exc
+    except ValueError as exc:  # TOMLDecodeError, and an integer literal past int's digit limit
+        raise ConfigError(
+            f"the config file {path} is not valid TOML ({exc}) — fix the value it names"
         ) from exc
 
 
@@ -574,7 +597,7 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
         project_path = _expand(project) / CONFIG_DIRNAME / CONFIG_FILENAME
         # Run from the home directory, the "project" file is the home file: the
         # person's own, read once as that, not a second time as a repository's.
-        if project_path.resolve() != user_path.resolve():
+        if os.path.realpath(project_path) != os.path.realpath(user_path):
             layers.append((project_path, True))
 
     found: list[Path] = []
