@@ -252,3 +252,12 @@ def test_summary_template_has_every_required_heading_in_order():
     assert positions == sorted(positions)
     assert SUMMARY_TEMPLATE.startswith("Summarise this coding session")
     assert SUMMARY_TEMPLATE.endswith("Session:\n")
+
+
+@pytest.mark.parametrize("keep_recent", [0, -1])
+async def test_full_compaction_refuses_to_keep_fewer_than_one_recent_turn(keep_recent):
+    async def summarise(_text: str) -> str:
+        return "summary"
+
+    with pytest.raises(ValueError, match="keep_recent must be at least 1"):
+        await full_compact(conversation(6), keep_recent=keep_recent, summarise=summarise)

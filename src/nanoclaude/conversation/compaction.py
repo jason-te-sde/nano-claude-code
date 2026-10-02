@@ -81,6 +81,11 @@ async def full_compact(
     summarise: Callable[[str], Awaitable[str]],
 ) -> Transcript:
     """Replace old history with one summary message, keeping recent turns intact."""
+    if keep_recent < 1:
+        # Keeping nothing verbatim would fold the user's current request into the
+        # summary. That is not a smaller compaction, it is a different operation,
+        # so it is refused rather than silently treated as a no-op.
+        raise ValueError(f"keep_recent must be at least 1, got {keep_recent}")
     if transcript.pending_tool_uses():
         raise ValueError("cannot compact while tool calls are unanswered")
     messages = list(transcript.messages)
@@ -88,7 +93,10 @@ async def full_compact(
     if len(messages) <= keep + 1:
         return transcript
 
-    head, tail = messages[:-keep], messages[-keep:]
+    # An explicit cut index, not messages[:-keep]: with keep == 0, -0 is 0, so the
+    # negative slices would summarise nothing and keep the whole transcript.
+    cut = len(messages) - keep
+    head, tail = messages[:cut], messages[cut:]
     # The summary that will be prepended is itself a user message (index 0),
     # so for roles to keep alternating, tail[0] must land at index 1 as
     # "assistant". A naive slice can instead start tail on the user message
