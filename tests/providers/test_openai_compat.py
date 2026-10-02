@@ -436,6 +436,44 @@ def test_no_tools_key_when_there_are_none():
     assert "tools" not in payload
 
 
+def test_no_temperature_is_sent_unless_one_is_asked_for():
+    # Reasoning models refuse a non-default temperature; every server accepts
+    # the parameter left out.
+    client = OpenAICompatClient("k", model="gpt-5", base_url="https://x/v1")
+    plain = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), (), 64))
+    assert "temperature" not in plain
+    asked = client.payload(
+        ModelRequest("sys", Transcript((user_text("hi"),)), (), 64, temperature=0.3)
+    )
+    assert asked["temperature"] == 0.3
+
+
+@pytest.mark.parametrize("base_url", ["https://api.openai.com/v1", "https://API.OpenAI.com/v1/"])
+def test_openai_itself_is_sent_max_completion_tokens(base_url):
+    # On OpenAI's own API max_tokens is deprecated and refused by its reasoning models.
+    client = OpenAICompatClient("k", model="gpt-5", base_url=base_url)
+    payload = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), (), 64))
+    assert payload["max_completion_tokens"] == 64
+    assert "max_tokens" not in payload
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://openrouter.ai/api/v1",
+        "http://localhost:8000/v1",
+        "https://api.openai.com.example/v1",
+        "https://gateway.example/api.openai.com/v1",
+    ],
+)
+def test_other_compatible_servers_keep_max_tokens(base_url):
+    # The de-facto parameter every other server understands.
+    client = OpenAICompatClient("k", model="m", base_url=base_url)
+    payload = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), (), 64))
+    assert payload["max_tokens"] == 64
+    assert "max_completion_tokens" not in payload
+
+
 def test_a_missing_api_key_names_the_adapter_and_the_fix():
     """Spec section 17.9, verbatim -- the exact wording and the em-dash both
     matter here, so this checks equality rather than a substring."""

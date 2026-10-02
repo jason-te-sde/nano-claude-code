@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -47,6 +48,16 @@ _FINISH = {
 
 #: Providers disagree on where reasoning lives.
 _REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
+
+#: Hosts that take max_completion_tokens. On OpenAI's own API max_tokens is
+#: deprecated and its reasoning models refuse it; the other servers this adapter
+#: talks to mostly know only max_tokens, so they keep it.
+_COMPLETION_TOKENS_HOSTS = frozenset({"api.openai.com"})
+
+
+def _output_cap_parameter(base_url: str) -> str:
+    host = urlsplit(base_url).hostname or ""
+    return "max_completion_tokens" if host in _COMPLETION_TOKENS_HOSTS else "max_tokens"
 
 
 def parse_arguments(raw: Any) -> Mapping[str, Any]:
@@ -220,6 +231,7 @@ class OpenAICompatClient:
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout_s)
         self._base_url = base_url.rstrip("/")
+        self._output_cap = _output_cap_parameter(base_url)
         self._headers = {"content-type": "application/json", "authorization": f"Bearer {api_key}"}
 
     @property
@@ -233,8 +245,7 @@ class OpenAICompatClient:
     def payload(self, request: ModelRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self._model,
-            "max_tokens": request.max_output_tokens,
-            "temperature": request.temperature,
+            self._output_cap: request.max_output_tokens,
             "messages": [
                 {"role": "system", "content": request.system},
                 *encode_messages(request.transcript),
@@ -242,6 +253,8 @@ class OpenAICompatClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if request.temperature is not None:
+            body["temperature"] = request.temperature
         if request.tools:
             body["tools"] = encode_tools(request.tools)
         return body

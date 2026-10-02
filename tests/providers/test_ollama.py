@@ -187,6 +187,13 @@ def test_payload_carries_temperature_and_max_tokens_in_options():
     assert payload["options"] == {"temperature": 0.3, "num_predict": 64}
 
 
+def test_no_temperature_option_is_sent_unless_one_is_asked_for():
+    # Left out, the model's own Modelfile default applies.
+    client = OllamaClient(model="m")
+    payload = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), (), 64))
+    assert payload["options"] == {"num_predict": 64}
+
+
 # -- complete(): happy paths, from the brief -----------------------------
 
 

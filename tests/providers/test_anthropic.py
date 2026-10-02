@@ -259,6 +259,18 @@ def test_disabling_cache_omits_cache_control():
     assert "cache_control" not in payload["tools"][-1]
 
 
+def test_no_temperature_is_sent_unless_one_is_asked_for():
+    # Current Claude models answer a non-default temperature with a 400, so an
+    # ordinary request must leave the provider's own default in place.
+    client = AnthropicClient("k")
+    plain = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), (), 64))
+    assert "temperature" not in plain
+    asked = client.payload(
+        ModelRequest("sys", Transcript((user_text("hi"),)), (), 64, temperature=0.3)
+    )
+    assert asked["temperature"] == 0.3
+
+
 def test_the_request_prefix_is_byte_stable_across_turns():
     """Automatic and explicit caching both need this; a timestamp would break it."""
     client = AnthropicClient("k")
