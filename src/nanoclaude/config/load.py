@@ -506,7 +506,8 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
 
     ``home`` and ``project`` are directories, each expected to hold a
     ``.nanoclaude/config.toml``; a leading ``~`` in either is expanded. At least
-    one of the two files must exist.
+    one of the two files must exist. A project's permission lists stack onto the
+    home lists, and its models may not name a ``base_url`` or ``api_key_env``.
     """
     user_path = _expand(home) / CONFIG_DIRNAME / CONFIG_FILENAME
     layers = [(user_path, False)]  # (file, is it a project's)
