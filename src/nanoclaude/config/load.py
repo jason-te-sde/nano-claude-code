@@ -6,6 +6,8 @@ A list in the user's file replaces the default, because the person's own file
 says what they want. A list in the project's file stacks onto the one beneath it,
 each rule once and in order, because a repository's config is not the person's
 own: it can add a rule and can never take one away, and an empty list is a no-op.
+It can add deny and ask rules, which only narrow what runs. It cannot add allow
+rules, which widen it: a repository must not be able to grant itself permissions.
 
 Validation happens here rather than at first use. "Role explore points at a
 model you have not defined" is a sentence worth reading before the first
@@ -266,7 +268,9 @@ def _rules(value: object, where: str, path: Path) -> tuple[str, ...]:
                 f"{where}[{index}] in {path} is not a valid rule ({exc}) — rules look like "
                 "Tool, Tool(subject) or Tool(prefix:*)"
             ) from exc
-    return rules
+    # Each rule once, so a list never differs from itself after a project file is
+    # laid over it: stacking an empty list is then exactly a no-op.
+    return tuple(dict.fromkeys(rules))
 
 
 def _fields(
@@ -366,6 +370,22 @@ def _refuse_credential_routing(raw: dict[str, Any], path: Path, home: Path) -> N
                 )
 
 
+def _refuse_widening(raw: dict[str, Any], path: Path, home: Path) -> None:
+    """Refuse a project config that grants permissions.
+
+    Checked on presence, like the keys above: the only allow list a project may
+    have is an empty one, and anything else, a malformed rule included, is an
+    attempt to grant something.
+    """
+    permissions = raw.get("permissions")
+    if isinstance(permissions, dict) and permissions.get("allow", []) != []:
+        raise ConfigError(
+            f"permissions.allow in {path} is not allowed in a project config "
+            "— a repository's file may add deny and ask rules but cannot grant itself "
+            f"permissions, so add allow rules to {home} if you trust the project"
+        )
+
+
 def _check_layer(raw: dict[str, Any], path: Path, *, home: Path | None = None) -> dict[str, Any]:
     """Check one file. ``home`` is given for a project's file, and is where it may not
     put what only the person's own file may say."""
@@ -377,6 +397,7 @@ def _check_layer(raw: dict[str, Any], path: Path, *, home: Path | None = None) -
             )
     if home is not None:
         _refuse_credential_routing(raw, path, home)
+        _refuse_widening(raw, path, home)
     return {name: _SECTION_CHECKS[name](value, name, path) for name, value in raw.items()}
 
 
@@ -506,8 +527,9 @@ def load_config(*, home: str, project: str | None, env: Mapping[str, str]) -> Co
 
     ``home`` and ``project`` are directories, each expected to hold a
     ``.nanoclaude/config.toml``; a leading ``~`` in either is expanded. At least
-    one of the two files must exist. A project's permission lists stack onto the
-    home lists, and its models may not name a ``base_url`` or ``api_key_env``.
+    one of the two files must exist. A project's deny and ask lists stack onto the
+    home lists, it may not add allow rules, and its models may not name a
+    ``base_url`` or ``api_key_env``.
     """
     user_path = _expand(home) / CONFIG_DIRNAME / CONFIG_FILENAME
     layers = [(user_path, False)]  # (file, is it a project's)

@@ -295,9 +295,10 @@ def test_a_project_changes_one_key_of_a_model_the_home_file_defines(tmp_path):
     assert config.models["m"].api_key_env == "MY_KEY"  # the home file's
 
 
-# A repository's config is not the person's own, so it may add rules but never
-# take one away: a list the project sets stacks onto the home list (spec 6.2, "the
-# project config overlays the user's").
+# A repository's config is not the person's own, so it may narrow what runs and
+# never widen it. It can add deny and ask rules, which stack onto the home lists
+# (spec 6.2: the project config overlays the user's), and it cannot add allow
+# rules at all: a repository must not be able to grant itself permissions.
 RULES_DEFAULTS = {
     "allow": ("Read", "Grep", "Glob"),
     "ask": ("Bash", "Write", "Edit", "Git", "TodoWrite"),
@@ -305,7 +306,7 @@ RULES_DEFAULTS = {
 }
 
 
-@pytest.mark.parametrize("key", ["allow", "ask", "deny"])
+@pytest.mark.parametrize("key", ["ask", "deny"])
 def test_a_list_the_project_sets_is_added_to_the_home_list_not_put_in_its_place(tmp_path, key):
     home = BASE + f'[permissions]\n{key} = ["Read(**/.env*)"]\n'
     config = load(tmp_path, home, f'[permissions]\n{key} = ["Bash(curl:*)"]\n')
@@ -326,11 +327,9 @@ def test_an_empty_list_in_the_project_removes_nothing_from_the_home_list(tmp_pat
     assert getattr(config.permissions, key) == ("Read(**/.env*)",)
 
 
-def test_a_project_allow_or_ask_rule_is_added_to_the_home_rules(tmp_path):
-    home = BASE + '[permissions]\nallow = ["Read"]\nask = ["Bash"]\n'
-    project = '[permissions]\nallow = ["Bash(npm test:*)"]\nask = ["Write(src/**)"]\n'
-    config = load(tmp_path, home, project)
-    assert config.permissions.allow == ("Read", "Bash(npm test:*)")
+def test_a_project_ask_rule_is_added_to_the_home_rules(tmp_path):
+    home = BASE + '[permissions]\nask = ["Bash"]\n'
+    config = load(tmp_path, home, '[permissions]\nask = ["Write(src/**)"]\n')
     assert config.permissions.ask == ("Bash", "Write(src/**)")
 
 
@@ -340,10 +339,19 @@ def test_stacking_keeps_the_home_order_and_drops_duplicates(tmp_path):
     assert config.permissions.deny == ("Read", "Bash(curl:*)", "Write")
 
 
-@pytest.mark.parametrize("key", ["allow", "ask"])
-def test_when_the_home_file_sets_no_list_the_project_adds_to_the_default_one(tmp_path, key):
-    config = load(tmp_path, BASE, f'[permissions]\n{key} = ["WebFetch"]\n')
-    assert getattr(config.permissions, key) == (*RULES_DEFAULTS[key], "WebFetch")
+def test_a_rule_listed_twice_in_one_file_is_kept_once(tmp_path):
+    # So that a list never differs from itself once a project file is laid over it.
+    config = load(
+        tmp_path,
+        BASE + '[permissions]\nallow = ["Read", "Grep", "Read"]\ndeny = ["Bash", "Bash"]\n',
+    )
+    assert config.permissions.allow == ("Read", "Grep")
+    assert config.permissions.deny == ("Bash",)
+
+
+def test_when_the_home_file_sets_no_ask_list_the_project_adds_to_the_default_one(tmp_path):
+    config = load(tmp_path, BASE, '[permissions]\nask = ["WebFetch"]\n')
+    assert config.permissions.ask == (*RULES_DEFAULTS["ask"], "WebFetch")
 
 
 @pytest.mark.parametrize("key", ["allow", "ask", "deny"])
@@ -361,9 +369,66 @@ def test_a_home_list_still_replaces_the_default_instead_of_stacking_onto_it(tmp_
 
 def test_a_list_the_project_does_not_set_keeps_the_home_list(tmp_path):
     home = BASE + '[permissions]\ndeny = ["Read(**/.env*)"]\n'
-    config = load(tmp_path, home, '[permissions]\nallow = ["WebFetch"]\n')
+    config = load(tmp_path, home, '[permissions]\nask = ["WebFetch"]\n')
     assert config.permissions.deny == ("Read(**/.env*)",)
-    assert config.permissions.allow == ("Read", "Grep", "Glob", "WebFetch")
+    assert config.permissions.ask == (*RULES_DEFAULTS["ask"], "WebFetch")
+
+
+def test_a_project_config_may_not_add_allow_rules_and_says_where_they_belong(tmp_path):
+    message = refusal(tmp_path, BASE, '[permissions]\nallow = ["Bash"]\n')
+    assert (
+        f"permissions.allow in {project_file(tmp_path)} is not allowed in a project config"
+        in message
+    )
+    assert "may add deny and ask rules but cannot grant itself permissions" in message
+    assert f"so add allow rules to {home_file(tmp_path)} if you trust the project" in message
+
+
+@pytest.mark.parametrize(
+    "value",
+    ['["Bash"]', '["Bash("]', '[""]', "[1]", '"Bash"', "5", "0", '""', "false"],
+)
+def test_the_refusal_is_for_putting_anything_but_an_empty_list_in_allow(tmp_path, value):
+    # A wrong value, or a rule that would not even parse, is still an attempt to grant
+    # something, and the useful answer is where allow rules belong.
+    message = refusal(tmp_path, BASE, f"[permissions]\nallow = {value}\n")
+    assert (
+        f"permissions.allow in {project_file(tmp_path)} is not allowed in a project config"
+        in message
+    )
+
+
+def test_an_empty_allow_list_in_a_project_config_changes_nothing(tmp_path):
+    home = BASE + '[permissions]\nallow = ["Read(src/**)"]\n'
+    config = load(tmp_path, home, "[permissions]\nallow = []\n")
+    assert config.permissions.allow == ("Read(src/**)",)
+
+
+def test_a_home_allow_rule_still_applies_beside_a_project_config(tmp_path):
+    home = BASE + '[permissions]\nallow = ["Bash(npm test:*)"]\n'
+    project = '[permissions]\ndeny = ["Bash(curl:*)"]\nask = ["Write"]\n'
+    config = load(tmp_path, home, project)
+    assert config.permissions.allow == ("Bash(npm test:*)",)
+
+
+def test_a_project_config_cannot_grant_itself_allow_rules_even_with_no_home_file(tmp_path):
+    write(project_file(tmp_path), BASE + '[permissions]\nallow = ["Bash"]\n')
+    with pytest.raises(
+        ConfigError, match=r"permissions\.allow in .* is not allowed in a project config"
+    ):
+        load_config(home=str(tmp_path / "home"), project=str(tmp_path / "proj"), env={})
+
+
+def test_a_project_directory_that_is_the_home_directory_may_allow(tmp_path):
+    # Run from the home directory, the "project" file is the person's own.
+    write(home_file(tmp_path), BASE + '[permissions]\nallow = ["Bash(npm test:*)"]\n')
+    config = load_config(home=str(tmp_path / "home"), project=str(tmp_path / "home"), env={})
+    assert config.permissions.allow == ("Bash(npm test:*)",)
+
+
+def test_a_project_file_whose_permissions_have_the_wrong_shape_gets_the_type_error(tmp_path):
+    message = refusal(tmp_path, BASE, "permissions = 5\n")
+    assert f"permissions in {project_file(tmp_path)} must be a table, not a whole number" in message
 
 
 TWO_MODELS = """
@@ -1419,12 +1484,12 @@ def _rule_list(rules: list[str]) -> str:
     suppress_health_check=[HealthCheck.function_scoped_fixture],
 )
 @given(
-    key=st.sampled_from(["allow", "ask", "deny"]),
+    key=st.sampled_from(["ask", "deny"]),
     home=st.one_of(st.none(), st.lists(st.sampled_from(_POOL), max_size=5)),
     project=st.lists(st.sampled_from(_POOL), max_size=5),
 )
-def test_a_project_file_only_ever_adds_rules(key, home, project):
-    """Whatever the lists are, adding a project file removes no rule that applied without it."""
+def test_a_project_file_only_ever_adds_ask_and_deny_rules(key, home, project):
+    """Whatever the lists are, adding a project file removes no ask or deny rule that applied."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         home_text = BASE + (
@@ -1445,6 +1510,34 @@ def test_a_project_file_only_ever_adds_rules(key, home, project):
     assert len(with_project) == len(set(with_project)), "a rule is listed twice"
     kept = [rule for rule in with_project if rule in without]
     assert kept == list(dict.fromkeys(without)), "the order of the rules beneath was disturbed"
+
+
+@settings(
+    max_examples=100,
+    deadline=None,
+    suppress_health_check=[HealthCheck.function_scoped_fixture],
+)
+@given(
+    home=st.one_of(st.none(), st.lists(st.sampled_from(_POOL), max_size=5)),
+    project=st.lists(st.sampled_from(_POOL), max_size=5),
+)
+def test_a_project_file_can_never_change_what_is_allowed(home, project):
+    """What may run unasked is the person's to say: a project's allow list is empty or refused."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        home_allow = f"[permissions]\nallow = {_rule_list(home)}\n" if home is not None else ""
+        write(root / "home" / ".nanoclaude" / "config.toml", BASE + home_allow)
+        write(
+            root / "proj" / ".nanoclaude" / "config.toml",
+            f"[permissions]\nallow = {_rule_list(project)}\n",
+        )
+        without = load_config(home=str(root / "home"), project=None, env={}).permissions.allow
+        if project:
+            with pytest.raises(ConfigError, match="not allowed in a project config"):
+                load_config(home=str(root / "home"), project=str(root / "proj"), env={})
+        else:
+            stacked = load_config(home=str(root / "home"), project=str(root / "proj"), env={})
+            assert stacked.permissions.allow == without
 
 
 # --------------------------------------------------------------------------
@@ -1516,6 +1609,8 @@ def _file_text(draw: st.DrawFn, *, home: bool) -> str:
             st.lists(st.sampled_from(list(_SECTIONS[header])), max_size=5, unique=True)
         ):
             accepted, _ = _SECTIONS[header][key]
+            if not home and (header, key) == ("permissions", "allow"):
+                accepted = ["[]"]  # the only allow list a project may have
             if accepted and (home or key not in _HOME_ONLY):
                 tables.setdefault(header, {})[key] = draw(st.sampled_from(accepted))
     if draw(st.booleans()):  # and now and then one value that should be refused
