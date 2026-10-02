@@ -1,4 +1,9 @@
+from collections.abc import Callable
+
+import pytest
+
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock
+from nanoclaude.providers import texttools
 from nanoclaude.providers.base import ModelReply, StopKind, ToolSpec, Usage
 from nanoclaude.providers.texttools import (
     MAX_PARSE_RETRIES,
@@ -258,3 +263,43 @@ def test_a_malformed_call_beside_a_valid_one_is_reported_not_dropped():
     last = wrapped.blocks[-1]
     assert isinstance(last, TextBlock)
     assert last.text.startswith("[tool protocol]")
+
+
+def _ids() -> Callable[[], str]:
+    counter = iter(range(10_000))
+    return lambda: f"c{next(counter)}"
+
+
+def test_an_uppercase_closing_tag_closes_the_block():
+    blocks, problems = parse_text_tools('<TOOL NAME="Read">{"path": "a"}</TOOL>', next_id=_ids())
+    assert problems == []
+    assert [b.name for b in blocks if isinstance(b, ToolUseBlock)] == ["Read"]
+
+
+def test_a_long_run_of_unclosed_tags_is_reported_once_and_scanned_once(monkeypatch):
+    # Counting searches rather than timing them: the property is that the
+    # closing tag is looked for once, not once per opening tag.
+    searches: list[int] = []
+    real = texttools._CLOSE
+
+    class Counting:
+        def search(self, text: str, pos: int = 0) -> object:
+            searches.append(pos)
+            return real.search(text, pos)
+
+    monkeypatch.setattr(texttools, "_CLOSE", Counting())
+    _, problems = parse_text_tools('<tool name="A">' * 5_000, next_id=_ids())
+    assert len(searches) == 1
+    assert problems == ['the <tool name="A"> block has no closing </tool> tag']
+
+
+@pytest.mark.parametrize(
+    "tag",
+    ["<tool name='Read'>", '<tool name="Read" extra="x">', "<tool Read>"],
+    ids=["single-quoted", "extra-attribute", "no-name-attribute"],
+)
+def test_an_opening_tag_in_the_wrong_form_is_reported_not_ignored(tag):
+    blocks, problems = parse_text_tools(f'{tag}{{"path": "a"}}</tool>', next_id=_ids())
+    assert not any(isinstance(b, ToolUseBlock) for b in blocks)
+    assert len(problems) == 1
+    assert "not in the expected form" in problems[0]

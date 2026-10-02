@@ -27,7 +27,11 @@ from nanoclaude.providers.base import ModelReply, StopKind, ToolSpec
 MAX_PARSE_RETRIES = 2
 
 _OPEN = re.compile(r"<tool\s+name=\"([A-Za-z_][A-Za-z0-9_]*)\"\s*>", re.IGNORECASE)
-_CLOSE = "</tool>"
+_CLOSE = re.compile(r"</tool\s*>", re.IGNORECASE)
+#: Any opening tag at all, well-formed or not. A match that _OPEN rejected is a
+#: call the model meant to make in the wrong form, and it is reported as such
+#: rather than passed through silently as prose.
+_ANY_OPEN = re.compile(r"<tool\b[^>]*>", re.IGNORECASE)
 
 TOOL_PROTOCOL_PROMPT = """\
 You do not have a function-calling interface. To use a tool, write a block in \
@@ -61,20 +65,35 @@ def parse_text_tools(text: str, *, next_id: Callable[[], str]) -> tuple[list[Blo
     blocks: list[Block] = []
     problems: list[str] = []
     position = 0
+    unclosed = False
+
+    def keep_prose(segment: str) -> None:
+        prose = _clean(segment)
+        if not prose:
+            return
+        if _ANY_OPEN.search(prose):
+            problems.append(
+                'a <tool> tag was not in the expected form <tool name="Name">: put the '
+                "name in double quotes and nothing else inside the tag"
+            )
+        blocks.append(TextBlock(prose))
 
     while True:
         match = _OPEN.search(text, position)
         if match is None:
             break
-        prose = _clean(text[position : match.start()])
-        if prose:
-            blocks.append(TextBlock(prose))
+        keep_prose(text[position : match.start()])
         name = match.group(1)
-        end = text.find(_CLOSE, match.end())
-        if end == -1:
+        close = _CLOSE.search(text, match.end())
+        if close is None:
+            # No closing tag after this point means none after any later opening
+            # tag either, so report once and stop: re-searching from every later
+            # tag would make a long run of unclosed tags quadratic.
             problems.append(f'the <tool name="{name}"> block has no closing </tool> tag')
             position = match.end()
-            continue
+            unclosed = True
+            break
+        end = close.start()
         payload = text[match.end() : end].strip().strip("`").strip()
         try:
             arguments = json.loads(payload)
@@ -90,11 +109,16 @@ def parse_text_tools(text: str, *, next_id: Callable[[], str]) -> tuple[list[Blo
                 problems.append(
                     f"the arguments for {name} were a {type(arguments).__name__}, not a JSON object"
                 )
-        position = end + len(_CLOSE)
+        position = close.end()
 
-    tail = _clean(text[position:])
-    if tail:
-        blocks.append(TextBlock(tail))
+    if unclosed:
+        # The rest of the reply is the unclosed block's own text; its tags were
+        # already reported as unclosed, so they are not re-reported as malformed.
+        tail = _clean(text[position:])
+        if tail:
+            blocks.append(TextBlock(tail))
+    else:
+        keep_prose(text[position:])
     if not blocks:
         blocks.append(TextBlock(text.strip()))
     return blocks, problems
