@@ -21,6 +21,7 @@ from nanoclaude.conversation.transcript import (
     ToolResultBlock,
     ToolUseBlock,
     Transcript,
+    assistant_text,
     user_text,
     validate,
 )
@@ -38,16 +39,31 @@ class StopReason(StrEnum):
     TURN_LIMIT = "turn_limit"
     REFUSAL = "refusal"
     MAX_TOKENS = "max_tokens"
+    #: A model without native tool calling was asked again as often as the text
+    #: protocol allows and still wrote no call that could be run. The session sets
+    #: it, since the session owns the retries; the loop never produces it.
+    MODEL_UNSUITABLE = "model_unsuitable"
 
 
 @runtime_checkable
 class Observation(Protocol):
-    """What :func:`observe` needs from a tool result. ``ToolOutcome`` satisfies it."""
+    """What :func:`observe` needs from a tool result. ``ToolOutcome`` satisfies it.
 
-    tool_use_id: str
-    content: str
-    is_error: bool
-    observed: tuple[tuple[str, Any], ...]
+    Read-only, because observe() only reads them. Plain attributes would declare
+    them settable, which a frozen dataclass such as ``ToolOutcome`` is not.
+    """
+
+    @property
+    def tool_use_id(self) -> str: ...
+
+    @property
+    def content(self) -> str: ...
+
+    @property
+    def is_error(self) -> bool: ...
+
+    @property
+    def observed(self) -> tuple[tuple[str, Any], ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,9 +128,16 @@ def start(prompt: str, *, max_turns: int = DEFAULT_MAX_TURNS) -> LoopState:
 
 
 def resume(state: LoopState, prompt: str) -> LoopState:
+    """Continue the conversation with a new prompt.
+
+    The prompt starts the turn count again: ``max_turns`` bounds what one prompt may
+    take, not what a whole conversation does, so a long session is not stopped by
+    the sum of everything it has done. What the conversation has read and used
+    carries over.
+    """
     if state.transcript.pending_tool_uses():
         raise LoopError("cannot resume while tool calls are unanswered")
-    return replace(state, transcript=state.transcript.append(user_text(prompt)))
+    return replace(state, transcript=state.transcript.append(user_text(prompt)), turn=0)
 
 
 def step(state: LoopState, reply: ModelReply) -> StepOutcome:
@@ -135,19 +158,23 @@ def step(state: LoopState, reply: ModelReply) -> StepOutcome:
 
     if advanced.turn + 1 >= advanced.max_turns:
         # Refusing to run them is fine; leaving them unanswered is not, because
-        # the next request would carry an invalid transcript.
+        # the next request would carry an invalid transcript. And the transcript
+        # ends with text (spec 5.4), not with those refusals: a conversation that
+        # ended on a user message looks like a turn nobody answered, so the next
+        # prompt would be told this one was interrupted, and could not be added
+        # to the transcript at all, two user messages in a row.
         refusals = tuple(
             ToolResultBlock(call.id, f"not executed: turn limit of {state.max_turns} reached", True)
             for call in calls
         )
-        closed = transcript.append(Message("user", refusals))
+        turns = advanced.turn + 1
+        said = (
+            f"Stopped after {turns} {'turn' if turns == 1 else 'turns'} without finishing the task."
+        )
+        closed = transcript.append(Message("user", refusals)).append(assistant_text(said))
         validate(closed)
         final = replace(advanced, transcript=closed, turn=advanced.turn + 1)
-        return Done(
-            final,
-            f"Stopped after {final.turn} turns without finishing the task.",
-            StopReason.TURN_LIMIT,
-        )
+        return Done(final, said, StopReason.TURN_LIMIT)
 
     return RunTools(advanced, calls)
 

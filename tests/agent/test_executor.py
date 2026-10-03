@@ -47,7 +47,7 @@ from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
 from nanoclaude.testing.scripted import calls as model_calls
 from nanoclaude.testing.scripted import calls_many
-from nanoclaude.tools.base import ToolContext, ToolOutcome, ok
+from nanoclaude.tools.base import ToolArgumentError, ToolContext, ToolOutcome, ok
 from nanoclaude.tools.registry import default_registry
 
 
@@ -696,3 +696,642 @@ async def test_on_decision_is_called_for_refusals_that_never_reach_evaluate(poli
         ("t2", "tool.bad-arguments"),
         ("t3", "rule.allow"),
     ]
+
+
+# --- A bug in one tool must not end the session ---------------------------
+#
+# run_batch used to let any exception other than ToolArgumentError and OSError
+# out of _run. One raised by a tool aborted the whole batch, threw away the
+# outcomes of calls that had already finished, and reached the person as a
+# traceback. The three tests after the first pin the edges of the clause that
+# fixes it: it must come after the two existing clauses, and it must not catch
+# what is not an Exception.
+
+
+class _Abort(BaseException):
+    """Stands in for KeyboardInterrupt and SystemExit.
+
+    Raising either of those inside a task makes asyncio re-raise it into the
+    event loop, which would end the whole pytest run rather than this test. A
+    BaseException of our own takes the same path through ``except Exception``.
+    """
+
+
+def _audit_row(store: Store, call_id: str) -> Any:
+    return store.db.execute(
+        "SELECT outcome, duration_ms, error, decision, rule FROM tool_calls WHERE tool_use_id = ?",
+        (call_id,),
+    ).fetchone()
+
+
+async def test_a_tool_raising_an_unexpected_exception_costs_one_call_not_the_batch(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    for name, text in (("a.py", "alpha"), ("b.py", "bravo"), ("c.py", "charlie")):
+        (tmp_repo / name).write_text(f"{text}\n")
+    real_run = ReadTool.run
+
+    async def explode_for_t2(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        if call_id == "t2":
+            raise RuntimeError("list index out of range")
+        return await real_run(self, ctx, call_id, arguments)
+
+    class Seen(SilentUI):
+        def __init__(self) -> None:
+            self.outcomes: list[ToolOutcome] = []
+
+        def on_outcome(self, _call: ToolUseBlock, outcome: ToolOutcome) -> None:
+            self.outcomes.append(outcome)
+
+    monkeypatch.setattr(ReadTool, "run", explode_for_t2)
+    ui, store = Seen(), _store(tmp_repo)
+    calls = (
+        ToolUseBlock("t1", "Read", {"path": "a.py"}),
+        ToolUseBlock("t2", "Read", {"path": "b.py"}),
+        ToolUseBlock("t3", "Read", {"path": "c.py"}),
+    )
+    outcomes = await executor(policy, ui, store).run_batch(calls, start("hi"))
+
+    # Every call is answered, in the order asked, and the siblings really ran.
+    assert [o.tool_use_id for o in outcomes] == ["t1", "t2", "t3"]
+    assert [o.is_error for o in outcomes] == [False, True, False]
+    assert "alpha" in outcomes[0].content and "charlie" in outcomes[2].content
+
+    # What the model is told: where it happened, what it was, that it is a bug.
+    bug = outcomes[1].content
+    assert "internal error" in bug.lower() and "Read" in bug, bug
+    assert "RuntimeError: list index out of range" in bug, bug
+    assert "bug" in bug, bug
+    # The person watching sees the failed call like any other outcome.
+    assert [o.tool_use_id for o in ui.outcomes] == ["t1", "t2", "t3"]
+
+    # The audit row says what happened, and the others are unaffected.
+    row = _audit_row(store, "t2")
+    assert row["outcome"] == "error", dict(row)
+    assert row["error"] == "RuntimeError: list index out of range", dict(row)
+    assert _audit_row(store, "t1")["outcome"] == "ok"
+    assert _audit_row(store, "t3")["outcome"] == "ok"
+
+
+async def test_what_an_unexpected_exception_says_is_scrubbed_like_any_tool_output(
+    policy, tmp_repo, monkeypatch
+):
+    """An exception message can quote a value the tool was handling. The result
+    goes into the transcript and the audit row goes into the database, and
+    neither may carry a credential. Built at run time so no literal in this file
+    is shaped like one."""
+    from nanoclaude.tools.read import ReadTool
+
+    secret = "sk-" + "Qz7" * 12
+    store = _store(tmp_repo)
+    (tmp_repo / "a.py").write_text("x")
+
+    async def leak(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise ValueError(f"cannot use token {secret}")
+
+    monkeypatch.setattr(ReadTool, "run", leak)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert secret not in outcomes[0].content and "[redacted:" in outcomes[0].content
+    row = _audit_row(store, "t1")
+    assert secret not in row["error"] and "[redacted:" in row["error"], dict(row)
+
+
+async def test_a_tool_argument_error_is_still_a_bad_arguments_result_not_an_internal_error(
+    policy, tmp_repo, monkeypatch
+):
+    """Raised from run() rather than from permission_request(), which is where
+    an argument the tool only inspects once it executes surfaces. It has its
+    own clause; the new one must sit after it and not swallow it."""
+    from nanoclaude.tools.base import ToolArgumentError
+    from nanoclaude.tools.read import ReadTool
+
+    async def reject(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise ToolArgumentError("offset must be an integer, got str")
+
+    monkeypatch.setattr(ReadTool, "run", reject)
+    (tmp_repo / "a.py").write_text("x")
+    store = _store(tmp_repo)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert outcomes[0].content == "bad arguments: offset must be an integer, got str"
+    assert _audit_row(store, "t1")["error"] == "offset must be an integer, got str"
+
+
+async def test_an_oserror_is_still_reported_as_itself_not_an_internal_error(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    async def fail(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise OSError("device not configured")
+
+    monkeypatch.setattr(ReadTool, "run", fail)
+    (tmp_repo / "a.py").write_text("x")
+    store = _store(tmp_repo)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert outcomes[0].content == "OSError: device not configured"
+    assert _audit_row(store, "t1")["error"] == "device not configured"
+
+
+async def test_cancelling_a_running_tool_still_cancels_the_batch(policy, tmp_repo, monkeypatch):
+    """CancelledError is a BaseException, so ``except Exception`` lets it through.
+    Written with a write rather than a read on purpose: a read runs inside
+    asyncio.gather, which cancels the batch by itself whatever _run does with
+    the error, so a clause that wrongly swallowed it would go unnoticed there.
+    A write is awaited directly, so swallowing the cancellation shows."""
+    from nanoclaude.tools.write import WriteTool
+
+    started = asyncio.Event()
+
+    async def hang(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        started.set()
+        await asyncio.Event().wait()  # never set; only cancellation ends this
+        raise AssertionError("the tool was allowed to finish")
+
+    monkeypatch.setattr(WriteTool, "run", hang)
+    store = _store(tmp_repo)
+    ex = executor(policy, AutoApprove(), store)
+    call = ToolUseBlock("t1", "Write", {"path": "a.txt", "content": "A"})
+    task = asyncio.create_task(ex.run_batch((call,), start("hi")))
+    # Bounded: a tool that never starts must fail this test, not hang the run.
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Decided, never finished: the row's outcome stays NULL, which is the only
+    # thing a NULL there is allowed to mean.
+    assert _audit_row(store, "t1")["outcome"] is None
+
+
+async def test_an_exception_that_is_not_an_exception_still_propagates(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.write import WriteTool
+
+    async def abort(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise _Abort("stop everything")
+
+    monkeypatch.setattr(WriteTool, "run", abort)
+    call = ToolUseBlock("t1", "Write", {"path": "a.txt", "content": "A"})
+    with pytest.raises(_Abort, match="stop everything"):
+        await executor(policy).run_batch((call,), start("hi"))
+
+
+# --- The same invariant for the question asked before a call runs -------------
+#
+# Before a tool runs the executor asks it what the call would touch
+# (permission_request). That is tool code too, and an exception from it other
+# than the ones that mean "these arguments are bad" used to leave run_batch the
+# same way an exception from run() did: the batch aborted, the finished calls'
+# outcomes were thrown away, and the person got a traceback.
+
+
+async def test_a_tool_whose_permission_request_raises_costs_one_call_not_the_batch(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    for name, text in (("a.py", "alpha"), ("b.py", "bravo"), ("c.py", "charlie")):
+        (tmp_repo / name).write_text(f"{text}\n")
+    real_request, real_run = ReadTool.permission_request, ReadTool.run
+    ran: list[str] = []
+
+    def explode_for_b(
+        self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]
+    ) -> PermissionRequest:
+        if arguments.get("path") == "b.py":
+            raise RuntimeError("path table is corrupt")
+        return real_request(self, ctx, arguments)
+
+    async def tracking_run(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        ran.append(call_id)
+        return await real_run(self, ctx, call_id, arguments)
+
+    class Seen(SilentUI):
+        def __init__(self) -> None:
+            self.decisions: list[tuple[str, str]] = []
+            self.outcomes: list[str] = []
+
+        def on_decision(
+            self, call: ToolUseBlock, _request: PermissionRequest, result: PermissionResult
+        ) -> None:
+            self.decisions.append((call.id, result.rule))
+
+        def on_outcome(self, call: ToolUseBlock, _outcome: ToolOutcome) -> None:
+            self.outcomes.append(call.id)
+
+    monkeypatch.setattr(ReadTool, "permission_request", explode_for_b)
+    monkeypatch.setattr(ReadTool, "run", tracking_run)
+    ui, store = Seen(), _store(tmp_repo)
+    calls = (
+        ToolUseBlock("t1", "Read", {"path": "a.py"}),
+        ToolUseBlock("t2", "Read", {"path": "b.py"}),
+        ToolUseBlock("t3", "Read", {"path": "c.py"}),
+    )
+    outcomes = await executor(policy, ui, store).run_batch(calls, start("hi"))
+
+    # Every call is answered, in the order asked; the siblings really ran.
+    assert [o.tool_use_id for o in outcomes] == ["t1", "t2", "t3"]
+    assert [o.is_error for o in outcomes] == [False, True, False]
+    assert "alpha" in outcomes[0].content and "charlie" in outcomes[2].content
+    # The call whose question could not be answered never ran.
+    assert sorted(ran) == ["t1", "t3"]
+
+    # What the model is told: where it happened, what it was, that it is a bug.
+    bug = outcomes[1].content
+    assert "internal error" in bug.lower() and "Read" in bug, bug
+    assert "RuntimeError: path table is corrupt" in bug, bug
+    assert "bug" in bug, bug
+
+    # The audit row: not executed, so no duration, and the outcome is an error,
+    # not a refusal. The decision and rule are the nearest true ones.
+    row = _audit_row(store, "t2")
+    assert row["outcome"] == "error", dict(row)
+    assert row["error"] == "RuntimeError: path table is corrupt", dict(row)
+    assert (row["decision"], row["rule"]) == ("deny", "tool.internal-error"), dict(row)
+    assert row["duration_ms"] == 0, dict(row)
+    assert _audit_row(store, "t1")["outcome"] == "ok"
+    assert _audit_row(store, "t3")["outcome"] == "ok"
+
+    # The person's front end hears about it however it renders: as a decision, and
+    # once as the outcome of a call, like any other that ended in an error.
+    assert ui.decisions == [
+        ("t1", "rule.allow"),
+        ("t2", "tool.internal-error"),
+        ("t3", "rule.allow"),
+    ]
+    assert ui.outcomes.count("t2") == 1 and sorted(ui.outcomes) == ["t1", "t2", "t3"]
+
+
+async def test_what_a_failing_permission_request_says_is_scrubbed_like_any_tool_output(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    secret = "sk-" + "Qz7" * 12  # built at run time: no literal here is shaped like a key
+    store = _store(tmp_repo)
+    (tmp_repo / "a.py").write_text("x")
+
+    def leak(self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]) -> PermissionRequest:
+        raise RuntimeError(f"cannot classify {secret}")
+
+    monkeypatch.setattr(ReadTool, "permission_request", leak)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert secret not in outcomes[0].content and "[redacted:" in outcomes[0].content
+    row = _audit_row(store, "t1")
+    assert secret not in row["error"] and "[redacted:" in row["error"], dict(row)
+
+
+#: What a message can hold that a terminal would act on: a colour sequence and a
+#: carriage return that redraws the line.
+ESCAPES = "\x1b[31mred\x1b[0m and\rmore"
+
+
+def _free_of_escapes(text: str) -> bool:
+    return "\x1b" not in text and "\r" not in text
+
+
+async def test_an_internal_error_from_run_carries_no_terminal_control_sequences(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    async def broken(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise RuntimeError(ESCAPES)
+
+    class Seen(SilentUI):
+        def __init__(self) -> None:
+            self.outcomes: list[ToolOutcome] = []
+
+        def on_outcome(self, _call: ToolUseBlock, outcome: ToolOutcome) -> None:
+            self.outcomes.append(outcome)
+
+    monkeypatch.setattr(ReadTool, "run", broken)
+    (tmp_repo / "a.py").write_text("x")
+    ui, store = Seen(), _store(tmp_repo)
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert "RuntimeError: red andmore" in outcomes[0].content
+    row = _audit_row(store, "t1")
+    assert row["error"] == "RuntimeError: red andmore", dict(row)
+    assert all(_free_of_escapes(o.content) for o in (*outcomes, *ui.outcomes))
+
+
+async def test_a_credential_split_by_an_escape_sequence_is_still_scrubbed(
+    policy, tmp_repo, monkeypatch
+):
+    """The scrubber matches a credential as it is written. An escape sequence in the
+    middle of one hides it from the scrubber and is gone once the text is stripped, so
+    stripping has to come first. Built at run time so no literal here is shaped like a
+    key."""
+    from nanoclaude.tools.read import ReadTool
+
+    secret = "sk-" + "Qz7" * 12
+    split = secret[:10] + "\x1b[0m" + secret[10:]
+
+    async def leak(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise ValueError(f"cannot use token {split}")
+
+    monkeypatch.setattr(ReadTool, "run", leak)
+    (tmp_repo / "a.py").write_text("x")
+    store = _store(tmp_repo)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    row = _audit_row(store, "t1")
+    for text in (outcomes[0].content, row["error"]):
+        assert secret not in text and "[redacted:" in text, text
+
+
+async def test_an_internal_error_from_a_permission_request_carries_no_terminal_control_sequences(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    def broken(self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]) -> PermissionRequest:
+        raise RuntimeError(ESCAPES)
+
+    class Seen(SilentUI):
+        def __init__(self) -> None:
+            self.reasons: list[str] = []
+
+        def on_decision(
+            self, _call: ToolUseBlock, _request: PermissionRequest, result: PermissionResult
+        ) -> None:
+            self.reasons.append(result.reason)
+
+    monkeypatch.setattr(ReadTool, "permission_request", broken)
+    (tmp_repo / "a.py").write_text("x")
+    ui, store = Seen(), _store(tmp_repo)
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert "RuntimeError: red andmore" in outcomes[0].content
+    row = _audit_row(store, "t1")
+    assert row["error"] == "RuntimeError: red andmore", dict(row)
+    assert ui.reasons == ["RuntimeError: red andmore"]
+    assert _free_of_escapes(outcomes[0].content)
+
+
+@pytest.mark.parametrize("where", ["permission_request", "run"])
+def test_a_real_keyboard_interrupt_in_a_tool_ends_the_batch_and_is_not_made_a_result(
+    policy, tmp_repo, monkeypatch, where
+):
+    """The stand-in the tests above use is a BaseException that is not an Exception.
+    KeyboardInterrupt is both of those things and one more: asyncio re-raises it out of
+    the task that raised it and through run_until_complete. Inside the event loop pytest
+    runs its async tests in, that would end the whole test run, so this one is a plain
+    test with a loop of its own."""
+    from nanoclaude.tools.read import ReadTool
+
+    def interrupted_request(
+        self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]
+    ) -> PermissionRequest:
+        raise KeyboardInterrupt
+
+    async def interrupted_run(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        ReadTool,
+        where,
+        interrupted_request if where == "permission_request" else interrupted_run,
+    )
+    (tmp_repo / "a.py").write_text("x")
+    batch = executor(policy).run_batch((ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi"))
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            loop.run_until_complete(batch)
+    finally:
+        # Whatever the interrupted batch left running is cancelled and finished before
+        # the loop goes, or the loop's closing would warn about it.
+        unfinished = asyncio.all_tasks(loop)
+        for task in unfinished:
+            task.cancel()
+        if unfinished:
+            loop.run_until_complete(asyncio.gather(*unfinished, return_exceptions=True))
+        loop.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ToolArgumentError("offset must be an integer, got str"),
+        ValueError("embedded null byte"),
+        OSError("device not configured"),
+    ],
+    ids=["tool-argument-error", "value-error", "os-error"],
+)
+async def test_what_a_permission_request_may_legitimately_raise_is_still_a_refusal(
+    policy, tmp_repo, monkeypatch, error
+):
+    """These three have their own clause and mean "these arguments are bad", which
+    the model can correct. The new clause sits after them and must not take them.
+    ValueError and OSError would pass a looser check (their text is in the new
+    message too), so the wording and the audit row are what is pinned."""
+    from nanoclaude.tools.read import ReadTool
+
+    def reject(self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]) -> PermissionRequest:
+        raise error
+
+    monkeypatch.setattr(ReadTool, "permission_request", reject)
+    (tmp_repo / "a.py").write_text("x")
+    store = _store(tmp_repo)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert outcomes[0].content.startswith("Refused (tool.bad-arguments): bad arguments: ")
+    row = _audit_row(store, "t1")
+    assert (row["outcome"], row["rule"]) == ("refused", "tool.bad-arguments"), dict(row)
+
+
+async def test_an_exception_that_is_not_an_exception_still_propagates_from_a_permission_request(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    def abort(self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]) -> PermissionRequest:
+        raise _Abort("stop everything")
+
+    monkeypatch.setattr(ReadTool, "permission_request", abort)
+    (tmp_repo / "a.py").write_text("x")
+    with pytest.raises(_Abort, match="stop everything"):
+        await executor(policy).run_batch(
+            (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+        )
+
+
+# --- Text the model chose never reaches anything raw ----------------------------
+#
+# Every string the executor builds from what the model sent (a path quoted in a
+# refusal, a tool name it made up, the message of an error a tool raised over its
+# arguments) goes through sanitize() before it reaches the model, the front end or
+# the audit log. The front end prints what it is given, and a terminal acts on
+# what it prints: one test per path, each reading everything that path produced.
+
+#: A window-title change, a clear-screen and a carriage return, in the order a
+#: hostile string would carry them.
+HOSTILE = "\x1b]0;TITLE\x07\x1b[2J\r"
+
+
+class _Recorder(SilentUI):
+    """Remembers everything the executor tells the front end."""
+
+    def __init__(self) -> None:
+        self.decisions: list[tuple[PermissionRequest, PermissionResult]] = []
+        self.outcomes: list[ToolOutcome] = []
+
+    def on_decision(
+        self, _call: ToolUseBlock, request: PermissionRequest, result: PermissionResult
+    ) -> None:
+        self.decisions.append((request, result))
+
+    def on_outcome(self, _call: ToolUseBlock, outcome: ToolOutcome) -> None:
+        self.outcomes.append(outcome)
+
+
+def _every_text_the_executor_wrote(
+    outcomes: tuple[ToolOutcome, ...], ui: _Recorder, store: Store
+) -> list[str]:
+    """What the model, the front end and the audit table were each handed.
+
+    Not the subject of a request a tool built (the path or the command it asked
+    about): the executor hands that on as it is, because the rules judge the
+    original, and a front end that shows it has to render it safely.
+    """
+    texts = [outcome.content for outcome in (*outcomes, *ui.outcomes)]
+    for request, result in ui.decisions:
+        texts += [request.tool, result.rule, result.reason]
+    columns = "tool, args_json, decision, rule, outcome, error"
+    for row in store.db.execute(f"SELECT {columns} FROM tool_calls"):  # noqa: S608
+        texts += [value for value in row if isinstance(value, str)]
+    return texts
+
+
+def _what_a_terminal_would_act_on(texts: list[str]) -> list[str]:
+    return [text for text in texts if any(char in text for char in ("\x1b", "\x07", "\r"))]
+
+
+async def test_a_policy_refusal_quoting_the_models_path_carries_no_terminal_sequences(
+    policy, tmp_repo
+):
+    ui, store = _Recorder(), _store(tmp_repo)
+    elsewhere = tmp_repo.parent / "elsewhere"  # beside the sandbox root, not in it
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": f"{elsewhere}/{HOSTILE}passwd"}),), start("hi")
+    )
+    # The words are still there; what a terminal would act on is not.
+    quoted = f"{elsewhere}/passwd is outside the working directory"
+    assert outcomes[0].content.startswith(f"Refused (sandbox.outside-root): {quoted}")
+    [(_, result)] = ui.decisions
+    assert result.reason.startswith(quoted)
+    assert _what_a_terminal_would_act_on(_every_text_the_executor_wrote(outcomes, ui, store)) == []
+
+
+async def test_an_unknown_tool_name_carrying_terminal_sequences_is_shown_and_stored_without_them(
+    policy, tmp_repo
+):
+    ui, store = _Recorder(), _store(tmp_repo)
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", f"Nope{HOSTILE}", {}),), start("hi")
+    )
+    assert outcomes[0].content.startswith("Refused (tool.unknown): ")
+    [(request, _)] = ui.decisions
+    assert request.tool == "Nope"
+    stored = store.db.execute("SELECT tool FROM tool_calls WHERE tool_use_id = 't1'").fetchone()
+    assert stored["tool"] == "Nope"
+    assert _what_a_terminal_would_act_on(_every_text_the_executor_wrote(outcomes, ui, store)) == []
+
+
+@pytest.mark.parametrize(
+    ("where", "error", "content", "recorded"),
+    [
+        (
+            "permission_request",
+            ToolArgumentError(f"offset {HOSTILE}must be a number"),
+            "Refused (tool.bad-arguments): bad arguments: offset must be a number",
+            None,
+        ),
+        (
+            "permission_request",
+            OSError(f"cannot stat {HOSTILE}file"),
+            "Refused (tool.bad-arguments): bad arguments: OSError: cannot stat file",
+            None,
+        ),
+        (
+            "run",
+            ToolArgumentError(f"offset {HOSTILE}must be a number"),
+            "bad arguments: offset must be a number",
+            "offset must be a number",
+        ),
+        (
+            "run",
+            OSError(f"cannot stat {HOSTILE}file"),
+            "OSError: cannot stat file",
+            "cannot stat file",
+        ),
+    ],
+    ids=[
+        "tool-argument-error-in-the-permission-request",
+        "os-error-in-the-permission-request",
+        "tool-argument-error-in-run",
+        "os-error-in-run",
+    ],
+)
+async def test_the_message_of_an_error_over_a_calls_arguments_carries_no_terminal_sequences(
+    policy, tmp_repo, monkeypatch, where, error, content, recorded
+):
+    from nanoclaude.tools.read import ReadTool
+
+    def raising_request(
+        self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]
+    ) -> PermissionRequest:
+        raise error
+
+    async def raising_run(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise error
+
+    monkeypatch.setattr(
+        ReadTool, where, raising_request if where == "permission_request" else raising_run
+    )
+    (tmp_repo / "a.py").write_text("x")
+    ui, store = _Recorder(), _store(tmp_repo)
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert outcomes[0].content == content
+    assert _audit_row(store, "t1")["error"] == recorded
+    assert _what_a_terminal_would_act_on(_every_text_the_executor_wrote(outcomes, ui, store)) == []

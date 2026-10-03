@@ -1,0 +1,2573 @@
+"""Tests for nanoclaude.agent.session and nanoclaude.testing.session.
+
+The first block is the brief's own eleven tests. Two of them changed shape and the
+module says why where it happens: the compaction test could not pass as written
+(a one-message conversation is never compacted, so the marker it looks for never
+appears), and the retry test must not wait out a real back-off.
+
+The rest pin the notes the brief carries and what the session owns that no other
+module can: that a bug in a tool does not end it, that an unknown cost is stored
+as unknown, that a reply of only complaints is asked for again a bounded number of
+times, that the configured retry policy is the one in force, that the context
+figure is measured the way compaction measures it, that no request sets a
+temperature, and that a session stays usable after Ctrl+C.
+
+Nothing here waits for time to pass: the retry policy under test has no delay or
+a delay of a millisecond, and cancellation is driven with events.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from nanoclaude.agent.loop import StopReason
+from nanoclaude.agent.session import Session, new_session_id
+from nanoclaude.agent.ui import AutoApprove, AutoDecline
+from nanoclaude.config.schema import LimitsConfig, ModelConfig, RolesConfig
+from nanoclaude.conversation.budget import (
+    Budget,
+    ContextTooSmallError,
+    HeuristicCounter,
+    transcript_text,
+)
+from nanoclaude.conversation.compaction import SUMMARY_TEMPLATE
+from nanoclaude.conversation.store import Store, decode_blocks
+from nanoclaude.conversation.transcript import (
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    Transcript,
+    assistant_text,
+    user_text,
+    validate,
+)
+from nanoclaude.prompts import SYSTEM_PROMPT
+from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, StopKind, Usage
+from nanoclaude.providers.capabilities import (
+    CONSERVATIVE_DEFAULT,
+    Capabilities,
+    capabilities_for,
+)
+from nanoclaude.providers.retry import RetryPolicy, classify_status
+from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
+from nanoclaude.testing.scripted import calls, calls_many, says
+from nanoclaude.testing.session import ScriptedSession, build_session
+from nanoclaude.tools.base import ToolContext, ToolOutcome
+
+#: A model id neither the capability table nor the price book has heard of. Its
+#: cost is unknown, and it gets the conservative capabilities unless a test gives
+#: it others.
+UNPRICED = "model-without-a-price"
+
+#: A model with no native tool calling and a window the protocol prompt fits in
+#: with room to spare. The brief's own tests use CONSERVATIVE_DEFAULT (8,192
+#: tokens); the retry tests add messages and should not depend on how close the
+#: fixed prompt sits to that window.
+TEXT_ONLY = Capabilities(
+    native_tools=False,
+    parallel_tools=False,
+    cache="none",
+    context_window=32_000,
+    max_output=4_000,
+)
+
+BAD_CALL = '<tool name="Read">{"path": </tool>'
+
+#: What an unconfigured session runs on, and what the compact role runs on when it
+#: is given a model of its own. Read from the table, so a test that needs a window
+#: or an output limit never states a number the table may have moved on from.
+SONNET = capabilities_for("anthropic", "claude-sonnet-5")
+HAIKU = capabilities_for("anthropic", "claude-haiku-4-5")
+
+
+def available_in(capabilities: Capabilities) -> int:
+    """Spec 7.3: the window, less the room kept for the reply, less a tenth as a margin."""
+    return capabilities.context_window - capabilities.max_output - capabilities.context_window // 10
+
+
+@pytest.fixture(autouse=True)
+def _no_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The environment block asks git for the branch on every turn: two forks.
+
+    Which branch the repository is on has no bearing on anything tested here, and
+    a temp directory that happened to sit inside another repository would change
+    the system prompt from machine to machine. assemble() has its own tests.
+    """
+    monkeypatch.setattr("nanoclaude.context.assemble.git_state", lambda _root: "")
+
+
+class Watcher(AutoApprove):
+    """Approves everything, and remembers what the session told the UI."""
+
+    def __init__(self) -> None:
+        self.replies: list[ModelReply] = []
+        self.retries: list[tuple[int, float, str]] = []
+
+    def on_reply(self, reply: ModelReply) -> None:
+        self.replies.append(reply)
+
+    def on_retry(self, attempt: int, delay_s: float, reason: str) -> None:
+        self.retries.append((attempt, delay_s, reason))
+
+
+def tool_history(rounds: int, *, result_chars: int) -> Transcript:
+    """A conversation that already ran ``rounds`` tool rounds and ended on an answer.
+
+    ``2 * rounds + 2`` messages: the request, a call and its result per round, and
+    the answer. Ids and paths are ``h0``/``f0.py`` and so on.
+    """
+    messages = [user_text("start")]
+    for i in range(rounds):
+        messages.append(
+            Message("assistant", (ToolUseBlock(f"h{i}", "Read", {"path": f"f{i}.py"}),))
+        )
+        messages.append(
+            Message("user", (ToolResultBlock(f"h{i}", f"result {i}: " + "x" * result_chars),))
+        )
+    messages.append(assistant_text("all done"))
+    return Transcript(tuple(messages))
+
+
+def is_summary_request(request: ModelRequest) -> bool:
+    return transcript_text(request.transcript).startswith(SUMMARY_TEMPLATE)
+
+
+async def reached(event: asyncio.Event) -> None:
+    """Wait for something the code under test must do, and fail if it never does.
+
+    A bare ``event.wait()`` would hang the run when the thing never happens, which is
+    exactly what a regression looks like. Nothing here takes anywhere near five
+    seconds.
+    """
+    await asyncio.wait_for(event.wait(), timeout=5)
+
+
+def tool_results(transcript: Transcript) -> list[ToolResultBlock]:
+    return [block for message in transcript.messages for block in message.tool_results()]
+
+
+def stored_row(session: ScriptedSession) -> Any:
+    assert session.store is not None
+    return session.store.db.execute(
+        "SELECT * FROM sessions WHERE id = ?", (session.session_id,)
+    ).fetchone()
+
+
+def archived_messages(session: ScriptedSession) -> list[Message]:
+    """What the store moved out of the live transcript, in the order it was moved."""
+    assert session.store is not None
+    rows = session.store.db.execute(
+        "SELECT role, blocks_json FROM messages_archive WHERE session_id = ? ORDER BY rowid",
+        (session.session_id,),
+    ).fetchall()
+    return [Message(row["role"], decode_blocks(row["blocks_json"])) for row in rows]
+
+
+def row_after_closing(session: ScriptedSession) -> Any:
+    """The session's row, read through a connection of its own: the session closed its."""
+    assert session.store is not None
+    reader = Store(session.store.path)
+    reader.open()
+    try:
+        return reader.db.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session.session_id,)
+        ).fetchone()
+    finally:
+        reader.close()
+
+
+# --------------------------------------------------------------------------
+# The brief's own tests
+# --------------------------------------------------------------------------
+
+
+async def test_a_one_turn_conversation_completes(tmp_repo):
+    session = build_session(tmp_repo, [says("all done")])
+    done = await session.run("hello")
+    assert done.reason is StopReason.COMPLETED and done.text == "all done"
+
+
+async def test_a_tool_call_runs_and_the_result_goes_back_to_the_model(tmp_repo):
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    session = build_session(
+        tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), says("it sets x")]
+    )
+    done = await session.run("what is in a.py")
+    assert done.text == "it sets x"
+    assert "x = 1" in transcript_text(done.state.transcript)
+    # Not only in the final state: the model's second request is what carried it.
+    answered = tool_results(session.model.requests[1].transcript)
+    assert [r.tool_use_id for r in answered] == ["t1"] and "x = 1" in answered[0].content
+
+
+async def test_the_session_is_persisted_turn_by_turn(tmp_repo):
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hello")
+    assert session.store is not None
+    reloaded = session.store.load_transcript(session.session_id)
+    assert reloaded == session.state.transcript
+
+
+async def test_a_follow_up_continues_the_same_transcript(tmp_repo):
+    session = build_session(tmp_repo, [says("first"), says("second")])
+    await session.run("one")
+    done = await session.follow_up("two")
+    assert done.text == "second"
+    assert len(done.state.transcript.messages) == 4
+    # The second request carried the whole first exchange, then the new prompt.
+    assert [m.text() for m in session.model.requests[1].transcript.messages] == [
+        "one",
+        "first",
+        "two",
+    ]
+
+
+async def test_a_retryable_provider_error_is_retried(tmp_repo):
+    session = build_session(
+        tmp_repo, [ModelError("overloaded", retryable=True, status=529), says("ok")]
+    )
+    done = await session.run("hello")
+    assert done.text == "ok"
+    assert len(session.model.requests) == 2
+
+
+async def test_a_non_retryable_provider_error_surfaces(tmp_repo):
+    session = build_session(tmp_repo, [ModelError("bad key", retryable=False, status=401)])
+    with pytest.raises(ModelError, match="bad key"):
+        await session.run("hello")
+    assert len(session.model.requests) == 1  # asked once; a 401 is not retried
+
+
+async def test_crossing_the_hard_threshold_triggers_a_full_compaction(tmp_repo):
+    """The brief ran this on a one-message conversation, which full_compact leaves
+    alone: with nothing older than the recent turns there is nothing to summarise.
+    It needs a history longer than the turns kept verbatim."""
+    session = build_session(
+        tmp_repo,
+        [says("SUMMARY of the work"), says("answer")],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    done = await session.follow_up("what next")
+    assert "[earlier conversation, compacted]" in transcript_text(done.state.transcript)
+    assert done.text == "answer"
+
+
+async def test_usage_is_attributed_to_the_main_role(tmp_repo):
+    session = build_session(tmp_repo, [says("done", input_tokens=50, output_tokens=5)])
+    await session.run("hello")
+    main = session.router.by_role()["main"]
+    assert main.usage.input_tokens == 50
+    assert (main.adapter, main.model) == ("anthropic", "claude-sonnet-5")
+
+
+async def test_a_model_without_native_tools_gets_the_text_protocol(tmp_repo):
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    session = build_session(
+        tmp_repo,
+        [says('<tool name="Read">{"path": "a.py"}</tool>'), says("it sets x")],
+        capabilities=CONSERVATIVE_DEFAULT,
+    )
+    done = await session.run("read a.py")
+    assert done.text == "it sets x"
+    assert "x = 1" in transcript_text(done.state.transcript)
+    # The loop cannot tell the difference: what the transcript holds is a real call.
+    assert [b.name for b in done.state.transcript.messages[1].tool_uses()] == ["Read"]
+
+
+async def test_the_system_prompt_names_the_text_protocol_only_when_needed(tmp_repo):
+    native = build_session(tmp_repo, [says("done")])
+    await native.run("hi")
+    assert "<tool name=" not in native.model.requests[0].system
+    assert native.model.requests[0].tools  # sent as tools, not as prose
+
+    fallback = build_session(tmp_repo, [says("done")], capabilities=CONSERVATIVE_DEFAULT)
+    await fallback.run("hi")
+    assert "<tool name=" in fallback.model.requests[0].system
+    assert fallback.model.requests[0].tools == ()  # said once, in the prompt
+
+
+async def test_the_turn_limit_ends_the_session_cleanly(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(10)]
+    session = build_session(tmp_repo, script, max_turns=3)
+    done = await session.run("keep reading")
+    assert done.reason is StopReason.TURN_LIMIT
+    validate(done.state.transcript)  # closed cleanly: every call has its answer
+
+
+# --------------------------------------------------------------------------
+# new_session_id
+# --------------------------------------------------------------------------
+
+
+def test_a_session_id_is_twelve_hex_characters_and_never_repeats():
+    ids = {new_session_id() for _ in range(300)}
+    assert len(ids) == 300
+    assert all(len(i) == 12 and set(i) <= set("0123456789abcdef") for i in ids)
+
+
+# --------------------------------------------------------------------------
+# Carried note: an unknown cost is stored as unknown
+# --------------------------------------------------------------------------
+
+
+async def test_a_priced_session_is_stored_with_what_it_cost(tmp_repo):
+    session = build_session(tmp_repo, [says("done", input_tokens=1_000, output_tokens=100)])
+    await session.run("hello")
+    # Sonnet 5 is $2 per million input tokens and $10 per million output tokens:
+    # (1,000 * 2 + 100 * 10) / 1,000,000.
+    assert session.cost == pytest.approx(0.003)
+    row = stored_row(session)
+    assert row["total_cost_usd"] == pytest.approx(0.003)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["ended_at"] is not None
+
+
+async def test_an_unpriced_session_is_stored_with_an_unknown_cost_not_zero(tmp_repo):
+    session = build_session(
+        tmp_repo, [says("done", input_tokens=1_000, output_tokens=100)], model=UNPRICED
+    )
+    await session.run("hello")
+    assert session.cost is None
+    row = stored_row(session)
+    assert row["total_cost_usd"] is None  # NULL, which a display shows as unknown
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["ended_at"] is not None  # the session is still recorded as finished
+
+
+async def test_a_session_that_used_nothing_costs_a_known_zero_not_an_unknown(tmp_repo):
+    # A priced model with no tokens spent is $0.00 and that is a fact. It must not
+    # be mistaken for the unknown above by any falsy check on the way to the store.
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hello")
+    assert session.cost == 0.0
+    assert stored_row(session)["total_cost_usd"] == 0.0
+
+
+async def test_a_second_unpriced_model_makes_the_whole_total_unknown(tmp_repo):
+    # Priced main, unpriced compaction model: the total is a guess, so it is unknown.
+    session = build_session(
+        tmp_repo,
+        [says("answer", input_tokens=1_000)],
+        compact_script=[says("SUMMARY")],
+        compact_model=UNPRICED,
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert session.router.by_role()["main"].cost is not None
+    assert session.cost is None
+    assert stored_row(session)["total_cost_usd"] is None
+
+
+async def test_usage_and_cost_follow_the_router_as_the_session_goes_on(tmp_repo):
+    session = build_session(
+        tmp_repo,
+        [
+            says("one", input_tokens=10, output_tokens=1),
+            says("two", input_tokens=20, output_tokens=2),
+        ],
+    )
+    assert session.usage == Usage() and session.cost == 0.0
+    await session.run("a")
+    assert session.usage == Usage(10, 1)
+    await session.follow_up("b")
+    assert session.usage == Usage(30, 3)
+    assert session.usage == session.router.total_usage()
+    assert session.cost == session.router.total_cost()
+
+
+# --------------------------------------------------------------------------
+# Carried note: MAX_PARSE_RETRIES
+# --------------------------------------------------------------------------
+
+
+async def test_a_reply_of_only_complaints_is_asked_for_again_with_the_complaints_fed_back(
+    tmp_repo,
+):
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    session = build_session(
+        tmp_repo,
+        [says(BAD_CALL), says('<tool name="Read">{"path": "a.py"}</tool>'), says("it sets x")],
+        capabilities=TEXT_ONLY,
+    )
+    done = await session.run("read a.py")
+    assert done.text == "it sets x"
+    assert len(session.model.requests) == 3
+
+    retry_request = session.model.requests[1]
+    validate(retry_request.transcript)  # roles still alternate
+    _prompt, attempt, correction = retry_request.transcript.messages
+    # What the model said is in the transcript as it said it, not with our note
+    # appended: the complaint arrives once, as the user's next message.
+    assert attempt.role == "assistant" and attempt.text() == BAD_CALL
+    assert correction.role == "user"
+    assert "not valid JSON" in correction.text()
+    assert "Read" in correction.text()
+    # It says what to do next, not only what went wrong.
+    assert "<tool name=" in correction.text()
+    # The conversation went on normally after it.
+    assert "x = 1" in transcript_text(done.state.transcript)
+
+
+async def test_every_complaint_in_a_reply_is_fed_back_not_only_the_first(tmp_repo):
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    two_bad = '<tool name="Read">{"path": </tool>\n<tool name="Grep">{not json}</tool>'
+    session = build_session(
+        tmp_repo,
+        [says(two_bad), says('<tool name="Read">{"path": "a.py"}</tool>'), says("done")],
+        capabilities=TEXT_ONLY,
+    )
+    await session.run("go")
+    correction = session.model.requests[1].transcript.messages[-1].text()
+    complaints = [line for line in correction.splitlines() if line.startswith("- ")]
+    assert len(complaints) == 2
+    assert "Read" in complaints[0] and "Grep" in complaints[1]
+
+
+async def test_a_reply_of_only_complaints_is_retried_at_most_the_limit_and_then_stops(tmp_repo):
+    script = [says(f"{BAD_CALL} attempt {n}") for n in range(MAX_PARSE_RETRIES + 3)]
+    session = build_session(tmp_repo, script, capabilities=TEXT_ONLY)
+    done = await session.run("read a.py")
+    # The first ask and MAX_PARSE_RETRIES more; the rest of the script is never used.
+    assert len(session.model.requests) == MAX_PARSE_RETRIES + 1
+    assert not session.model.exhausted
+    # It gives up (the reason and what the person is told are pinned below), and the
+    # transcript ends on the last reply, complaints and all.
+    assert done.reason is StopReason.MODEL_UNSUITABLE
+    last = done.state.transcript.last()
+    assert last is not None and last.role == "assistant"
+    assert f"attempt {MAX_PARSE_RETRIES}" in last.text() and "[tool protocol]" in last.text()
+    validate(done.state.transcript)
+
+
+async def test_a_reply_with_one_valid_call_is_not_retried_for_the_malformed_one_beside_it(
+    tmp_repo,
+):
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    both = '<tool name="Read">{"path": "a.py"}</tool>\n<tool name="Grep">{not json}</tool>'
+    session = build_session(tmp_repo, [says(both), says("done")], capabilities=TEXT_ONLY)
+    done = await session.run("go")
+    # One request for the turn with the call in it and one after the tool ran.
+    assert len(session.model.requests) == 2
+    assert done.text == "done"
+    after = session.model.requests[1].transcript
+    [ran] = tool_results(after)  # the call ran
+    assert re.fullmatch(r"tt_[0-9a-f]{12}", ran.tool_use_id)
+    # The complaint stays in the reply for the model to see, but nobody asked it
+    # to write the call again: no user message in the history is a correction.
+    assert "[tool protocol]" in after.messages[1].text()
+    assert [m.role for m in after.messages] == ["user", "assistant", "user"]
+
+
+async def test_the_parse_retry_limit_counts_failures_in_a_row_not_in_a_session(tmp_repo):
+    # Two failures, a good call, two more failures, then an answer. With a limit of
+    # two in a row every reply is used; a limit of two on the whole session would
+    # stop at the fourth reply.
+    (tmp_repo / "a.py").write_text("x\n")
+    good = '<tool name="Read">{"path": "a.py"}</tool>'
+    script = [says(BAD_CALL)] * 2 + [says(good)] + [says(BAD_CALL)] * 2 + [says("finished")]
+    session = build_session(tmp_repo, script, capabilities=TEXT_ONLY)
+    done = await session.run("go")
+    assert done.text == "finished"
+    assert session.model.exhausted
+    assert len(session.model.requests) == 6
+
+
+UNSUITABLE = (
+    "error: qwen3-coder did not produce a valid tool call in {attempts} attempts "
+    "\u2014 choose a model with native tool calling (--model)"
+)
+
+
+async def test_a_model_that_never_writes_a_valid_call_is_given_up_on_by_name(tmp_repo):
+    # Spec 4.4: after the retries are spent the tool gives up and says the model is
+    # not suitable. The first reply and MAX_PARSE_RETRIES more are the attempts.
+    script = [says(f"{BAD_CALL} attempt {n}") for n in range(MAX_PARSE_RETRIES + 3)]
+    session = build_session(tmp_repo, script, model="qwen3-coder", capabilities=TEXT_ONLY)
+    done = await session.run("read a.py")
+    attempts = MAX_PARSE_RETRIES + 1
+    assert len(session.model.requests) == attempts
+    assert done.reason is StopReason.MODEL_UNSUITABLE
+    # The value headless prints as stop_reason, and anything but "completed" makes
+    # it exit non-zero.
+    assert done.reason.value == "model_unsuitable"
+    # The last text a person sees is the 17.9 form, with the real model and the count.
+    assert done.text == UNSUITABLE.format(attempts=attempts)
+    validate(done.state.transcript)
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+
+
+async def test_giving_up_on_a_model_still_records_what_every_attempt_cost(tmp_repo):
+    # The stop is a verdict on the model, not a way out of the bookkeeping: the attempts
+    # were paid for, and the row says so without anyone closing the session.
+    script = [
+        says(f"{BAD_CALL} attempt {n}", input_tokens=1_000, output_tokens=100)
+        for n in range(MAX_PARSE_RETRIES + 1)
+    ]
+    session = build_session(tmp_repo, script, native_tools=False)
+    done = await session.run("go")
+    assert done.reason is StopReason.MODEL_UNSUITABLE
+    row = stored_row(session)
+    attempts = MAX_PARSE_RETRIES + 1
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (
+        1_000 * attempts,
+        100 * attempts,
+    )
+    assert row["total_cost_usd"] == pytest.approx(0.003 * attempts)
+    assert row["ended_at"] is not None
+
+
+@pytest.mark.parametrize(
+    ("last_reply", "text"),
+    [
+        (says('<tool name="Read">{"path": "a.py"}</tool>'), "all read"),
+        (
+            says("I cannot call tools, but here is the answer"),
+            "I cannot call tools, but here is the answer",
+        ),
+    ],
+    ids=["a-valid-call", "an-answer-in-prose"],
+)
+async def test_a_success_on_the_last_allowed_retry_is_not_a_failure(tmp_repo, last_reply, text):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [says(BAD_CALL)] * MAX_PARSE_RETRIES + [last_reply, says("all read")]
+    session = build_session(tmp_repo, script, model="qwen3-coder", capabilities=TEXT_ONLY)
+    done = await session.run("read a.py")
+    assert done.reason is StopReason.COMPLETED and done.text == text
+    assert len(session.model.requests) >= MAX_PARSE_RETRIES + 1
+
+
+async def test_the_attempts_counted_are_the_failures_in_a_row_not_every_reply_so_far(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    good = '<tool name="Read">{"path": "a.py"}</tool>'
+    script = [says(good)] + [says(BAD_CALL)] * (MAX_PARSE_RETRIES + 1)
+    session = build_session(tmp_repo, script, model="qwen3-coder", capabilities=TEXT_ONLY)
+    done = await session.run("go")
+    assert done.reason is StopReason.MODEL_UNSUITABLE
+    assert done.text == UNSUITABLE.format(
+        attempts=MAX_PARSE_RETRIES + 1
+    )  # not one more for the call
+
+
+async def test_a_turn_limit_is_not_mistaken_for_an_unsuitable_model(tmp_repo):
+    # A reply with a valid call and a malformed one, at the turn limit: the calls
+    # are what stopped it, and the complaint beside them is not a spent retry.
+    (tmp_repo / "a.py").write_text("x\n")
+    both = '<tool name="Read">{"path": "a.py"}</tool>\n<tool name="Grep">{not json}</tool>'
+    session = build_session(tmp_repo, [says(both)], capabilities=TEXT_ONLY, max_turns=1)
+    done = await session.run("go")
+    assert done.reason is StopReason.TURN_LIMIT
+
+
+async def test_a_reply_cut_off_in_the_middle_of_a_call_keeps_its_own_reason(tmp_repo):
+    # Out of output tokens is not a verdict on the model, and "choose another model"
+    # would be the wrong advice for it.
+    cut = ModelReply(
+        (TextBlock('<tool name="Read">{"path": "a.py"'),), StopKind.MAX_TOKENS, Usage(), "scripted"
+    )
+    session = build_session(tmp_repo, [cut] * (MAX_PARSE_RETRIES + 1), capabilities=TEXT_ONLY)
+    done = await session.run("go")
+    assert done.reason is StopReason.MAX_TOKENS
+
+
+async def test_every_attempt_is_billed_and_shown_even_the_ones_that_were_asked_again(tmp_repo):
+    watcher = Watcher()
+    script = [
+        says(BAD_CALL, input_tokens=10, output_tokens=1) for _ in range(MAX_PARSE_RETRIES + 1)
+    ]
+    session = build_session(tmp_repo, script, capabilities=TEXT_ONLY, ui=watcher)
+    done = await session.run("go")
+    attempts = MAX_PARSE_RETRIES + 1
+    assert session.router.by_role()["main"].usage == Usage(10 * attempts, attempts)
+    # And in the conversation's own count, which is what a Done carries.
+    assert done.state.usage == Usage(10 * attempts, attempts)
+    assert len(watcher.replies) == attempts
+
+
+async def test_asking_again_does_not_use_up_turns(tmp_repo):
+    # Two turns allowed: one tool round and the answer. Asking again twice on the
+    # way must not count against them.
+    (tmp_repo / "a.py").write_text("x\n")
+    good = '<tool name="Read">{"path": "a.py"}</tool>'
+    script = [says(BAD_CALL), says(BAD_CALL), says(good), says("finished")]
+    session = build_session(tmp_repo, script, capabilities=TEXT_ONLY, max_turns=2)
+    done = await session.run("go")
+    assert done.reason is StopReason.COMPLETED and done.text == "finished"
+    assert done.state.turn == 1
+
+
+async def test_asking_again_in_the_middle_of_a_prompt_does_not_give_its_turns_back(tmp_repo):
+    # Three turns allowed, so the second reply with calls after the first is the
+    # limit. A malformed reply between tool rounds is asked for again; that is the
+    # same prompt still running and must not start its count over, or a model that
+    # fails once between calls could keep going for ever.
+    (tmp_repo / "a.py").write_text("x\n")
+    good = '<tool name="Read">{"path": "a.py"}</tool>'
+    script = [says(good), says(BAD_CALL), says(good), says(good), says("never reached")]
+    session = build_session(tmp_repo, script, capabilities=TEXT_ONLY, max_turns=3)
+    done = await session.run("go")
+    # call, [malformed, asked again], call, call: the third tool round is the limit.
+    assert done.reason is StopReason.TURN_LIMIT
+    assert len(session.model.requests) == 4
+    assert not session.model.exhausted
+
+
+async def test_under_the_text_protocol_the_ui_is_shown_the_reply_as_parsed(tmp_repo):
+    # The person sees the call the model made, not the markup it wrote it in.
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    watcher = Watcher()
+    session = build_session(
+        tmp_repo,
+        [says('<tool name="Read">{"path": "a.py"}</tool>'), says("done")],
+        capabilities=TEXT_ONLY,
+        ui=watcher,
+    )
+    await session.run("go")
+    shown = watcher.replies[0]
+    [call] = [b for b in shown.blocks if isinstance(b, ToolUseBlock)]
+    assert (call.name, dict(call.arguments)) == ("Read", {"path": "a.py"})
+    assert shown.stop is StopKind.TOOL_USE
+
+
+async def test_a_model_with_native_tools_is_never_asked_again_for_a_text_call(tmp_repo):
+    # Both directions of the guard: only a model without native calls is parsed
+    # for text calls, so only its malformed ones are retried.
+    session = build_session(tmp_repo, [says(BAD_CALL), says("never used")])
+    done = await session.run("go")
+    assert len(session.model.requests) == 1
+    assert done.text == BAD_CALL and "[tool protocol]" not in done.text
+
+
+async def test_text_protocol_calls_get_ids_that_are_unique_across_turns(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    one = '<tool name="Read">{"path": "a.py"}</tool>'
+    session = build_session(tmp_repo, [says(one), says(one), says("done")], capabilities=TEXT_ONLY)
+    done = await session.run("go")
+    ids = [r.tool_use_id for r in tool_results(done.state.transcript)]
+    assert len(ids) == 2 and len(set(ids)) == 2
+    assert all(re.fullmatch(r"tt_[0-9a-f]{12}", one) for one in ids)
+    validate(done.state.transcript)  # validate() rejects a repeated id
+
+
+# --------------------------------------------------------------------------
+# Carried note: a bug in one tool must not end the session
+# --------------------------------------------------------------------------
+
+
+async def test_a_bug_in_one_tool_does_not_end_the_session(tmp_repo, monkeypatch):
+    from nanoclaude.tools.read import ReadTool
+
+    async def explode(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise RuntimeError("list index out of range")
+
+    monkeypatch.setattr(ReadTool, "run", explode)
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), says("that tool is broken")]
+    )
+    done = await session.run("read it")
+    assert done.reason is StopReason.COMPLETED and done.text == "that tool is broken"
+    # The model was told what happened and could answer.
+    [result] = tool_results(session.model.requests[1].transcript)
+    assert result.is_error and "RuntimeError: list index out of range" in result.content
+    assert "bug" in result.content
+    # And the audit table says so too.
+    assert session.store is not None
+    row = session.store.db.execute(
+        "SELECT outcome, session_id FROM tool_calls WHERE tool_use_id = 't1'"
+    ).fetchone()
+    assert (row["outcome"], row["session_id"]) == ("error", session.session_id)
+
+
+# --------------------------------------------------------------------------
+# Carried note: the retry policy and ui.on_retry
+# --------------------------------------------------------------------------
+
+
+async def test_a_retry_is_reported_to_the_ui_with_the_attempt_the_delay_and_the_reason(tmp_repo):
+    watcher = Watcher()
+    session = build_session(
+        tmp_repo,
+        [ModelError("overloaded", retryable=True, status=529), says("ok")],
+        ui=watcher,
+        retry=RetryPolicy(base_delay_s=0.001, max_delay_s=0.001),
+    )
+    await session.run("hello")
+    [(attempt, delay, reason)] = watcher.retries
+    assert attempt == 1
+    # with_retry draws the delay from [0.5, 1.0] of the policy's ceiling: here the
+    # configured millisecond, not the default policy's second.
+    assert 0.0005 <= delay <= 0.001
+    assert reason == "overloaded"
+
+
+async def test_the_configured_retry_policy_decides_how_many_attempts_are_made(tmp_repo):
+    watcher = Watcher()
+    script = [ModelError("overloaded", retryable=True, status=529)] * 5
+    session = build_session(
+        tmp_repo,
+        script,
+        ui=watcher,
+        retry=RetryPolicy(overload_attempts=3, base_delay_s=0.0, max_delay_s=0.0),
+    )
+    with pytest.raises(ModelError, match="overloaded"):
+        await session.run("hello")
+    assert len(session.model.requests) == 3  # the default policy would have made five
+    assert [attempt for attempt, _, _ in watcher.retries] == [1, 2]
+
+
+async def test_a_failure_that_is_not_retryable_is_not_retried_and_not_reported(tmp_repo):
+    watcher = Watcher()
+    session = build_session(
+        tmp_repo, [ModelError("bad key", retryable=False, status=401), says("never")], ui=watcher
+    )
+    with pytest.raises(ModelError, match="bad key"):
+        await session.run("hello")
+    assert watcher.retries == [] and len(session.model.requests) == 1
+
+
+async def test_cancelling_while_waiting_to_retry_stops_the_run_at_once(tmp_repo):
+    # An hour's back-off: only cancellation can end this in the time the test has.
+    retrying = asyncio.Event()
+
+    class NotifyOnRetry(AutoApprove):
+        def on_retry(self, _attempt: int, _delay_s: float, _reason: str) -> None:
+            retrying.set()
+
+    session = build_session(
+        tmp_repo,
+        [ModelError("overloaded", retryable=True, status=529), says("never reached")],
+        ui=NotifyOnRetry(),
+        retry=RetryPolicy(base_delay_s=3600.0, max_delay_s=3600.0),
+    )
+    task = asyncio.create_task(session.run("hello"))
+    await reached(retrying)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+    assert len(session.model.requests) == 1
+
+
+async def test_the_compaction_request_is_retried_under_the_same_policy(tmp_repo):
+    watcher = Watcher()
+    session = build_session(
+        tmp_repo,
+        [says("answer")],
+        compact_script=[ModelError("overloaded", retryable=True, status=529), says("SUMMARY")],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+        ui=watcher,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert [attempt for attempt, _, _ in watcher.retries] == [1]
+    assert session.compact_model is not None and len(session.compact_model.requests) == 2
+
+
+# --------------------------------------------------------------------------
+# Carried note: context_usage() is async and uses the router's capabilities
+# --------------------------------------------------------------------------
+
+
+async def test_the_context_figure_is_measured_against_the_configured_window(tmp_repo, monkeypatch):
+    measured: list[int] = []
+    real_verdict = Budget.verdict
+
+    def spying_verdict(self: Budget, transcript: Transcript, system: str, tools: str) -> Any:
+        measured.append(self.available())
+        return real_verdict(self, transcript, system, tools)
+
+    monkeypatch.setattr(Budget, "verdict", spying_verdict)
+    session = build_session(tmp_repo, [says("done")], context_window=64_000)
+    await session.run("hello")  # every turn checks the budget before it asks
+
+    _, available = await session.context_usage()
+    # 64,000 window, a quarter of it kept for the reply (16,000, which the
+    # override bounds the output to), and a tenth held back: 64,000 - 16,000 - 6,400.
+    assert available == 41_600
+    # And that is the budget the session compacted against, not a second opinion.
+    assert measured and set(measured) == {41_600}
+
+
+async def test_the_context_figure_uses_the_models_table_row_when_nothing_overrides_it(tmp_repo):
+    session = build_session(tmp_repo, [])
+    _, available = await session.context_usage()
+    assert available == available_in(SONNET)
+
+
+async def test_the_context_figure_is_the_main_roles_when_another_role_has_a_smaller_window(
+    tmp_repo,
+):
+    # The conversation being measured is the main role's. The compact role's model
+    # has a window of its own, which is not what the conversation will be sent to.
+    assert available_in(HAIKU) != available_in(SONNET)
+    session = build_session(tmp_repo, [], compact_script=[])
+    _, available = await session.context_usage()
+    assert available == available_in(SONNET)
+
+
+async def test_the_context_figure_sees_capabilities_the_table_does_not_have(tmp_repo):
+    # A model the table has never heard of, whose capabilities came from the cache
+    # or a probe: the table alone says 8,192 tokens, and would show 5,324.
+    session = build_session(
+        tmp_repo,
+        [],
+        capabilities=Capabilities(True, False, "none", context_window=32_000, max_output=4_000),
+    )
+    _, available = await session.context_usage()
+    assert available == 24_800  # 32,000 - 4,000 - 3,200
+
+
+async def test_the_context_figure_counts_the_conversation_on_top_of_the_fixed_prompt(tmp_repo):
+    session = build_session(tmp_repo, [])
+    empty, _ = await session.context_usage()
+    # What every request carries before the conversation does: at least the
+    # system prompt, and the tool definitions beside it.
+    assert empty >= HeuristicCounter().count(SYSTEM_PROMPT)
+
+    session.state = replace(session.state, transcript=Transcript((user_text("x" * 3_500),)))
+    full, _ = await session.context_usage()
+    assert full - empty == 1_000  # 3,500 characters at 3.5 characters a token
+
+
+async def test_the_context_figure_counts_the_tool_definitions_a_request_carries(tmp_repo):
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    request = session.model.requests[0]
+    session.state = replace(session.state, transcript=Transcript())
+    fixed, _ = await session.context_usage()
+    counter = HeuristicCounter()
+    # The system prompt and, in some form, at least the descriptions of the tools.
+    descriptions = "".join(spec.description for spec in request.tools)
+    assert fixed >= counter.count(request.system) + counter.count(descriptions)
+
+
+async def test_the_fixed_part_of_the_context_is_the_system_prompt_and_the_tool_definitions_in_full(
+    tmp_repo,
+):
+    # The definitions count with their schemas, which are most of their size, and not
+    # only their names and descriptions.
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    request = session.model.requests[0]
+    session.state = replace(session.state, transcript=Transcript())
+    fixed, _ = await session.context_usage()
+    definitions = [
+        {"name": spec.name, "description": spec.description, "input_schema": dict(spec.schema)}
+        for spec in request.tools
+    ]
+    counter = HeuristicCounter()
+    assert fixed == counter.count(request.system) + counter.count(json.dumps(definitions))
+
+
+@pytest.mark.parametrize("capabilities", [None, TEXT_ONLY], ids=["native-tools", "text-protocol"])
+async def test_the_budget_is_measured_on_the_system_prompt_that_is_actually_sent(
+    tmp_repo, monkeypatch, capabilities
+):
+    # Under the text protocol the tool definitions are inside the system prompt.
+    # A budget measured on the prompt without them would count a request smaller
+    # than the one sent, on exactly the small-window models that need the check.
+    measured: list[tuple[str, str]] = []
+    real_verdict = Budget.verdict
+
+    def spying_verdict(self: Budget, transcript: Transcript, system: str, tools: str) -> Any:
+        measured.append((system, tools))
+        return real_verdict(self, transcript, system, tools)
+
+    monkeypatch.setattr(Budget, "verdict", spying_verdict)
+    session = build_session(tmp_repo, [says("done")], capabilities=capabilities)
+    await session.run("hello")
+    sent = session.model.requests[0]
+    assert measured and {system for system, _ in measured} == {sent.system}
+    # The tool definitions a request carries are counted too, in whatever form: at
+    # least their descriptions. Under the text protocol none are sent as tools.
+    counter = HeuristicCounter()
+    descriptions = counter.count("".join(spec.description for spec in sent.tools))
+    assert all(counter.count(tools) >= descriptions for _, tools in measured)
+    assert (descriptions > 0) == (capabilities is None)
+
+
+async def test_the_context_is_assembled_once_for_each_request_and_shared_with_the_budget(
+    tmp_repo, monkeypatch
+):
+    # Assembling reads the git state and walks the tree. Done once, the request and
+    # the budget cannot see two different prompts; done twice, they could.
+    from nanoclaude.context.assemble import assemble as real_assemble
+
+    assembled: list[str] = []
+
+    def counting_assemble(*args: Any, **kwargs: Any) -> Any:
+        assembled.append(args[0])
+        return real_assemble(*args, **kwargs)
+
+    monkeypatch.setattr("nanoclaude.agent.session.assemble", counting_assemble)
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), says("done")])
+    await session.run("go")
+    assert len(session.model.requests) == 2
+    assert len(assembled) == 2  # one for each request, and none besides
+
+
+async def test_a_window_smaller_than_the_fixed_prompt_cannot_be_compacted_and_says_so(tmp_repo):
+    session = build_session(tmp_repo, [says("never asked")], context_window=2_000)
+    with pytest.raises(ContextTooSmallError, match="Compacting cannot help"):
+        await session.run("hello")
+    assert session.model.requests == []  # refused before anything was sent
+
+
+# --------------------------------------------------------------------------
+# Carried note: no request sets a temperature
+# --------------------------------------------------------------------------
+
+
+async def test_no_request_the_session_makes_sets_a_temperature(tmp_repo):
+    session = build_session(
+        tmp_repo,
+        [says("SUMMARY"), says("answer")],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    # The turn really did compact, so the summary request is among those checked.
+    assert len(session.model.requests) == 2
+    assert sum(is_summary_request(r) for r in session.model.requests) == 1
+    assert [r.temperature for r in session.model.requests] == [None, None]
+
+
+# --------------------------------------------------------------------------
+# Compaction: which strategy, from the configured thresholds
+# --------------------------------------------------------------------------
+
+
+async def test_a_conversation_under_the_soft_threshold_is_sent_as_it_is(tmp_repo):
+    session = build_session(tmp_repo, [says("answer")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert len(session.model.requests) == 1  # no summary asked for
+    sent = tool_results(session.model.requests[0].transcript)
+    assert all("x" * 400 in r.content for r in sent)
+
+
+@pytest.mark.parametrize(
+    ("rounds", "compacts"), [(5, True), (2, False)], ids=["outgrows-the-window", "fits-easily"]
+)
+async def test_a_conversation_is_compacted_at_the_shipped_thresholds_when_it_fills_a_small_window(
+    tmp_repo, rounds, compacts
+):
+    # No threshold is configured here: it is the window that is small. A model the
+    # table does not know, with a 20,000 token window and 2,000 kept for its reply.
+    small = Capabilities(True, True, "none", context_window=20_000, max_output=2_000)
+    session = build_session(tmp_repo, [says("SUMMARY"), says("answer")], capabilities=small)
+    session.state = replace(session.state, transcript=tool_history(rounds, result_chars=10_000))
+
+    used, available = await session.context_usage()
+    assert available == available_in(small)
+    limits = LimitsConfig()
+    if compacts:
+        assert used / available >= limits.compact_hard  # what /status shows is over the line
+    else:
+        assert used / available < limits.compact_soft  # and here it is well under it
+
+    await session.follow_up("what next")
+    assert any(is_summary_request(r) for r in session.model.requests) is compacts
+
+
+async def test_crossing_the_soft_threshold_shrinks_old_tool_results_and_asks_nobody(tmp_repo):
+    session = build_session(tmp_repo, [says("answer")], compact_soft=0.0001, compact_hard=0.9999)
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert len(session.model.requests) == 1  # micro-compaction needs no model
+    sent = session.model.requests[0].transcript
+    shrunk = [r.content.startswith("[compacted:") for r in tool_results(sent)]
+    # Five rounds, the last three turns kept verbatim: the oldest three shrink.
+    assert shrunk == [True, True, True, False, False]
+    validate(sent)  # every call still has its answer
+    assert len(sent.messages) == 13  # shrunk in place: nothing added, nothing dropped
+
+
+async def test_crossing_the_hard_threshold_replaces_old_history_with_a_summary(tmp_repo):
+    session = build_session(
+        tmp_repo,
+        [says("SUMMARY of the work", input_tokens=7, output_tokens=3), says("answer")],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    done = await session.follow_up("what next")
+
+    summary_request, main_request = session.model.requests
+    assert is_summary_request(summary_request)
+    asked = transcript_text(summary_request.transcript)
+    # What was summarised is the head: the first three rounds, not the recent ones.
+    assert "result 2" in asked and "result 3" not in asked
+
+    sent = main_request.transcript.messages
+    assert sent[0].text().startswith("[earlier conversation, compacted]\nSUMMARY of the work")
+    # The summary, then the three most recent turns (six messages) verbatim,
+    # ending on the request the person just made.
+    assert len(sent) == 7
+    assert sent[-1].text() == "what next"
+    assert "result 4" in tool_results(main_request.transcript)[-1].content
+    assert done.text == "answer"
+    # The summary call is billed to the role that made it.
+    assert session.router.by_role()["compact"].usage == Usage(7, 3)
+    assert session.router.by_role()["main"].usage == Usage()
+
+
+async def test_the_summary_is_asked_of_the_compact_roles_model_not_the_main_roles(tmp_repo):
+    session = build_session(
+        tmp_repo,
+        [says("answer")],
+        compact_script=[says("SUMMARY", input_tokens=5, output_tokens=2)],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert session.compact_model is not None
+    assert [is_summary_request(r) for r in session.compact_model.requests] == [True]
+    assert not any(is_summary_request(r) for r in session.model.requests)
+    # The request that follows is sized by the main model's output limit, not by
+    # the compact model's.
+    assert HAIKU.max_output != SONNET.max_output
+    assert [r.max_output_tokens for r in session.model.requests] == [SONNET.max_output]
+    # Priced and attributed at the model that made the call.
+    compact = session.router.by_role()["compact"]
+    assert (compact.adapter, compact.model) == ("anthropic", "claude-haiku-4-5")
+    assert compact.usage == Usage(5, 2)
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "expected"),
+    [(None, 2_048), (Capabilities(True, False, "none", 100_000, 1_000), 1_000)],
+    ids=["a-large-output-is-capped-at-2048", "a-small-output-is-the-models-own-limit"],
+)
+async def test_a_summary_asks_for_at_most_2048_tokens_and_never_more_than_the_model_allows(
+    tmp_repo, capabilities, expected
+):
+    session = build_session(
+        tmp_repo,
+        [says("SUMMARY"), says("answer")],
+        capabilities=capabilities,
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    summary_request = session.model.requests[0]
+    assert is_summary_request(summary_request)
+    assert summary_request.max_output_tokens == expected
+
+
+async def test_a_summary_is_limited_by_the_compact_models_output_not_the_main_models(tmp_repo):
+    # Roles on different models is the point of the router, and their limits differ.
+    session = build_session(
+        tmp_repo,
+        [says("answer")],
+        compact_script=[says("SUMMARY")],
+        compact_model=UNPRICED,
+        compact_capabilities=Capabilities(True, False, "none", 100_000, max_output=1_000),
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert session.compact_model is not None
+    [summary_request] = session.compact_model.requests
+    assert summary_request.max_output_tokens == 1_000  # the main model would allow 2,048
+
+
+async def test_only_the_text_of_a_summary_is_used_not_the_models_thinking(tmp_repo):
+    thought = ModelReply(
+        (ThinkingBlock("private reasoning"), TextBlock("THE SUMMARY")),
+        StopKind.END_TURN,
+        Usage(),
+        "scripted",
+    )
+    session = build_session(
+        tmp_repo, [thought, says("answer")], compact_soft=0.00005, compact_hard=0.0001
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    summary = session.model.requests[1].transcript.messages[0].text()
+    assert "THE SUMMARY" in summary and "private reasoning" not in summary
+
+
+async def test_a_summary_that_fails_stops_the_turn_and_leaves_the_history_alone(tmp_repo):
+    session = build_session(
+        tmp_repo,
+        [says("never asked")],
+        compact_script=[ModelError("no route to host", retryable=False)],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    history = tool_history(5, result_chars=400)
+    session.state = replace(session.state, transcript=history)
+    with pytest.raises(ModelError) as caught:
+        await session.follow_up("what next")
+    # The person is told which role's model failed, and why.
+    assert "compact" in str(caught.value) and "no route to host" in str(caught.value)
+    # Nothing was thrown away for a summary that never arrived: every message the
+    # conversation had is still there, and nothing was sent to the main model.
+    assert session.state.transcript.messages[: len(history.messages)] == history.messages
+    assert session.model.requests == []
+
+
+async def test_a_summary_that_comes_back_empty_is_refused_and_the_history_kept(tmp_repo):
+    session = build_session(
+        tmp_repo,
+        [says("never asked")],
+        compact_script=[says("   \n")],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    history = tool_history(5, result_chars=400)
+    session.state = replace(session.state, transcript=history)
+    with pytest.raises(ModelError, match="empty summary"):
+        await session.follow_up("what next")
+    assert session.state.transcript.messages[: len(history.messages)] == history.messages
+
+
+# --------------------------------------------------------------------------
+# A context overflow reported by the provider (spec 7.4)
+# --------------------------------------------------------------------------
+
+
+def overflow() -> ModelError:
+    """What an adapter raises for a 400 that says the conversation does not fit."""
+    return classify_status(
+        400,
+        '{"type":"error","error":{"type":"invalid_request_error",'
+        '"message":"prompt is too long: 213456 tokens > 200000 maximum"}}',
+    )
+
+
+async def test_a_context_overflow_is_answered_with_one_compaction_and_one_retry(tmp_repo):
+    # The shipped thresholds, and a conversation they consider fine: it is the provider
+    # that says otherwise, so this is a compaction nothing in the budget asked for.
+    session = build_session(tmp_repo, [overflow(), says("SUMMARY of the work"), says("answer")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    done = await session.follow_up("what next")
+
+    first, summary, retry = session.model.requests
+    assert [is_summary_request(r) for r in (first, summary, retry)] == [False, True, False]
+    assert len(session.model.requests) == 3  # one compaction, one retry, nothing more
+    # The first request carried the conversation as it was; the retry carries it compacted.
+    assert first.transcript.messages[0].text() == "start" and len(first.transcript.messages) == 13
+    assert (
+        retry.transcript.messages[0]
+        .text()
+        .startswith("[earlier conversation, compacted]\nSUMMARY of the work")
+    )
+    # The request that goes again is the same request in every other respect, and the
+    # compacted conversation still ends on what the person asked.
+    assert (retry.system, retry.tools, retry.max_output_tokens) == (
+        first.system,
+        first.tools,
+        first.max_output_tokens,
+    )
+    validate(retry.transcript)
+    assert retry.transcript.messages[-1].text() == "what next"
+    assert (done.reason, done.text) == (StopReason.COMPLETED, "answer")
+
+
+async def test_the_store_holds_the_compacted_conversation_when_the_retry_is_sent(
+    tmp_repo, monkeypatch
+):
+    session = build_session(tmp_repo, [overflow(), says("SUMMARY"), says("answer")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    comparisons: list[tuple[Transcript, Transcript]] = []
+    real_complete = session.model.complete
+
+    async def spying_complete(request: ModelRequest) -> ModelReply:
+        if not is_summary_request(request):
+            assert session.store is not None
+            stored = session.store.load_transcript(session.session_id)
+            comparisons.append((stored, request.transcript))
+        return await real_complete(request)
+
+    with monkeypatch.context() as local:
+        local.setattr(session.model, "complete", spying_complete)
+        await session.follow_up("what next")
+    assert len(comparisons) == 2
+    assert all(stored == sent for stored, sent in comparisons)
+
+
+async def test_a_context_overflow_that_happens_again_after_compacting_fails_by_name(tmp_repo):
+    session = build_session(tmp_repo, [overflow(), says("SUMMARY"), overflow(), says("never")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    with pytest.raises(ModelError) as caught:
+        await session.follow_up("what next")
+    message = str(caught.value)
+    assert "does not fit" in message and "claude-sonnet-5" in message
+    assert "even after compacting" in message
+    # What to do next, in the spec 17.9 form.
+    assert "\u2014 use a model with a larger window (--model), or start over with /clear" in message
+    assert caught.value.context_overflow is False  # the verdict, not another thing to answer
+    assert isinstance(caught.value.__cause__, ModelError)
+    assert len(session.model.requests) == 3 and not session.model.exhausted  # no second retry
+    # Nothing was lost on the way: the session is left a valid conversation.
+    validate(session.state.transcript)
+
+
+async def test_a_context_overflow_with_nothing_older_to_compact_does_not_ask_again(tmp_repo):
+    session = build_session(tmp_repo, [overflow(), says("never")])
+    session.state = replace(session.state, transcript=tool_history(1, result_chars=50))
+    with pytest.raises(ModelError, match="does not fit"):
+        await session.follow_up("what next")
+    # No summary was asked for and nothing was sent again: compacting could not help.
+    assert len(session.model.requests) == 1 and not session.model.exhausted
+
+
+async def test_a_400_that_is_not_an_overflow_is_not_answered_by_compacting(tmp_repo):
+    plain = classify_status(400, '{"error":{"message":"tools.0.name: invalid"}}')
+    session = build_session(tmp_repo, [plain, says("never")])
+    history = tool_history(5, result_chars=400)
+    session.state = replace(session.state, transcript=history)
+    with pytest.raises(ModelError) as caught:
+        await session.follow_up("what next")
+    assert "tools.0.name: invalid" in str(caught.value)
+    assert len(session.model.requests) == 1  # no summary, no retry
+    assert session.state.transcript.messages[: len(history.messages)] == history.messages
+
+
+async def test_another_failure_on_the_retry_is_reported_as_itself(tmp_repo):
+    gateway = ModelError("bad gateway", retryable=False, status=502)
+    session = build_session(tmp_repo, [overflow(), says("SUMMARY"), gateway])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    with pytest.raises(ModelError, match="bad gateway") as caught:
+        await session.follow_up("what next")
+    assert "does not fit" not in str(caught.value)
+
+
+async def test_an_overflow_on_the_summary_request_is_the_compact_roles_error_not_a_retry(
+    tmp_repo,
+):
+    # Only the main request is answered by compacting. The summary is itself a request
+    # to a model with its own window, and an overflow there ends the attempt.
+    session = build_session(tmp_repo, [overflow(), says("never")], compact_script=[overflow()])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    with pytest.raises(ModelError) as caught:
+        await session.follow_up("what next")
+    assert "compact" in str(caught.value) and "does not fit" not in str(caught.value)
+    assert caught.value.context_overflow is False
+    assert session.compact_model is not None
+    assert len(session.compact_model.requests) == 1  # asked once, not again
+    assert len(session.model.requests) == 1
+
+
+# --------------------------------------------------------------------------
+# Spec 7.3: a small-window model keeps at most two recent turns
+# --------------------------------------------------------------------------
+
+# The tests below compact `tool_history(5)`: a request, five tool rounds h0..h4 and
+# an answer. Keeping two turns leaves the call and result of h4; keeping three
+# also leaves h3's. What is asserted is which results stay, whichever way the
+# compaction was reached.
+WINDOWS = pytest.mark.parametrize(
+    ("window", "retained"),
+    [(31_999, ["h4"]), (32_000, ["h3", "h4"])],
+    ids=["31999-tokens-keeps-two-turns", "32000-tokens-keeps-the-configured-three"],
+)
+
+
+def window_of(tokens: int) -> Capabilities:
+    return Capabilities(True, True, "none", context_window=tokens, max_output=2_000)
+
+
+def retained_ids(transcript: Transcript) -> list[str]:
+    return [result.tool_use_id for result in tool_results(transcript)]
+
+
+@WINDOWS
+async def test_a_budget_compaction_keeps_the_recent_turns_the_window_allows(
+    tmp_repo, window, retained
+):
+    session = build_session(
+        tmp_repo,
+        [says("SUMMARY"), says("answer")],
+        capabilities=window_of(window),
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert is_summary_request(session.model.requests[0])
+    assert retained_ids(session.model.requests[1].transcript) == retained
+
+
+@WINDOWS
+async def test_a_manual_compaction_keeps_the_recent_turns_the_window_allows(
+    tmp_repo, window, retained
+):
+    session = build_session(tmp_repo, [says("SUMMARY")], capabilities=window_of(window))
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    assert retained_ids(session.state.transcript) == retained
+
+
+@WINDOWS
+async def test_a_compaction_forced_by_the_provider_keeps_the_recent_turns_the_window_allows(
+    tmp_repo, window, retained
+):
+    session = build_session(
+        tmp_repo, [overflow(), says("SUMMARY"), says("answer")], capabilities=window_of(window)
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert is_summary_request(session.model.requests[1])
+    assert retained_ids(session.model.requests[2].transcript) == retained
+
+
+@WINDOWS
+async def test_shrinking_old_tool_results_spares_the_recent_turns_the_window_allows(
+    tmp_repo, window, retained
+):
+    session = build_session(
+        tmp_repo,
+        [says("answer")],
+        capabilities=window_of(window),
+        compact_soft=0.0001,
+        compact_hard=0.9999,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    sent = session.model.requests[0].transcript
+    shrunk = {r.tool_use_id: r.content.startswith("[compacted:") for r in tool_results(sent)}
+    assert shrunk == {f"h{i}": f"h{i}" not in retained for i in range(5)}
+
+
+async def test_a_small_window_does_not_raise_the_turns_kept_above_what_is_configured(tmp_repo):
+    # min(configured, 2), not 2: a person who asked to keep one turn keeps one.
+    session = build_session(
+        tmp_repo, [says("SUMMARY")], capabilities=window_of(31_999), keep_recent_turns=1
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    assert retained_ids(session.state.transcript) == []
+
+
+async def test_a_large_window_keeps_as_many_turns_as_are_configured(tmp_repo):
+    session = build_session(
+        tmp_repo, [says("SUMMARY")], capabilities=window_of(32_000), keep_recent_turns=4
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    assert retained_ids(session.state.transcript) == ["h2", "h3", "h4"]
+
+
+async def test_the_window_that_counts_is_the_main_models_not_the_compact_roles(tmp_repo):
+    session = build_session(
+        tmp_repo,
+        [],
+        compact_script=[says("SUMMARY")],
+        capabilities=window_of(32_000),
+        compact_model="scripted-compact",
+        compact_capabilities=window_of(31_999),
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    assert retained_ids(session.state.transcript) == ["h3", "h4"]
+
+
+async def test_a_manual_compaction_summarises_with_the_instructions_given(tmp_repo):
+    session = build_session(tmp_repo, [says("SUMMARY about auth")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact("the auth module")
+    [request] = session.model.requests
+    assert is_summary_request(request)
+    assert "Pay particular attention to: the auth module" in transcript_text(request.transcript)
+    assert (
+        session.state.transcript.messages[0]
+        .text()
+        .startswith("[earlier conversation, compacted]\nSUMMARY about auth")
+    )
+
+
+async def test_a_manual_compaction_without_instructions_adds_none(tmp_repo):
+    session = build_session(tmp_repo, [says("SUMMARY")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    assert "Pay particular attention" not in transcript_text(session.model.requests[0].transcript)
+
+
+async def test_compacting_a_conversation_with_nothing_older_than_the_recent_turns_asks_nobody(
+    tmp_repo,
+):
+    session = build_session(tmp_repo, [says("never asked")])
+    session.state = replace(session.state, transcript=tool_history(1, result_chars=50))
+    before = session.state.transcript
+    await session.compact()
+    assert session.model.requests == [] and session.state.transcript == before
+
+
+# --------------------------------------------------------------------------
+# Persistence: the store mirrors the transcript the model is shown
+# --------------------------------------------------------------------------
+
+
+async def test_after_a_full_compaction_the_store_holds_the_compacted_transcript_and_no_tail(
+    tmp_repo,
+):
+    session = build_session(
+        tmp_repo,
+        [says("SUMMARY"), says("answer")],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    done = await session.follow_up("what next")
+    assert session.store is not None
+    reloaded = session.store.load_transcript(session.session_id)
+    # The compacted transcript is shorter than what was stored before it: rows
+    # beyond its end must be gone, or a reload would append the old tail.
+    assert reloaded == done.state.transcript
+    assert reloaded.messages[0].text().startswith("[earlier conversation, compacted]")
+
+
+async def test_after_a_manual_compaction_the_store_holds_the_compacted_transcript(tmp_repo):
+    session = build_session(tmp_repo, [says("SUMMARY")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    # The next turn would persist it, but the next turn may never come: an
+    # explicit /compact is saved when it is done.
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == session.state.transcript
+
+
+async def test_after_micro_compaction_the_store_holds_what_the_model_was_shown(tmp_repo):
+    session = build_session(tmp_repo, [says("answer")], compact_soft=0.0001, compact_hard=0.9999)
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    done = await session.follow_up("what next")
+    assert session.store is not None
+    reloaded = session.store.load_transcript(session.session_id)
+    assert reloaded == done.state.transcript
+    assert reloaded.messages[2].tool_results()[0].content.startswith("[compacted:")
+
+
+async def test_a_conversation_replaced_from_outside_is_stored_as_the_new_one(tmp_repo):
+    # What /clear does: swap the transcript for an empty one and carry on.
+    session = build_session(tmp_repo, [says("first answer"), says("second answer")])
+    await session.run("first question")
+    session.state = replace(session.state, transcript=Transcript(), turn=0)
+    done = await session.follow_up("second question")
+    assert session.store is not None
+    reloaded = session.store.load_transcript(session.session_id)
+    assert [m.text() for m in reloaded.messages] == ["second question", "second answer"]
+    assert reloaded == done.state.transcript
+
+
+async def test_a_full_compaction_leaves_the_messages_it_replaced_in_the_archive(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    reads = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(4)]
+    session = build_session(tmp_repo, [*reads, says("done"), says("SUMMARY")])
+    before = (await session.run("read it")).state.transcript
+    await session.compact()
+    assert session.store is not None
+    live = session.store.load_transcript(session.session_id)
+    assert live == session.state.transcript  # the live rows are what the model is shown
+    archived = archived_messages(session)
+    assert before.messages[0] in archived  # the request the summary replaced
+    assert all(message in (*live.messages, *archived) for message in before.messages)
+
+
+async def test_a_conversation_replaced_from_outside_is_archived_not_lost(tmp_repo):
+    session = build_session(tmp_repo, [says("first answer"), says("second answer")])
+    first = await session.run("first question")
+    session.state = replace(session.state, transcript=Transcript(), turn=0)
+    done = await session.follow_up("second question")
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+    assert archived_messages(session) == list(first.state.transcript.messages)
+
+
+async def test_micro_compaction_archives_the_full_results_it_shrank_and_only_those(tmp_repo):
+    session = build_session(tmp_repo, [says("answer")], compact_soft=0.0001, compact_hard=0.9999)
+    history = tool_history(5, result_chars=400)
+    session.state = replace(session.state, transcript=history)
+    done = await session.follow_up("what next")
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+    # Three results fall outside the recent turns; their messages are indexes 2, 4 and 6.
+    assert archived_messages(session) == [history.messages[i] for i in (2, 4, 6)]
+
+
+async def test_everything_a_session_ever_stored_is_in_the_live_rows_or_the_archive(
+    tmp_repo, monkeypatch
+):
+    stored: list[Message] = []
+    real_append, real_replace = Store.append_message, Store.replace_transcript
+
+    def recording_append(self: Store, session_id: str, seq: int, message: Message) -> None:
+        stored.append(message)
+        real_append(self, session_id, seq, message)
+
+    def recording_replace(self: Store, session_id: str, transcript: Transcript) -> None:
+        stored.extend(transcript.messages)
+        real_replace(self, session_id, transcript)
+
+    monkeypatch.setattr(Store, "append_message", recording_append)
+    monkeypatch.setattr(Store, "replace_transcript", recording_replace)
+    (tmp_repo / "a.py").write_text("x\n")
+    reads = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(4)]
+    session = build_session(
+        tmp_repo, [*reads, says("done"), says("SUMMARY"), says("after the summary"), says("fresh")]
+    )
+    await session.run("read it")
+    await session.compact()
+    await session.follow_up("and then?")
+    session.state = replace(session.state, transcript=Transcript(), turn=0)
+    await session.follow_up("a fresh start")
+
+    assert session.store is not None
+    live = session.store.load_transcript(session.session_id)
+    assert live == session.state.transcript
+    archived = archived_messages(session)
+    assert archived  # the compaction and the clear each removed something
+    assert all(message in (*live.messages, *archived) for message in stored)
+
+
+async def test_each_message_is_written_once_and_a_plain_conversation_is_never_rewritten(
+    tmp_repo, monkeypatch
+):
+    appended: list[int] = []
+    rewritten: list[int] = []
+    real_append, real_replace = Store.append_message, Store.replace_transcript
+
+    def counting_append(self: Store, session_id: str, seq: int, message: Message) -> None:
+        appended.append(seq)
+        real_append(self, session_id, seq, message)
+
+    def counting_replace(self: Store, session_id: str, transcript: Transcript) -> None:
+        rewritten.append(len(transcript.messages))
+        real_replace(self, session_id, transcript)
+
+    monkeypatch.setattr(Store, "append_message", counting_append)
+    monkeypatch.setattr(Store, "replace_transcript", counting_replace)
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), says("one"), says("two")]
+    )
+    await session.run("a")
+    await session.follow_up("b")
+    assert rewritten == []
+    assert appended == list(range(len(session.state.transcript.messages)))  # 0..n-1, once each
+
+
+async def test_the_call_is_stored_before_the_tool_runs(tmp_repo, monkeypatch):
+    # A crash inside a tool must leave the transcript showing what was attempted.
+    from nanoclaude.tools.read import ReadTool
+
+    seen_in_store: list[Transcript] = []
+
+    async def look(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        assert session.store is not None
+        seen_in_store.append(session.store.load_transcript(session.session_id))
+        return ToolOutcome(call_id, "seen", is_error=False)
+
+    monkeypatch.setattr(ReadTool, "run", look)
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), says("done")])
+    await session.run("read it")
+    [stored] = seen_in_store
+    assert [m.role for m in stored.messages] == ["user", "assistant"]
+    assert [b.name for b in stored.messages[1].tool_uses()] == ["Read"]
+
+
+async def test_the_store_holds_what_the_model_is_shown_at_the_moment_it_is_shown(
+    tmp_repo, monkeypatch
+):
+    # Not only once the turn is over: a crash during the request must leave a store
+    # that matches what was sent, including when compaction has just replaced the
+    # head of the conversation.
+    session = build_session(
+        tmp_repo,
+        [says("SUMMARY"), says("answer")],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    comparisons: list[tuple[Transcript, Transcript]] = []
+    real_complete = session.model.complete
+
+    async def spying_complete(request: ModelRequest) -> ModelReply:
+        if not is_summary_request(request):
+            assert session.store is not None
+            stored = session.store.load_transcript(session.session_id)
+            comparisons.append((stored, request.transcript))
+        return await real_complete(request)
+
+    with monkeypatch.context() as local:
+        local.setattr(session.model, "complete", spying_complete)
+        await session.follow_up("what next")
+    [(stored, sent)] = comparisons
+    assert sent.messages[0].text().startswith("[earlier conversation, compacted]")
+    assert stored == sent
+
+
+async def test_at_every_request_the_store_already_holds_what_is_being_sent(tmp_repo, monkeypatch):
+    # The person's prompt before the first request, and the tool results before the
+    # second: a crash while the model is thinking must not lose either.
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    session = build_session(
+        tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), says("it sets x")]
+    )
+    comparisons: list[tuple[Transcript, Transcript]] = []
+    real_complete = session.model.complete
+
+    async def spying_complete(request: ModelRequest) -> ModelReply:
+        assert session.store is not None
+        stored = session.store.load_transcript(session.session_id)
+        comparisons.append((stored, request.transcript))
+        return await real_complete(request)
+
+    with monkeypatch.context() as local:
+        local.setattr(session.model, "complete", spying_complete)
+        await session.run("what is in a.py")
+    assert [len(sent.messages) for _, sent in comparisons] == [1, 3]
+    assert all(stored == sent for stored, sent in comparisons)
+
+
+async def test_a_session_is_created_in_the_store_with_its_directory_and_roles(tmp_repo):
+    session = build_session(tmp_repo, [])
+    row = stored_row(session)
+    assert row["cwd"] == str(tmp_repo)
+    assert row["ended_at"] is None and row["total_cost_usd"] is None  # not finished: not known
+    assert json.loads(row["roles_json"]) == {
+        "main": "m",
+        "explore": "m",
+        "plan": "m",
+        "verify": "m",
+        "compact": "m",
+        "title": "m",
+    }
+
+
+async def test_a_session_needs_no_database(tmp_repo):
+    built = build_session(tmp_repo, [says("done")])
+    bare = Session(
+        root=built.root,
+        config=built.config,
+        router=built.router,
+        registry=built.registry,
+        policy=built.policy,
+    )
+    assert bare.store is None and bare.audit is None
+    assert isinstance(bare.ui, AutoDecline)
+    assert len(bare.session_id) == 12
+    done = await bare.run("hello")
+    assert done.text == "done"
+    await bare.aclose()
+    assert bare.home == str(Path.home())
+
+
+# --------------------------------------------------------------------------
+# A session survives being interrupted
+# --------------------------------------------------------------------------
+
+
+async def test_cancelling_a_turn_during_a_tool_leaves_a_session_that_can_go_on(
+    tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.write import WriteTool
+
+    started = asyncio.Event()
+
+    async def hang(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the tool was allowed to finish")
+
+    monkeypatch.setattr(WriteTool, "run", hang)
+    session = build_session(
+        tmp_repo,
+        [calls("Write", {"path": "w.txt", "content": "w"}, call_id="w1"), says("picked up again")],
+    )
+    task = asyncio.create_task(session.run("write it"))
+    await reached(started)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    done = await session.follow_up("try again")
+    assert done.text == "picked up again"
+    validate(done.state.transcript)
+    # The call that never reported back is answered, honestly: it may have run.
+    [result] = tool_results(done.state.transcript)
+    assert result.tool_use_id == "w1" and result.is_error
+    assert "interrupted" in result.content.lower() and "may or may not" in result.content
+    # The model's next request carried that, then the person's new message.
+    sent = session.model.requests[1].transcript
+    validate(sent)
+    assert sent.messages[-1].text() == "try again"
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+
+
+async def test_cancelling_a_turn_while_the_model_is_answering_leaves_a_session_that_can_go_on(
+    tmp_repo, monkeypatch
+):
+    started = asyncio.Event()
+    session = build_session(tmp_repo, [says("an answer, this time")])
+
+    async def never_answers(request: ModelRequest) -> ModelReply:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the model was allowed to answer")
+
+    with monkeypatch.context() as local:
+        local.setattr(session.model, "complete", never_answers)
+        task = asyncio.create_task(session.run("first question"))
+        await reached(started)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    done = await session.follow_up("second question")
+    assert done.text == "an answer, this time"
+    validate(done.state.transcript)
+    sent = session.model.requests[0].transcript
+    assert [m.role for m in sent.messages] == ["user", "assistant", "user"]
+    assert sent.messages[0].text() == "first question"
+    assert "interrupted" in sent.messages[1].text().lower()
+    assert sent.messages[2].text() == "second question"
+
+
+async def test_a_provider_error_midway_leaves_a_session_that_can_go_on(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [
+            calls("Read", {"path": "a.py"}, call_id="t1"),
+            ModelError("bad gateway", retryable=False, status=502),
+            says("recovered"),
+        ],
+    )
+    with pytest.raises(ModelError, match="bad gateway"):
+        await session.run("read it")
+    done = await session.follow_up("try again")
+    assert done.text == "recovered"
+    validate(done.state.transcript)
+    # The tool round that finished before the failure is still in the history.
+    assert [r.tool_use_id for r in tool_results(done.state.transcript)] == ["t1"]
+
+
+async def test_compacting_right_after_an_interrupted_tool_does_not_trip_on_the_open_call(
+    tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.write import WriteTool
+
+    started = asyncio.Event()
+
+    async def hang(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the tool was allowed to finish")
+
+    monkeypatch.setattr(WriteTool, "run", hang)
+    session = build_session(
+        tmp_repo, [calls("Write", {"path": "w.txt", "content": "w"}, call_id="w1")]
+    )
+    task = asyncio.create_task(session.run("write it"))
+    await reached(started)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await session.compact()  # would raise "cannot compact while tool calls are unanswered"
+    assert not session.state.transcript.pending_tool_uses()
+
+
+async def test_compacting_after_an_interrupted_turn_stores_the_repair_before_asking_for_a_summary(
+    tmp_repo,
+):
+    # A provider error cut the turn short, so the conversation ends on results the
+    # model never answered. compact() closes that with a note before it asks for a
+    # summary. The store holds what the model is shown, so the note is stored then,
+    # not after a summary that may never come.
+    (tmp_repo / "a.py").write_text("x\n")
+    reads = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(4)]
+    session = build_session(
+        tmp_repo,
+        [
+            *reads,
+            ModelError("bad gateway", retryable=False, status=502),
+            ModelError("summary refused", retryable=False, status=400),
+        ],
+    )
+    with pytest.raises(ModelError, match="bad gateway"):
+        await session.run("read it")
+    with pytest.raises(ModelError, match="could not summarise"):
+        await session.compact()
+    assert session.store is not None
+    stored = session.store.load_transcript(session.session_id)
+    assert "interrupted" in stored.messages[-1].text().lower()
+    assert stored == session.state.transcript
+
+
+async def test_each_prompt_gets_the_whole_turn_limit(tmp_repo):
+    # Two turns allowed: one tool round and then the answer. Each follow_up uses both.
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="t1"),
+        says("first done"),
+        calls("Read", {"path": "a.py"}, call_id="t2"),
+        says("second done"),
+    ]
+    session = build_session(tmp_repo, script, max_turns=2)
+    first = await session.follow_up("one")
+    second = await session.follow_up("two")
+    assert (first.reason, first.text) == (StopReason.COMPLETED, "first done")
+    assert (second.reason, second.text) == (StopReason.COMPLETED, "second done")
+    assert second.state.turn == 1  # counted for this prompt alone
+
+
+async def test_one_prompt_that_needs_more_turns_than_the_limit_stops_at_it(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(1, 4)]
+    session = build_session(tmp_repo, [*script, says("never reached")], max_turns=2)
+    done = await session.follow_up("keep reading")
+    assert done.reason is StopReason.TURN_LIMIT
+    assert len(session.model.requests) == 2  # the second reply's calls were not run
+    validate(done.state.transcript)  # closed cleanly: every call has its answer
+
+
+async def test_a_prompt_that_hit_the_limit_does_not_use_up_the_next_one(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="t1"),
+        calls("Read", {"path": "a.py"}, call_id="t2"),  # the second reply with calls: the limit
+        calls("Read", {"path": "a.py"}, call_id="t3"),
+        says("recovered"),
+    ]
+    session = build_session(tmp_repo, script, max_turns=2)
+    stopped = await session.follow_up("too much")
+    assert stopped.reason is StopReason.TURN_LIMIT
+    again = await session.follow_up("try something smaller")
+    assert (again.reason, again.text) == (StopReason.COMPLETED, "recovered")
+
+
+@pytest.mark.parametrize("entry", ["run", "follow_up"])
+async def test_each_prompt_reads_the_turn_limit_the_config_has_when_it_arrives(tmp_repo, entry):
+    # A front end builds the session, then replaces its config (--max-turns applied,
+    # say). The limit in force is the one read when the prompt arrives.
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(1, 4)]
+    session = build_session(tmp_repo, [*script, says("never reached")], max_turns=40)
+    session.config = replace(session.config, limits=replace(session.config.limits, max_turns=2))
+    done = await getattr(session, entry)("keep reading")
+    assert done.reason is StopReason.TURN_LIMIT
+    assert len(session.model.requests) == 2
+
+
+async def test_a_limit_changed_between_prompts_applies_to_the_next_one(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="t1"),
+        says("first done"),
+        calls("Read", {"path": "a.py"}, call_id="t2"),
+        calls("Read", {"path": "a.py"}, call_id="t3"),
+        says("never reached"),
+    ]
+    session = build_session(tmp_repo, script, max_turns=5)
+    assert (await session.follow_up("one")).reason is StopReason.COMPLETED
+    session.config = replace(session.config, limits=replace(session.config.limits, max_turns=2))
+    two = await session.follow_up("two")
+    assert two.reason is StopReason.TURN_LIMIT
+    assert two.state.max_turns == 2
+
+
+async def test_a_prompt_after_an_interrupted_turn_gets_the_whole_limit(tmp_repo, monkeypatch):
+    # Closing the interrupted turn's calls goes through observe(), which counts a turn.
+    # That one belongs to the prompt that was cut short, not to the next one.
+    from nanoclaude.tools.write import WriteTool
+
+    started = asyncio.Event()
+
+    async def hang(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the tool was allowed to finish")
+
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [
+            calls("Write", {"path": "w.txt", "content": "w"}, call_id="w1"),
+            calls("Read", {"path": "a.py"}, call_id="t1"),
+            says("second done"),
+        ],
+        max_turns=2,
+    )
+    with monkeypatch.context() as local:
+        local.setattr(WriteTool, "run", hang)
+        task = asyncio.create_task(session.run("write it"))
+        await reached(started)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    done = await session.follow_up("read it instead")
+    assert (done.reason, done.text) == (StopReason.COMPLETED, "second done")
+    assert done.state.turn == 1
+
+
+async def test_after_a_turn_limit_stop_the_next_request_is_not_told_the_turn_was_interrupted(
+    tmp_repo,
+):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="t1"),
+        calls("Read", {"path": "a.py"}, call_id="t2"),
+        says("on a smaller task"),
+    ]
+    session = build_session(tmp_repo, script, max_turns=2)
+    stopped = await session.follow_up("too much")
+    assert stopped.reason is StopReason.TURN_LIMIT
+    await session.follow_up("something smaller")
+    sent = session.model.requests[2].transcript
+    validate(sent)
+    assert "interrupted" not in transcript_text(sent).lower()
+    assert [m.role for m in sent.messages][-3:] == ["user", "assistant", "user"]
+    assert sent.messages[-2].text() == stopped.text
+    assert sent.messages[-1].text() == "something smaller"
+
+
+async def test_a_turn_limit_stop_is_stored_with_the_text_that_closes_it(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [calls("Read", {"path": "a.py"}, call_id="t1")]
+    session = build_session(tmp_repo, script, max_turns=1)
+    stopped = await session.follow_up("too much")
+    assert stopped.reason is StopReason.TURN_LIMIT
+    assert stopped.text == "Stopped after 1 turn without finishing the task."
+    assert session.store is not None
+    stored = session.store.load_transcript(session.session_id)
+    assert stored == stopped.state.transcript
+    assert stored.messages[-1].text() == stopped.text
+
+
+async def test_a_follow_up_before_anything_was_said_starts_the_conversation(tmp_repo):
+    # After /clear the REPL calls follow_up on an empty transcript, and the turn
+    # limit in force is the configured one, not whatever a placeholder carried.
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [calls("Read", {"path": "a.py"}, call_id="t1"), says("done")]
+    session = build_session(tmp_repo, script, max_turns=5)
+    assert session.state.transcript == Transcript() and session.state.max_turns == 5
+    done = await session.follow_up("read it")
+    assert done.reason is StopReason.COMPLETED and done.text == "done"
+    validate(done.state.transcript)
+
+
+# --------------------------------------------------------------------------
+# Wiring: what the session hands to the modules it owns
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("entry", ["run", "follow_up"])
+async def test_a_mention_in_the_prompt_is_inlined_before_the_model_sees_it(tmp_repo, entry):
+    (tmp_repo / "a.py").write_text("answer = 42\n")
+    session = build_session(tmp_repo, [says("ok")])
+    await getattr(session, entry)("explain @a.py please")
+    first = session.model.requests[0].transcript.messages[0].text()
+    assert 'path="a.py"' in first and "answer = 42" in first
+
+
+@pytest.mark.parametrize(
+    ("window", "output"),
+    [(None, SONNET.max_output), (64_000, 16_000)],
+    ids=["table-row", "bounded-override"],
+)
+async def test_the_request_carries_the_assembled_context_and_the_models_own_output_limit(
+    tmp_repo, window, output
+):
+    (tmp_repo / "marker_file.py").write_text("x\n")
+    session = build_session(tmp_repo, [says("ok")], context_window=window)
+    await session.run("hello")
+    request = session.model.requests[0]
+    assert request.system.startswith(SYSTEM_PROMPT)
+    # The environment block follows the system prompt: it holds the project map.
+    assert "marker_file.py" in request.system
+    # The table row's output limit, or the quarter of a 64,000 window that an
+    # override bounds it to.
+    assert request.max_output_tokens == output
+
+
+def test_the_executor_is_built_from_the_sessions_own_parts(tmp_repo):
+    session = build_session(tmp_repo, [], ui=Watcher())
+    executor = session.executor
+    assert executor.registry is session.registry
+    assert executor.policy is session.policy
+    assert executor.ui is session.ui
+    assert executor.audit is session.audit
+    assert executor.redactor is session.redactor
+    assert executor.session_id == session.session_id
+
+
+async def test_a_mention_of_a_secrets_file_is_expanded_only_when_the_policy_allows_secrets(
+    tmp_repo,
+):
+    (tmp_repo / ".env").write_text("GREETING=hello\n")
+    refusing = build_session(tmp_repo, [says("ok")])
+    await refusing.run("what is in @.env")
+    assert "GREETING" not in refusing.model.requests[0].transcript.messages[0].text()
+
+    allowing = build_session(tmp_repo, [says("ok")])
+    allowing.policy = replace(allowing.policy, allow_secrets=True)
+    await allowing.run("what is in @.env")
+    assert "GREETING=hello" in allowing.model.requests[0].transcript.messages[0].text()
+
+
+async def test_global_instructions_come_from_the_sessions_home(tmp_repo):
+    home = tmp_repo / "elsewhere"
+    (home / ".nanoclaude").mkdir(parents=True)
+    (home / ".nanoclaude" / "NANO.md").write_text("Always answer in haiku.\n")
+    session = build_session(tmp_repo, [says("ok")], home=home)
+    await session.run("hello")
+    assert "Always answer in haiku." in session.model.requests[0].system
+
+
+async def test_the_todo_list_the_model_writes_is_the_one_the_session_holds(tmp_repo):
+    todos = [{"content": "write the test", "status": "in_progress"}]
+    session = build_session(
+        tmp_repo, [calls("TodoWrite", {"todos": todos}, call_id="t1"), says("planned")]
+    )
+    await session.run("plan it")
+    assert [(t.content, t.status) for t in session.todo_state.items] == [
+        ("write the test", "in_progress")
+    ]
+
+
+async def test_a_refused_call_is_reported_to_the_model_and_the_session_goes_on(tmp_repo):
+    session = build_session(
+        tmp_repo, [calls("Read", {"path": "/etc/passwd"}, call_id="t1"), says("understood")]
+    )
+    done = await session.run("read the password file")
+    assert done.text == "understood"
+    [result] = tool_results(session.model.requests[1].transcript)
+    assert result.is_error and result.content.startswith("Refused (sandbox.outside-root)")
+
+
+async def test_the_sessions_ui_decides_what_the_executor_asks_for(tmp_repo):
+    # Both directions: the executor is given the session's UI, not a default one.
+    call = calls("Write", {"path": "w.txt", "content": "w"}, call_id="w1")
+    approving = build_session(tmp_repo, [call, says("done")], ui=AutoApprove())
+    await approving.run("write it")
+    assert (tmp_repo / "w.txt").read_text() == "w"
+
+    (tmp_repo / "w.txt").unlink()
+    declining = build_session(
+        tmp_repo,
+        [calls("Write", {"path": "w.txt", "content": "w"}, call_id="w2"), says("done")],
+        ui=AutoDecline(),
+    )
+    done = await declining.run("write it")
+    assert not (tmp_repo / "w.txt").exists()
+    [result] = tool_results(done.state.transcript)
+    assert result.is_error and "declined" in result.content
+
+
+async def test_a_call_is_billed_to_the_model_the_router_used_whatever_the_sessions_config_says(
+    tmp_repo,
+):
+    # The router decides which client answers a role, so it decides which model the
+    # call is billed at. A front end that swaps the session's own config (as /model
+    # does) has not changed the client, and must not change the bill.
+    session = build_session(tmp_repo, [says("done", input_tokens=10)])
+    session.config = replace(
+        session.config,
+        models={"x": ModelConfig("anthropic", "claude-opus-5")},
+        roles=RolesConfig("x", "x", "x", "x", "x", "x"),
+    )
+    await session.run("hello")
+    main = session.router.by_role()["main"]
+    assert (main.adapter, main.model) == ("anthropic", "claude-sonnet-5")
+
+
+async def test_every_reply_reaches_the_ui_once(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    watcher = Watcher()
+    session = build_session(
+        tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), says("done")], ui=watcher
+    )
+    await session.run("go")
+    assert [r.stop for r in watcher.replies] == [StopKind.TOOL_USE, StopKind.END_TURN]
+
+
+async def test_the_audit_log_is_kept_under_the_sessions_own_id(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [
+            calls_many(("Read", {"path": "a.py"}, "t1"), ("Read", {"path": "a.py"}, "t2")),
+            says("done"),
+        ],
+    )
+    await session.run("go")
+    assert session.store is not None
+    rows = session.store.db.execute(
+        "SELECT tool_use_id, session_id, outcome FROM tool_calls ORDER BY tool_use_id"
+    ).fetchall()
+    assert [(r["tool_use_id"], r["session_id"], r["outcome"]) for r in rows] == [
+        ("t1", session.session_id, "ok"),
+        ("t2", session.session_id, "ok"),
+    ]
+
+
+# --------------------------------------------------------------------------
+# Resuming a stored session
+# --------------------------------------------------------------------------
+
+
+async def stored_session(
+    tmp_repo: Path, script: Sequence[ModelReply | ModelError], **options: Any
+) -> ScriptedSession:
+    """A session that ran its script and was closed: what is left behind to resume."""
+    first = build_session(tmp_repo, script, **options)
+    await first.run("first question")
+    await first.aclose()
+    return first
+
+
+def resumed(
+    tmp_repo: Path,
+    first: ScriptedSession,
+    script: Sequence[ModelReply | ModelError],
+    **options: Any,
+) -> ScriptedSession:
+    return build_session(tmp_repo, script, session_id=first.session_id, resume=True, **options)
+
+
+async def test_a_stored_session_can_be_resumed_and_goes_on_from_where_it_stopped(tmp_repo):
+    first = await stored_session(tmp_repo, [says("first answer")])
+    session = resumed(tmp_repo, first, [says("second answer")])
+    assert [m.text() for m in session.state.transcript.messages] == [
+        "first question",
+        "first answer",
+    ]
+
+    done = await session.follow_up("second question")
+
+    sent = session.model.requests[0].transcript
+    assert [m.text() for m in sent.messages] == [
+        "first question",
+        "first answer",
+        "second question",
+    ]
+    assert done.text == "second answer"
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+    assert len(done.state.transcript.messages) == 4
+
+
+async def test_resuming_does_not_create_the_session_again(tmp_repo):
+    first = await stored_session(tmp_repo, [says("first answer")])
+    assert first.store is not None
+    reader = Store(first.store.path)
+    reader.open()
+    started = reader.session_row(first.session_id)
+    session = resumed(tmp_repo, first, [says("second answer")])
+    await session.follow_up("second question")
+    assert [row.id for row in reader.recent_sessions(10)] == [first.session_id]
+    row = reader.session_row(first.session_id)
+    assert row is not None and started is not None
+    assert (row.started_at, row.cwd) == (started.started_at, started.cwd)
+    reader.close()
+
+
+async def test_a_resumed_session_adds_to_the_stored_rows_and_rewrites_none_of_them(
+    tmp_repo, monkeypatch
+):
+    first = await stored_session(tmp_repo, [says("first answer")])
+    appended: list[int] = []
+    rewritten: list[int] = []
+    real_append, real_replace = Store.append_message, Store.replace_transcript
+
+    def counting_append(self: Store, session_id: str, seq: int, message: Message) -> None:
+        appended.append(seq)
+        real_append(self, session_id, seq, message)
+
+    def counting_replace(self: Store, session_id: str, transcript: Transcript) -> None:
+        rewritten.append(len(transcript.messages))
+        real_replace(self, session_id, transcript)
+
+    monkeypatch.setattr(Store, "append_message", counting_append)
+    monkeypatch.setattr(Store, "replace_transcript", counting_replace)
+    session = resumed(tmp_repo, first, [says("second answer"), says("third answer")])
+    await session.follow_up("second question")
+    await session.follow_up("third question")
+    assert rewritten == []
+    assert appended == [2, 3, 4, 5]  # after the two stored messages, once each
+
+
+async def test_a_session_that_is_not_stored_cannot_be_resumed_and_is_not_started_instead(tmp_repo):
+    from nanoclaude.agent.session import UnknownSessionError
+
+    with pytest.raises(UnknownSessionError) as excinfo:
+        build_session(tmp_repo, [], session_id="0123456789ab", resume=True)
+    assert str(excinfo.value) == (
+        'no stored session "0123456789ab" \u2014 check the id, or leave out --resume to start a '
+        "new session"
+    )
+    # Nothing was created in its place.
+    reader = Store(tmp_repo / ".nanoclaude" / "sessions.db")
+    reader.open()
+    assert reader.recent_sessions(10) == []
+    reader.close()
+
+
+async def test_a_session_cannot_be_resumed_without_a_store_to_read_it_from(tmp_repo):
+    built = build_session(tmp_repo, [])
+    with pytest.raises(ValueError, match="needs a store"):
+        Session(
+            root=built.root,
+            config=built.config,
+            router=built.router,
+            registry=built.registry,
+            policy=built.policy,
+            session_id="0123456789ab",
+            resume=True,
+        )
+
+
+async def test_a_resumed_session_starts_with_the_configured_turn_limit_and_a_fresh_count(tmp_repo):
+    first = await stored_session(tmp_repo, [says("first answer")], max_turns=40)
+    session = resumed(tmp_repo, first, [], max_turns=7)
+    assert (session.state.turn, session.state.max_turns) == (0, 7)
+
+
+async def test_a_resumed_session_has_read_nothing_yet(tmp_repo):
+    # The stamps of what a conversation has read are not stored, and the files may have
+    # changed since: an edit has to follow a new read.
+    (tmp_repo / "a.py").write_text("x\n")
+    first = await stored_session(
+        tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), says("first answer")]
+    )
+    assert first.state.read_state
+    session = resumed(tmp_repo, first, [])
+    assert dict(session.state.read_state) == {}
+
+
+async def test_the_totals_of_a_resumed_session_add_to_the_stored_ones(tmp_repo):
+    first = await stored_session(
+        tmp_repo, [says("first answer", input_tokens=1_000, output_tokens=100)]
+    )
+    session = resumed(tmp_repo, first, [says("second", input_tokens=500, output_tokens=50)])
+    await session.follow_up("second question")
+    row = stored_row(session)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_500, 150)
+    assert row["total_cost_usd"] == pytest.approx(0.0045)  # $0.003, then $0.0015
+    # What the session reports for itself is what this run used.
+    assert session.usage == Usage(500, 50)
+    assert session.cost == pytest.approx(0.0015)
+    # Closing it records the same totals, not the earlier ones again.
+    await session.aclose()
+    closed = row_after_closing(session)
+    assert (closed["total_input_tokens"], closed["total_output_tokens"]) == (1_500, 150)
+    assert closed["total_cost_usd"] == pytest.approx(0.0045)
+
+
+async def test_a_resumed_session_that_used_nothing_keeps_the_stored_totals(tmp_repo):
+    first = await stored_session(
+        tmp_repo, [says("first answer", input_tokens=1_000, output_tokens=100)]
+    )
+    session = resumed(tmp_repo, first, [])
+    await session.aclose()
+    row = row_after_closing(session)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["total_cost_usd"] == pytest.approx(0.003)
+
+
+@pytest.mark.parametrize(
+    ("earlier", "now"),
+    [(UNPRICED, None), (None, UNPRICED)],
+    ids=["an-unpriced-model-then-a-priced-one", "a-priced-model-then-an-unpriced-one"],
+)
+async def test_a_cost_that_is_unknown_on_either_side_makes_the_total_unknown(
+    tmp_repo, earlier, now
+):
+    first = await stored_session(
+        tmp_repo, [says("first answer", input_tokens=1_000, output_tokens=100)], model=earlier
+    )
+    session = resumed(
+        tmp_repo, first, [says("second", input_tokens=500, output_tokens=50)], model=now
+    )
+    await session.follow_up("second question")
+    row = stored_row(session)
+    assert row["total_cost_usd"] is None
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_500, 150)
+
+
+async def test_a_session_that_never_finished_has_an_unknown_total_when_it_is_resumed(tmp_repo):
+    # Its row was created and never written to again, as after a crash: what it spent
+    # is not known, and adding to nothing must not read as adding to zero.
+    first = build_session(tmp_repo, [says("first answer", input_tokens=1_000)])
+    await first.run("first question")  # a prompt that stops records its totals ...
+    assert first.store is not None
+    first.store.db.execute("UPDATE sessions SET total_cost_usd = NULL, ended_at = NULL")
+    first.store.db.commit()  # ... so put the row back as a crash would have left it
+    session = resumed(tmp_repo, first, [says("second", input_tokens=500)])
+    await session.follow_up("second question")
+    assert stored_row(session)["total_cost_usd"] is None
+
+
+async def test_a_session_resumed_after_a_call_that_never_reported_back_closes_it_honestly(
+    tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.write import WriteTool
+
+    started = asyncio.Event()
+
+    async def hang(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the tool was allowed to finish")
+
+    first = build_session(
+        tmp_repo, [calls("Write", {"path": "w.txt", "content": "w"}, call_id="w1")]
+    )
+    with monkeypatch.context() as local:
+        local.setattr(WriteTool, "run", hang)
+        task = asyncio.create_task(first.run("write it"))
+        await reached(started)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    await first.aclose()
+
+    session = resumed(tmp_repo, first, [says("picked up again")])
+    assert session.state.transcript.pending_tool_uses()  # the stored tail is the open call
+    done = await session.follow_up("try again")
+
+    sent = session.model.requests[0].transcript
+    validate(sent)
+    [result] = tool_results(sent)
+    assert result.tool_use_id == "w1" and result.is_error and "may or may not" in result.content
+    assert sent.messages[-1].text() == "try again"
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+
+
+async def test_a_session_resumed_after_a_failed_request_closes_the_turn_that_got_no_reply(
+    tmp_repo,
+):
+    (tmp_repo / "a.py").write_text("x\n")
+    first = build_session(
+        tmp_repo,
+        [
+            calls("Read", {"path": "a.py"}, call_id="t1"),
+            ModelError("bad gateway", retryable=False, status=502),
+        ],
+    )
+    with pytest.raises(ModelError, match="bad gateway"):
+        await first.run("read it")
+    await first.aclose()
+
+    session = resumed(tmp_repo, first, [says("recovered")])
+    assert session.state.transcript.messages[-1].role == "user"  # the results, never answered
+    done = await session.follow_up("try again")
+    assert done.text == "recovered"
+    sent = session.model.requests[0].transcript
+    validate(sent)
+    assert "interrupted" in sent.messages[-2].text().lower()
+    assert [r.tool_use_id for r in tool_results(sent)] == ["t1"]
+
+
+async def test_ids_minted_after_a_resume_do_not_collide_with_the_stored_ones(tmp_repo):
+    # The text protocol has no ids from a server, so the session makes them up. The
+    # stored conversation holds the ones the first process made, the audit table is
+    # keyed by them, and the transcript refuses a repeat.
+    (tmp_repo / "a.py").write_text("x\n")
+    call = '<tool name="Read">{"path": "a.py"}</tool>'
+    first = await stored_session(tmp_repo, [says(call), says("done")], capabilities=TEXT_ONLY)
+    session = resumed(tmp_repo, first, [says(call), says("done again")], capabilities=TEXT_ONLY)
+    done = await session.follow_up("again")
+    ids = [r.tool_use_id for r in tool_results(done.state.transcript)]
+    assert len(ids) == 2 and len(set(ids)) == 2
+    validate(done.state.transcript)
+    assert session.store is not None
+    audited = session.store.db.execute(
+        "SELECT tool_use_id FROM tool_calls WHERE session_id = ?", (session.session_id,)
+    ).fetchall()
+    assert sorted(row["tool_use_id"] for row in audited) == sorted(ids)
+
+
+# --------------------------------------------------------------------------
+# Closing
+# --------------------------------------------------------------------------
+
+
+async def test_closing_a_session_closes_its_clients_and_its_store(tmp_repo):
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hello")
+    closed_before = session.model.closed  # a variable: mypy would narrow the attribute itself
+    await session.aclose()
+    assert closed_before is False and session.model.closed
+    assert session.store is not None
+    with pytest.raises(RuntimeError, match="store is not open"):
+        _ = session.store.db
+
+
+async def test_closing_after_a_prompt_that_failed_still_records_what_was_spent(tmp_repo):
+    # No prompt reached a stop, so nothing wrote the row. The round that was paid for
+    # still cost what it cost, and a session that is closed has ended.
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [
+            calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=1_000, output_tokens=100),
+            ModelError("bad gateway", retryable=False, status=502),
+        ],
+    )
+    with pytest.raises(ModelError, match="bad gateway"):
+        await session.run("read it")
+    assert stored_row(session)["ended_at"] is None
+    await session.aclose()
+    row = row_after_closing(session)
+    assert row["total_cost_usd"] == pytest.approx(0.003)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["ended_at"] is not None
+
+
+async def test_closing_after_a_cancelled_prompt_still_records_what_was_spent(tmp_repo, monkeypatch):
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=1_000, output_tokens=100)],
+    )
+    asked_again = asyncio.Event()
+    answer = session.model.complete
+
+    async def stops_answering(request: ModelRequest) -> ModelReply:
+        if session.model.requests:  # the first request was answered; this one never is
+            asked_again.set()
+            await asyncio.Event().wait()
+        return await answer(request)
+
+    monkeypatch.setattr(session.model, "complete", stops_answering)
+    task = asyncio.create_task(session.run("read it"))
+    await reached(asked_again)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await session.aclose()
+    row = row_after_closing(session)
+    assert row["total_cost_usd"] == pytest.approx(0.003)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["ended_at"] is not None
+
+
+async def test_the_row_is_finished_even_when_a_client_fails_to_close(tmp_repo, monkeypatch):
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [
+            calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=1_000, output_tokens=100),
+            ModelError("bad gateway", retryable=False, status=502),
+        ],
+    )
+    with pytest.raises(ModelError, match="bad gateway"):
+        await session.run("read it")
+
+    async def refuse() -> None:
+        raise RuntimeError("would not close")
+
+    monkeypatch.setattr(session.router, "aclose", refuse)
+    with pytest.raises(RuntimeError, match="would not close"):
+        await session.aclose()
+    row = row_after_closing(session)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["ended_at"] is not None
+
+
+async def test_the_row_is_written_before_the_clients_are_asked_to_close(tmp_repo, monkeypatch):
+    # Closing a client can be slow, or be interrupted; what was spent is not lost to that.
+    session = build_session(tmp_repo, [])
+    ended_when_asked: list[float | None] = []
+    close_clients = session.router.aclose
+
+    async def watching() -> None:
+        ended_when_asked.append(stored_row(session)["ended_at"])
+        await close_clients()
+
+    monkeypatch.setattr(session.router, "aclose", watching)
+    await session.aclose()
+    assert len(ended_when_asked) == 1 and ended_when_asked[0] is not None
+
+
+async def test_closing_again_after_a_close_that_failed_does_nothing(tmp_repo, monkeypatch):
+    # The failure was reported once. A cleanup that closes again must not trade it for
+    # a second, different one about a store that is already closed.
+    session = build_session(tmp_repo, [])
+
+    async def refuse() -> None:
+        raise RuntimeError("would not close")
+
+    monkeypatch.setattr(session.router, "aclose", refuse)
+    with pytest.raises(RuntimeError, match="would not close"):
+        await session.aclose()
+    await session.aclose()
+
+
+async def test_the_clients_and_the_store_are_closed_even_when_the_row_cannot_be_written(
+    tmp_repo, monkeypatch
+):
+    session = build_session(tmp_repo, [])
+    assert session.store is not None
+
+    def refuse(*_args: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(session.store, "finish_session", refuse)
+    with pytest.raises(RuntimeError, match="disk full"):
+        await session.aclose()
+    assert session.model.closed
+    with pytest.raises(RuntimeError, match="store is not open"):
+        _ = session.store.db
+
+
+async def test_a_session_can_be_closed_twice(tmp_repo):
+    # A front end may close from its normal exit and from its cleanup.
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hello")
+    await session.aclose()
+    await session.aclose()
+
+
+async def test_the_store_is_closed_even_when_a_client_fails_to_close(tmp_repo, monkeypatch):
+    session = build_session(tmp_repo, [])
+
+    async def refuse() -> None:
+        raise RuntimeError("would not close")
+
+    monkeypatch.setattr(session.router, "aclose", refuse)
+    with pytest.raises(RuntimeError, match="would not close"):
+        await session.aclose()
+    assert session.store is not None
+    with pytest.raises(RuntimeError, match="store is not open"):
+        _ = session.store.db

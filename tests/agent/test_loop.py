@@ -17,6 +17,7 @@ from nanoclaude.agent.loop import (
 )
 from nanoclaude.conversation.transcript import Transcript, validate
 from nanoclaude.testing.scripted import calls, calls_many, says
+from nanoclaude.tools.base import ToolOutcome
 
 
 class FakeOutcome:
@@ -49,6 +50,20 @@ def test_a_tool_reply_asks_for_the_calls():
     assert [c.id for c in outcome.calls] == ["t1"]
 
 
+def test_observe_takes_the_real_tool_outcome_and_not_only_a_stand_in():
+    # Observation says ToolOutcome satisfies it, and nothing checked that: every
+    # other test here passes FakeOutcome, a class whose fields can be assigned.
+    # ToolOutcome is a frozen dataclass, whose cannot, so a protocol of plain
+    # attributes is refused by mypy --strict at the one call that matters, the
+    # session's. This is that call, typed.
+    outcomes: tuple[ToolOutcome, ...] = (ToolOutcome("t1", "1\tx = 1"),)
+    outcome = step(start("hi"), calls("Read", {"path": "a.py"}, call_id="t1"))
+    state = observe(outcome.state, outcomes)
+    assert state.turn == 1
+    last = state.transcript.last()
+    assert last is not None and last.tool_results()[0].content == "1\tx = 1"
+
+
 def test_observe_advances_the_turn_and_records_what_was_seen():
     outcome = step(start("hi"), calls("Read", {"path": "a.py"}, call_id="t1"))
     assert isinstance(outcome, RunTools)
@@ -71,15 +86,62 @@ def test_turn_limit_closes_the_transcript_rather_than_leaving_calls_unanswered()
     assert isinstance(outcome, Done)
     assert outcome.reason is StopReason.TURN_LIMIT
     validate(outcome.state.transcript)
-    last = outcome.state.transcript.messages[-1]
+    refusals = outcome.state.transcript.messages[-2]
     # The key assertions: validate() alone would not catch a left-unanswered
     # tool_use -- a trailing pending call is legal mid-turn transcript shape
     # (that's what makes a normal RunTools state valid too), so it passes
     # whether or not the loop actually closed this call out. What proves it
-    # did is that the last message carries a matching, error tool_result
-    # naming the turn limit.
-    assert last.tool_results()[0].is_error
-    assert "turn limit" in last.tool_results()[0].content
+    # did is that the message after the call carries a matching, error
+    # tool_result naming the turn limit.
+    assert refusals.tool_results()[0].is_error
+    assert "turn limit" in refusals.tool_results()[0].content
+
+
+def test_a_turn_limit_stop_ends_with_text_so_no_turn_is_left_looking_interrupted():
+    # Spec 5.4: the unanswered calls get a "not executed" result, "then ends with text".
+    # A transcript that ended on those results would be a user message nobody answered,
+    # which is what an interrupted turn looks like, and the next prompt would be told
+    # that this one was interrupted.
+    outcome = step(start("hi", max_turns=1), calls("Bash", {"command": "ls"}, call_id="t1"))
+    assert isinstance(outcome, Done) and outcome.reason is StopReason.TURN_LIMIT
+    last = outcome.state.transcript.messages[-1]
+    assert last.role == "assistant"
+    assert last.text() == outcome.text
+    assert [m.role for m in outcome.state.transcript.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("limit", "said"),
+    [
+        (1, "Stopped after 1 turn without finishing the task."),
+        (2, "Stopped after 2 turns without finishing the task."),
+        (3, "Stopped after 3 turns without finishing the task."),
+    ],
+)
+def test_the_turn_limit_text_says_how_many_turns_were_taken_and_is_singular_for_one(limit, said):
+    state = start("hi", max_turns=limit)
+    for number in range(1, limit):
+        outcome = step(state, calls("Read", {"path": "a.py"}, call_id=f"t{number}"))
+        assert isinstance(outcome, RunTools)
+        state = observe(outcome.state, [FakeOutcome(f"t{number}", "x")])
+    final = step(state, calls("Read", {"path": "a.py"}, call_id="last"))
+    assert isinstance(final, Done) and final.reason is StopReason.TURN_LIMIT
+    assert final.text == said
+    assert final.state.turn == limit
+    assert final.state.transcript.messages[-1].text() == said
+
+
+def test_a_conversation_that_stopped_at_the_turn_limit_can_be_continued():
+    outcome = step(start("hi", max_turns=1), calls("Bash", {"command": "ls"}, call_id="t1"))
+    assert isinstance(outcome, Done)
+    resumed = resume(outcome.state, "try again")
+    validate(resumed.transcript)
+    assert resumed.transcript.messages[-1].text() == "try again"
 
 
 def test_refusal_is_distinguished_from_completion():
@@ -175,6 +237,37 @@ def test_resume_appends_a_user_message_when_nothing_is_pending():
     assert last.text() == "and another thing"
 
 
+def _a_conversation_one_tool_round_in() -> LoopState:
+    """A conversation that has run one tool round and answered, with something read and used."""
+    first = step(
+        start("hi", max_turns=3), calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=7)
+    )
+    assert isinstance(first, RunTools)
+    observed = (("/p/a.py", "SHA"),)
+    answered = observe(first.state, [FakeOutcome("t1", "1\tx = 1", observed=observed)])
+    done = step(answered, says("done", input_tokens=5, output_tokens=2))
+    assert isinstance(done, Done) and done.state.turn == 1
+    return done.state
+
+
+def test_a_new_prompt_starts_the_turn_count_again():
+    # max_turns bounds what one prompt may take, not what a whole conversation may.
+    state = _a_conversation_one_tool_round_in()
+    resumed = resume(state, "and another thing")
+    assert resumed.turn == 0
+    assert resumed.turns_left == resumed.max_turns == 3
+
+
+def test_a_new_prompt_keeps_what_the_conversation_has_read_and_used():
+    # Starting the count again must not start the conversation again: an Edit still
+    # needs the file to have been read, and the usage is the conversation's.
+    state = _a_conversation_one_tool_round_in()
+    resumed = resume(state, "and another thing")
+    assert resumed.read_state == {"/p/a.py": "SHA"}
+    assert resumed.usage == state.usage and resumed.usage.input_tokens == 12
+    assert resumed.transcript.messages[: len(state.transcript)] == state.transcript.messages
+
+
 def test_resume_refuses_while_tool_calls_are_unanswered():
     outcome = step(start("hi"), calls("Read", {"path": "a.py"}, call_id="t1"))
     assert isinstance(outcome, RunTools)
@@ -263,7 +356,7 @@ def test_turn_limit_closes_every_pending_call_not_just_the_first():
     assert isinstance(outcome, Done)
     assert outcome.reason is StopReason.TURN_LIMIT
     validate(outcome.state.transcript)
-    results = outcome.state.transcript.messages[-1].tool_results()
+    results = outcome.state.transcript.messages[-2].tool_results()
     assert [r.tool_use_id for r in results] == ["t1", "t2"]
     assert all(r.is_error for r in results)
     assert all("turn limit" in r.content for r in results)

@@ -8,6 +8,7 @@ from nanoclaude.providers.base import ModelReply, StopKind, ToolSpec, Usage
 from nanoclaude.providers.texttools import (
     MAX_PARSE_RETRIES,
     TOOL_PROTOCOL_PROMPT,
+    parse_reply,
     parse_text_tools,
     render_tools,
     wrap_reply,
@@ -315,3 +316,63 @@ def test_many_tag_fragments_with_no_closing_bracket_parse_quickly():
     started = time.perf_counter()
     parse_text_tools(text, next_id=_ids())
     assert time.perf_counter() - started < 0.5
+
+
+# --- parse_reply: wrap_reply, and what it found wrong --------------------------
+#
+# The session retries a reply that held complaints and no call. It must learn that
+# from the parser, not by looking for the "[tool protocol]" note in the text:
+# a model can write those words itself, and a reply that merely contains them is
+# not one that failed to parse.
+
+
+def _reply(text: str) -> ModelReply:
+    return ModelReply((TextBlock(text),), StopKind.END_TURN, Usage(3, 4), "local")
+
+
+def test_parse_reply_gives_back_the_wrapped_reply_and_no_problems_for_a_clean_call():
+    wrapped, problems = parse_reply(
+        _reply('<tool name="Read">{"path": "a.py"}</tool>'), next_id=ids()
+    )
+    assert problems == ()
+    assert wrapped.stop is StopKind.TOOL_USE
+    assert [b.name for b in wrapped.blocks if isinstance(b, ToolUseBlock)] == ["Read"]
+
+
+def test_parse_reply_reports_what_was_wrong_when_no_call_survived():
+    wrapped, problems = parse_reply(_reply('<tool name="Read">{"path": </tool>'), next_id=ids())
+    assert len(problems) == 1
+    assert "arguments for Read were not valid JSON" in problems[0]
+    assert not any(isinstance(b, ToolUseBlock) for b in wrapped.blocks)
+
+
+def test_parse_reply_reports_the_problem_beside_a_call_that_did_parse():
+    text = '<tool name="Read">{"path": "a.py"}</tool>\n<tool name="Grep">{not json}</tool>'
+    wrapped, problems = parse_reply(_reply(text), next_id=ids())
+    assert len(problems) == 1 and "arguments for Grep were not valid JSON" in problems[0]
+    # The call that parsed is still there: the caller decides what a problem means.
+    assert [b.name for b in wrapped.blocks if isinstance(b, ToolUseBlock)] == ["Read"]
+
+
+def test_parse_reply_finds_no_problem_in_a_reply_that_only_mentions_a_tag():
+    reply = _reply("I mentioned <tool once, nothing more")
+    wrapped, problems = parse_reply(reply, next_id=ids())
+    assert problems == ()
+    assert wrapped == reply
+
+
+def test_the_protocol_note_alone_is_not_a_problem():
+    # A model quoting the note back at us has not failed to parse anything.
+    reply = _reply("[tool protocol] - the arguments for Read were not valid JSON")
+    wrapped, problems = parse_reply(reply, next_id=ids())
+    assert problems == ()
+    assert wrapped is reply
+
+
+def test_parse_reply_returns_a_plain_reply_itself_and_never_asks_for_an_id():
+    def refuse() -> str:
+        raise AssertionError("an id was taken for a reply with no call in it")
+
+    reply = _reply("just talking")
+    wrapped, problems = parse_reply(reply, next_id=refuse)
+    assert wrapped is reply and problems == ()
