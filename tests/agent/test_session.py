@@ -1783,6 +1783,39 @@ async def test_a_prompt_after_an_interrupted_turn_gets_the_whole_limit(tmp_repo,
     assert done.state.turn == 1
 
 
+async def test_after_a_turn_limit_stop_the_next_request_is_not_told_the_turn_was_interrupted(
+    tmp_repo,
+):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="t1"),
+        calls("Read", {"path": "a.py"}, call_id="t2"),
+        says("on a smaller task"),
+    ]
+    session = build_session(tmp_repo, script, max_turns=2)
+    stopped = await session.follow_up("too much")
+    assert stopped.reason is StopReason.TURN_LIMIT
+    await session.follow_up("something smaller")
+    sent = session.model.requests[2].transcript
+    validate(sent)
+    assert "interrupted" not in transcript_text(sent).lower()
+    assert [m.role for m in sent.messages][-3:] == ["user", "assistant", "user"]
+    assert sent.messages[-2].text() == stopped.text
+    assert sent.messages[-1].text() == "something smaller"
+
+
+async def test_a_turn_limit_stop_is_stored_with_the_text_that_closes_it(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [calls("Read", {"path": "a.py"}, call_id="t1")]
+    session = build_session(tmp_repo, script, max_turns=1)
+    stopped = await session.follow_up("too much")
+    assert stopped.reason is StopReason.TURN_LIMIT
+    assert session.store is not None
+    stored = session.store.load_transcript(session.session_id)
+    assert stored == stopped.state.transcript
+    assert stored.messages[-1].text() == stopped.text
+
+
 async def test_a_follow_up_before_anything_was_said_starts_the_conversation(tmp_repo):
     # After /clear the REPL calls follow_up on an empty transcript, and the turn
     # limit in force is the configured one, not whatever a placeholder carried.

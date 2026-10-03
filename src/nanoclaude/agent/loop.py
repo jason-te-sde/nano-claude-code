@@ -21,6 +21,7 @@ from nanoclaude.conversation.transcript import (
     ToolResultBlock,
     ToolUseBlock,
     Transcript,
+    assistant_text,
     user_text,
     validate,
 )
@@ -157,19 +158,20 @@ def step(state: LoopState, reply: ModelReply) -> StepOutcome:
 
     if advanced.turn + 1 >= advanced.max_turns:
         # Refusing to run them is fine; leaving them unanswered is not, because
-        # the next request would carry an invalid transcript.
+        # the next request would carry an invalid transcript. And the transcript
+        # ends with text (spec 5.4), not with those refusals: a conversation that
+        # ended on a user message looks like a turn nobody answered, so the next
+        # prompt would be told this one was interrupted, and could not be added
+        # to the transcript at all, two user messages in a row.
         refusals = tuple(
             ToolResultBlock(call.id, f"not executed: turn limit of {state.max_turns} reached", True)
             for call in calls
         )
-        closed = transcript.append(Message("user", refusals))
+        said = f"Stopped after {advanced.turn + 1} turns without finishing the task."
+        closed = transcript.append(Message("user", refusals)).append(assistant_text(said))
         validate(closed)
         final = replace(advanced, transcript=closed, turn=advanced.turn + 1)
-        return Done(
-            final,
-            f"Stopped after {final.turn} turns without finishing the task.",
-            StopReason.TURN_LIMIT,
-        )
+        return Done(final, said, StopReason.TURN_LIMIT)
 
     return RunTools(advanced, calls)
 

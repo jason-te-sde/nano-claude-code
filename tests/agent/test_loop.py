@@ -86,15 +86,53 @@ def test_turn_limit_closes_the_transcript_rather_than_leaving_calls_unanswered()
     assert isinstance(outcome, Done)
     assert outcome.reason is StopReason.TURN_LIMIT
     validate(outcome.state.transcript)
-    last = outcome.state.transcript.messages[-1]
+    refusals = outcome.state.transcript.messages[-2]
     # The key assertions: validate() alone would not catch a left-unanswered
     # tool_use -- a trailing pending call is legal mid-turn transcript shape
     # (that's what makes a normal RunTools state valid too), so it passes
     # whether or not the loop actually closed this call out. What proves it
-    # did is that the last message carries a matching, error tool_result
-    # naming the turn limit.
-    assert last.tool_results()[0].is_error
-    assert "turn limit" in last.tool_results()[0].content
+    # did is that the message after the call carries a matching, error
+    # tool_result naming the turn limit.
+    assert refusals.tool_results()[0].is_error
+    assert "turn limit" in refusals.tool_results()[0].content
+
+
+def test_a_turn_limit_stop_ends_with_text_so_no_turn_is_left_looking_interrupted():
+    # Spec 5.4: the unanswered calls get a "not executed" result, "then ends with text".
+    # A transcript that ended on those results would be a user message nobody answered,
+    # which is what an interrupted turn looks like, and the next prompt would be told
+    # that this one was interrupted.
+    outcome = step(start("hi", max_turns=1), calls("Bash", {"command": "ls"}, call_id="t1"))
+    assert isinstance(outcome, Done) and outcome.reason is StopReason.TURN_LIMIT
+    last = outcome.state.transcript.messages[-1]
+    assert last.role == "assistant"
+    assert last.text() == outcome.text
+    assert [m.role for m in outcome.state.transcript.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+
+
+def test_the_turn_limit_text_says_how_many_turns_were_taken():
+    state = start("hi", max_turns=3)
+    for call_id in ("t1", "t2"):
+        outcome = step(state, calls("Read", {"path": "a.py"}, call_id=call_id))
+        assert isinstance(outcome, RunTools)
+        state = observe(outcome.state, [FakeOutcome(call_id, "x")])
+    final = step(state, calls("Read", {"path": "a.py"}, call_id="t3"))
+    assert isinstance(final, Done) and final.reason is StopReason.TURN_LIMIT
+    assert final.text == "Stopped after 3 turns without finishing the task."
+    assert final.state.turn == 3
+
+
+def test_a_conversation_that_stopped_at_the_turn_limit_can_be_continued():
+    outcome = step(start("hi", max_turns=1), calls("Bash", {"command": "ls"}, call_id="t1"))
+    assert isinstance(outcome, Done)
+    resumed = resume(outcome.state, "try again")
+    validate(resumed.transcript)
+    assert resumed.transcript.messages[-1].text() == "try again"
 
 
 def test_refusal_is_distinguished_from_completion():
@@ -309,7 +347,7 @@ def test_turn_limit_closes_every_pending_call_not_just_the_first():
     assert isinstance(outcome, Done)
     assert outcome.reason is StopReason.TURN_LIMIT
     validate(outcome.state.transcript)
-    results = outcome.state.transcript.messages[-1].tool_results()
+    results = outcome.state.transcript.messages[-2].tool_results()
     assert [r.tool_use_id for r in results] == ["t1", "t2"]
     assert all(r.is_error for r in results)
     assert all("turn limit" in r.content for r in results)
