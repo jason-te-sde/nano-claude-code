@@ -123,9 +123,16 @@ def start(prompt: str, *, max_turns: int = DEFAULT_MAX_TURNS) -> LoopState:
 
 
 def resume(state: LoopState, prompt: str) -> LoopState:
+    """Continue the conversation with a new prompt.
+
+    The prompt starts the turn count again: ``max_turns`` bounds what one prompt may
+    take, not what a whole conversation does, so a long session is not stopped by
+    the sum of everything it has done. What the conversation has read and used
+    carries over.
+    """
     if state.transcript.pending_tool_uses():
         raise LoopError("cannot resume while tool calls are unanswered")
-    return replace(state, transcript=state.transcript.append(user_text(prompt)))
+    return replace(state, transcript=state.transcript.append(user_text(prompt)), turn=0)
 
 
 def step(state: LoopState, reply: ModelReply) -> StepOutcome:

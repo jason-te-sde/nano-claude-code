@@ -1295,6 +1295,48 @@ async def test_compacting_right_after_an_interrupted_tool_does_not_trip_on_the_o
     assert not session.state.transcript.pending_tool_uses()
 
 
+async def test_each_prompt_gets_the_whole_turn_limit(tmp_repo):
+    # Two turns allowed: one tool round and then the answer. Each follow_up uses both.
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="t1"),
+        says("first done"),
+        calls("Read", {"path": "a.py"}, call_id="t2"),
+        says("second done"),
+    ]
+    session = build_session(tmp_repo, script, max_turns=2)
+    first = await session.follow_up("one")
+    second = await session.follow_up("two")
+    assert (first.reason, first.text) == (StopReason.COMPLETED, "first done")
+    assert (second.reason, second.text) == (StopReason.COMPLETED, "second done")
+    assert second.state.turn == 1  # counted for this prompt alone
+
+
+async def test_one_prompt_that_needs_more_turns_than_the_limit_stops_at_it(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(1, 4)]
+    session = build_session(tmp_repo, [*script, says("never reached")], max_turns=2)
+    done = await session.follow_up("keep reading")
+    assert done.reason is StopReason.TURN_LIMIT
+    assert len(session.model.requests) == 2  # the second reply's calls were not run
+    validate(done.state.transcript)  # closed cleanly: every call has its answer
+
+
+async def test_a_prompt_that_hit_the_limit_does_not_use_up_the_next_one(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="t1"),
+        calls("Read", {"path": "a.py"}, call_id="t2"),  # the second reply with calls: the limit
+        calls("Read", {"path": "a.py"}, call_id="t3"),
+        says("recovered"),
+    ]
+    session = build_session(tmp_repo, script, max_turns=2)
+    stopped = await session.follow_up("too much")
+    assert stopped.reason is StopReason.TURN_LIMIT
+    again = await session.follow_up("try something smaller")
+    assert (again.reason, again.text) == (StopReason.COMPLETED, "recovered")
+
+
 async def test_a_follow_up_before_anything_was_said_starts_the_conversation(tmp_repo):
     # After /clear the REPL calls follow_up on an empty transcript, and the turn
     # limit in force is the configured one, not whatever a placeholder carried.

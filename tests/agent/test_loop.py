@@ -190,6 +190,37 @@ def test_resume_appends_a_user_message_when_nothing_is_pending():
     assert last.text() == "and another thing"
 
 
+def _a_conversation_one_tool_round_in() -> LoopState:
+    """A conversation that has run one tool round and answered, with something read and used."""
+    first = step(
+        start("hi", max_turns=3), calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=7)
+    )
+    assert isinstance(first, RunTools)
+    observed = (("/p/a.py", "SHA"),)
+    answered = observe(first.state, [FakeOutcome("t1", "1\tx = 1", observed=observed)])
+    done = step(answered, says("done", input_tokens=5, output_tokens=2))
+    assert isinstance(done, Done) and done.state.turn == 1
+    return done.state
+
+
+def test_a_new_prompt_starts_the_turn_count_again():
+    # max_turns bounds what one prompt may take, not what a whole conversation may.
+    state = _a_conversation_one_tool_round_in()
+    resumed = resume(state, "and another thing")
+    assert resumed.turn == 0
+    assert resumed.turns_left == resumed.max_turns == 3
+
+
+def test_a_new_prompt_keeps_what_the_conversation_has_read_and_used():
+    # Starting the count again must not start the conversation again: an Edit still
+    # needs the file to have been read, and the usage is the conversation's.
+    state = _a_conversation_one_tool_round_in()
+    resumed = resume(state, "and another thing")
+    assert resumed.read_state == {"/p/a.py": "SHA"}
+    assert resumed.usage == state.usage and resumed.usage.input_tokens == 12
+    assert resumed.transcript.messages[: len(state.transcript)] == state.transcript.messages
+
+
 def test_resume_refuses_while_tool_calls_are_unanswered():
     outcome = step(start("hi"), calls("Read", {"path": "a.py"}, call_id="t1"))
     assert isinstance(outcome, RunTools)
