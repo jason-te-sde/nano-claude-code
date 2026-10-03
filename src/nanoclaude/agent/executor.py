@@ -19,14 +19,33 @@ semaphore; a refused or declined call never executes and so cannot split a
 run of reads around it. Concurrency buys latency within one run; no amount of
 it is worth an undefined order between a write and whatever depends on it.
 
-**Nothing the model chose reaches anything raw.** A path quoted in a refusal, a
-tool name it made up, the message of an error a tool raised over its arguments:
-each is text the model sent, and each is handed to the model, to the front end and
-to the audit log. The front end prints what it is given and a terminal acts on
-what it prints (a title change, a screen clear, a carriage return that rewrites a
-line), so the executor strips terminal control sequences with
-:func:`~nanoclaude.tools.base.sanitize` from every string it builds from outside
-input, once, where it is built, and all three get the clean one.
+**What is stripped of terminal control sequences, and what is not.** The front end
+prints what it is given and a terminal acts on what it prints: a title change, a
+screen clear, a carriage return that rewrites a line. So every string the executor
+*builds* from text the model chose goes through
+:func:`~nanoclaude.tools.base.sanitize` once, where it is built, and the model, the
+front end and the audit log all get the clean one:
+
+* the reason of every policy result, which quotes the path or the command asked
+  about;
+* the message of a refusal made before the policy runs (an unknown tool name, an
+  error a tool raised over its arguments), the tool name on the placeholder request
+  the front end is handed for such a call, and the tool column of the audit row;
+* the text of an error raised while a tool runs, and the error column it sets;
+* the detail of an internal error, which is also scrubbed of credentials.
+
+What a tool returns is built by the tool, through ``ok()`` and ``failed()``, which
+strip it; the executor does not strip it again. The call's arguments are stored in
+the audit row as JSON.
+
+Two things reach the front end as they are, and that is deliberate: the request a
+tool built (its subject is the path or the command it asks about), which goes to
+``ui.confirm`` and ``ui.on_decision``, and the model's own call (its name and
+arguments), which goes to those two and to ``ui.on_outcome``. The policy has to judge
+what would really run, and a rule matched against a stripped copy of a command is
+matched against something the shell never receives. Whatever draws a confirmation,
+which is where a carriage return or a screen clear could change what a person thinks
+they are approving, has to render these two safely itself.
 """
 
 from __future__ import annotations
