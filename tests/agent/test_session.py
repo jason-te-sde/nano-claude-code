@@ -1963,6 +1963,7 @@ async def test_a_turn_limit_stop_is_stored_with_the_text_that_closes_it(tmp_repo
     session = build_session(tmp_repo, script, max_turns=1)
     stopped = await session.follow_up("too much")
     assert stopped.reason is StopReason.TURN_LIMIT
+    assert stopped.text == "Stopped after 1 turn without finishing the task."
     assert session.store is not None
     stored = session.store.load_transcript(session.session_id)
     assert stored == stopped.state.transcript

@@ -167,7 +167,10 @@ def step(state: LoopState, reply: ModelReply) -> StepOutcome:
             ToolResultBlock(call.id, f"not executed: turn limit of {state.max_turns} reached", True)
             for call in calls
         )
-        said = f"Stopped after {advanced.turn + 1} turns without finishing the task."
+        turns = advanced.turn + 1
+        said = (
+            f"Stopped after {turns} {'turn' if turns == 1 else 'turns'} without finishing the task."
+        )
         closed = transcript.append(Message("user", refusals)).append(assistant_text(said))
         validate(closed)
         final = replace(advanced, transcript=closed, turn=advanced.turn + 1)

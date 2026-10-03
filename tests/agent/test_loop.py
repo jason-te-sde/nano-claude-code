@@ -115,16 +115,25 @@ def test_a_turn_limit_stop_ends_with_text_so_no_turn_is_left_looking_interrupted
     ]
 
 
-def test_the_turn_limit_text_says_how_many_turns_were_taken():
-    state = start("hi", max_turns=3)
-    for call_id in ("t1", "t2"):
-        outcome = step(state, calls("Read", {"path": "a.py"}, call_id=call_id))
+@pytest.mark.parametrize(
+    ("limit", "said"),
+    [
+        (1, "Stopped after 1 turn without finishing the task."),
+        (2, "Stopped after 2 turns without finishing the task."),
+        (3, "Stopped after 3 turns without finishing the task."),
+    ],
+)
+def test_the_turn_limit_text_says_how_many_turns_were_taken_and_is_singular_for_one(limit, said):
+    state = start("hi", max_turns=limit)
+    for number in range(1, limit):
+        outcome = step(state, calls("Read", {"path": "a.py"}, call_id=f"t{number}"))
         assert isinstance(outcome, RunTools)
-        state = observe(outcome.state, [FakeOutcome(call_id, "x")])
-    final = step(state, calls("Read", {"path": "a.py"}, call_id="t3"))
+        state = observe(outcome.state, [FakeOutcome(f"t{number}", "x")])
+    final = step(state, calls("Read", {"path": "a.py"}, call_id="last"))
     assert isinstance(final, Done) and final.reason is StopReason.TURN_LIMIT
-    assert final.text == "Stopped after 3 turns without finishing the task."
-    assert final.state.turn == 3
+    assert final.text == said
+    assert final.state.turn == limit
+    assert final.state.transcript.messages[-1].text() == said
 
 
 def test_a_conversation_that_stopped_at_the_turn_limit_can_be_continued():
