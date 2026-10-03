@@ -188,7 +188,10 @@ class Session:
     async def follow_up(self, prompt: str) -> Done:
         """Continue the conversation with ``prompt``."""
         self._mend()
-        self.state = loop.resume(self.state, self._expand(prompt))
+        # The limit in force is the config's now, as it is for run(): a front end
+        # may have replaced the config since the session was built.
+        state = replace(self.state, max_turns=self.config.limits.max_turns)
+        self.state = loop.resume(state, self._expand(prompt))
         return await self._drive()
 
     def _expand(self, prompt: str) -> str:

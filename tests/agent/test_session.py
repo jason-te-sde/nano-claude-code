@@ -1717,6 +1717,72 @@ async def test_a_prompt_that_hit_the_limit_does_not_use_up_the_next_one(tmp_repo
     assert (again.reason, again.text) == (StopReason.COMPLETED, "recovered")
 
 
+@pytest.mark.parametrize("entry", ["run", "follow_up"])
+async def test_each_prompt_reads_the_turn_limit_the_config_has_when_it_arrives(tmp_repo, entry):
+    # A front end builds the session, then replaces its config (--max-turns applied,
+    # say). The limit in force is the one read when the prompt arrives.
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(1, 4)]
+    session = build_session(tmp_repo, [*script, says("never reached")], max_turns=40)
+    session.config = replace(session.config, limits=replace(session.config.limits, max_turns=2))
+    done = await getattr(session, entry)("keep reading")
+    assert done.reason is StopReason.TURN_LIMIT
+    assert len(session.model.requests) == 2
+
+
+async def test_a_limit_changed_between_prompts_applies_to_the_next_one(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="t1"),
+        says("first done"),
+        calls("Read", {"path": "a.py"}, call_id="t2"),
+        calls("Read", {"path": "a.py"}, call_id="t3"),
+        says("never reached"),
+    ]
+    session = build_session(tmp_repo, script, max_turns=5)
+    assert (await session.follow_up("one")).reason is StopReason.COMPLETED
+    session.config = replace(session.config, limits=replace(session.config.limits, max_turns=2))
+    two = await session.follow_up("two")
+    assert two.reason is StopReason.TURN_LIMIT
+    assert two.state.max_turns == 2
+
+
+async def test_a_prompt_after_an_interrupted_turn_gets_the_whole_limit(tmp_repo, monkeypatch):
+    # Closing the interrupted turn's calls goes through observe(), which counts a turn.
+    # That one belongs to the prompt that was cut short, not to the next one.
+    from nanoclaude.tools.write import WriteTool
+
+    started = asyncio.Event()
+
+    async def hang(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the tool was allowed to finish")
+
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [
+            calls("Write", {"path": "w.txt", "content": "w"}, call_id="w1"),
+            calls("Read", {"path": "a.py"}, call_id="t1"),
+            says("second done"),
+        ],
+        max_turns=2,
+    )
+    with monkeypatch.context() as local:
+        local.setattr(WriteTool, "run", hang)
+        task = asyncio.create_task(session.run("write it"))
+        await reached(started)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    done = await session.follow_up("read it instead")
+    assert (done.reason, done.text) == (StopReason.COMPLETED, "second done")
+    assert done.state.turn == 1
+
+
 async def test_a_follow_up_before_anything_was_said_starts_the_conversation(tmp_repo):
     # After /clear the REPL calls follow_up on an empty transcript, and the turn
     # limit in force is the configured one, not whatever a placeholder carried.
