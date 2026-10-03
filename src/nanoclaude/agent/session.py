@@ -200,13 +200,7 @@ class Session:
             system, specs = self._prompt(capabilities)
             await self._maybe_compact(capabilities, system, specs)
 
-            request = ModelRequest(
-                system=system,
-                transcript=self.state.transcript,
-                tools=specs,
-                max_output_tokens=capabilities.max_output,
-            )
-            raw = await self._complete("main", request)
+            raw = await self._ask_main(capabilities, system, specs)
             self.router.record("main", raw.usage, *self._adapter_and_model("main"))
             reply: ModelReply = raw
             complaints: tuple[str, ...] = ()
@@ -267,6 +261,55 @@ class Session:
         )
         return f"{context.system}\n\n{context.environment}", specs if native else ()
 
+    def _request(
+        self, capabilities: Capabilities, system: str, specs: tuple[ToolSpec, ...]
+    ) -> ModelRequest:
+        """The next request for the main model, from the conversation as it is now."""
+        return ModelRequest(
+            system=system,
+            transcript=self.state.transcript,
+            tools=specs,
+            max_output_tokens=capabilities.max_output,
+        )
+
+    async def _ask_main(
+        self, capabilities: Capabilities, system: str, specs: tuple[ToolSpec, ...]
+    ) -> ModelReply:
+        """Ask the main model, answering a context overflow the way spec 7.4 says to.
+
+        When the provider reports that the conversation does not fit its window the
+        session compacts it once, fully, and asks again once. A second overflow, or a
+        conversation with nothing older than its recent turns to compact, ends the
+        attempt: asking again could only fail the same way. This is the main request
+        only. The summary is a request to a model with a window of its own, and an
+        overflow there is that model's error and not something to retry.
+        """
+        try:
+            return await self._complete("main", self._request(capabilities, system, specs))
+        except ModelError as error:
+            if not error.context_overflow:
+                raise
+            overflow = error
+        before = self.state.transcript
+        await self._compact_fully()
+        if self.state.transcript == before:
+            raise self._does_not_fit(overflow) from overflow
+        try:
+            return await self._complete("main", self._request(capabilities, system, specs))
+        except ModelError as error:
+            if error.context_overflow:
+                raise self._does_not_fit(error) from error
+            raise
+
+    def _does_not_fit(self, cause: ModelError) -> ModelError:
+        model = self._adapter_and_model("main")[1]
+        return ModelError(
+            f"the conversation does not fit the context window of {model} even after compacting "
+            "it \u2014 use a model with a larger window (--model), or start over with /clear",
+            retryable=False,
+            status=cause.status,
+        )
+
     async def _complete(self, role: str, request: ModelRequest) -> ModelReply:
         """One provider call under the retry policy; each retry is reported to the UI."""
         client = await self.router.client_for(role)
@@ -291,23 +334,29 @@ class Session:
         transcript = self.state.transcript
         budget.require_fits(transcript, system, tools)
         verdict = budget.verdict(transcript, system, tools)
-        keep_recent = self.config.limits.keep_recent_turns
         if verdict == "micro":
             compacted = micro_compact(
-                transcript, keep_recent=keep_recent, counter=HeuristicCounter()
+                transcript,
+                keep_recent=self.config.limits.keep_recent_turns,
+                counter=HeuristicCounter(),
             )
+            self.state = replace(self.state, transcript=compacted)
+            self._persist()
         elif verdict == "full":
-            compacted = await full_compact(
-                transcript, keep_recent=keep_recent, summarise=self._summarise
-            )
-        else:
-            return
-        self.state = replace(self.state, transcript=compacted)
-        self._persist()
+            await self._compact_fully()
 
     async def compact(self, instructions: str | None = None) -> None:
         """Summarise the older part of the conversation now: the ``/compact`` command."""
         self._mend()
+        await self._compact_fully(instructions)
+
+    async def _compact_fully(self, instructions: str | None = None) -> None:
+        """Replace the older part of the conversation with a summary, and store it.
+
+        The one place a full compaction happens: the budget calls it at the hard
+        threshold, ``/compact`` calls it, and so does the answer to a provider that
+        says the conversation does not fit. They differ in why, not in how.
+        """
         extra = f"\n\nPay particular attention to: {instructions}" if instructions else ""
 
         async def summarise(text: str) -> str:

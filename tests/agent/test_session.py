@@ -57,7 +57,7 @@ from nanoclaude.providers.capabilities import (
     Capabilities,
     capabilities_for,
 )
-from nanoclaude.providers.retry import RetryPolicy
+from nanoclaude.providers.retry import RetryPolicy, classify_status
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, calls_many, says
 from nanoclaude.testing.session import ScriptedSession, build_session
@@ -1048,6 +1048,134 @@ async def test_a_summary_that_comes_back_empty_is_refused_and_the_history_kept(t
     with pytest.raises(ModelError, match="empty summary"):
         await session.follow_up("what next")
     assert session.state.transcript.messages[: len(history.messages)] == history.messages
+
+
+# --------------------------------------------------------------------------
+# A context overflow reported by the provider (spec 7.4)
+# --------------------------------------------------------------------------
+
+
+def overflow() -> ModelError:
+    """What an adapter raises for a 400 that says the conversation does not fit."""
+    return classify_status(
+        400,
+        '{"type":"error","error":{"type":"invalid_request_error",'
+        '"message":"prompt is too long: 213456 tokens > 200000 maximum"}}',
+    )
+
+
+async def test_a_context_overflow_is_answered_with_one_compaction_and_one_retry(tmp_repo):
+    # The shipped thresholds, and a conversation they consider fine: it is the provider
+    # that says otherwise, so this is a compaction nothing in the budget asked for.
+    session = build_session(tmp_repo, [overflow(), says("SUMMARY of the work"), says("answer")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    done = await session.follow_up("what next")
+
+    first, summary, retry = session.model.requests
+    assert [is_summary_request(r) for r in (first, summary, retry)] == [False, True, False]
+    assert len(session.model.requests) == 3  # one compaction, one retry, nothing more
+    # The first request carried the conversation as it was; the retry carries it compacted.
+    assert first.transcript.messages[0].text() == "start" and len(first.transcript.messages) == 13
+    assert (
+        retry.transcript.messages[0]
+        .text()
+        .startswith("[earlier conversation, compacted]\nSUMMARY of the work")
+    )
+    # The request that goes again is the same request in every other respect, and the
+    # compacted conversation still ends on what the person asked.
+    assert (retry.system, retry.tools, retry.max_output_tokens) == (
+        first.system,
+        first.tools,
+        first.max_output_tokens,
+    )
+    validate(retry.transcript)
+    assert retry.transcript.messages[-1].text() == "what next"
+    assert (done.reason, done.text) == (StopReason.COMPLETED, "answer")
+
+
+async def test_the_store_holds_the_compacted_conversation_when_the_retry_is_sent(
+    tmp_repo, monkeypatch
+):
+    session = build_session(tmp_repo, [overflow(), says("SUMMARY"), says("answer")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    comparisons: list[tuple[Transcript, Transcript]] = []
+    real_complete = session.model.complete
+
+    async def spying_complete(request: ModelRequest) -> ModelReply:
+        if not is_summary_request(request):
+            assert session.store is not None
+            stored = session.store.load_transcript(session.session_id)
+            comparisons.append((stored, request.transcript))
+        return await real_complete(request)
+
+    with monkeypatch.context() as local:
+        local.setattr(session.model, "complete", spying_complete)
+        await session.follow_up("what next")
+    assert len(comparisons) == 2
+    assert all(stored == sent for stored, sent in comparisons)
+
+
+async def test_a_context_overflow_that_happens_again_after_compacting_fails_by_name(tmp_repo):
+    session = build_session(tmp_repo, [overflow(), says("SUMMARY"), overflow(), says("never")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    with pytest.raises(ModelError) as caught:
+        await session.follow_up("what next")
+    message = str(caught.value)
+    assert "does not fit" in message and "claude-sonnet-5" in message
+    assert "even after compacting" in message
+    # What to do next, in the spec 17.9 form.
+    assert "\u2014 use a model with a larger window (--model), or start over with /clear" in message
+    assert caught.value.context_overflow is False  # the verdict, not another thing to answer
+    assert isinstance(caught.value.__cause__, ModelError)
+    assert len(session.model.requests) == 3 and not session.model.exhausted  # no second retry
+    # Nothing was lost on the way: the session is left a valid conversation.
+    validate(session.state.transcript)
+
+
+async def test_a_context_overflow_with_nothing_older_to_compact_does_not_ask_again(tmp_repo):
+    session = build_session(tmp_repo, [overflow(), says("never")])
+    session.state = replace(session.state, transcript=tool_history(1, result_chars=50))
+    with pytest.raises(ModelError, match="does not fit"):
+        await session.follow_up("what next")
+    # No summary was asked for and nothing was sent again: compacting could not help.
+    assert len(session.model.requests) == 1 and not session.model.exhausted
+
+
+async def test_a_400_that_is_not_an_overflow_is_not_answered_by_compacting(tmp_repo):
+    plain = classify_status(400, '{"error":{"message":"tools.0.name: invalid"}}')
+    session = build_session(tmp_repo, [plain, says("never")])
+    history = tool_history(5, result_chars=400)
+    session.state = replace(session.state, transcript=history)
+    with pytest.raises(ModelError) as caught:
+        await session.follow_up("what next")
+    assert "tools.0.name: invalid" in str(caught.value)
+    assert len(session.model.requests) == 1  # no summary, no retry
+    assert session.state.transcript.messages[: len(history.messages)] == history.messages
+
+
+async def test_another_failure_on_the_retry_is_reported_as_itself(tmp_repo):
+    gateway = ModelError("bad gateway", retryable=False, status=502)
+    session = build_session(tmp_repo, [overflow(), says("SUMMARY"), gateway])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    with pytest.raises(ModelError, match="bad gateway") as caught:
+        await session.follow_up("what next")
+    assert "does not fit" not in str(caught.value)
+
+
+async def test_an_overflow_on_the_summary_request_is_the_compact_roles_error_not_a_retry(
+    tmp_repo,
+):
+    # Only the main request is answered by compacting. The summary is itself a request
+    # to a model with its own window, and an overflow there ends the attempt.
+    session = build_session(tmp_repo, [overflow(), says("never")], compact_script=[overflow()])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    with pytest.raises(ModelError) as caught:
+        await session.follow_up("what next")
+    assert "compact" in str(caught.value) and "does not fit" not in str(caught.value)
+    assert caught.value.context_overflow is False
+    assert session.compact_model is not None
+    assert len(session.compact_model.requests) == 1  # asked once, not again
+    assert len(session.model.requests) == 1
 
 
 async def test_a_manual_compaction_summarises_with_the_instructions_given(tmp_repo):
