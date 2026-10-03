@@ -98,10 +98,20 @@ class ModelError(RuntimeError):
     401 is not, and the difference must survive the trip up to the session.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status: int | None = None,
+        context_overflow: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.status = status
+        #: True when the provider said the request does not fit the model's context
+        #: window. Spec 7.4: the session answers it with one compaction and one retry.
+        self.context_overflow = context_overflow
 
 
 @runtime_checkable

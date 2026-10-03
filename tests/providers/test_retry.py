@@ -225,3 +225,97 @@ async def test_the_smallest_jitter_halves_the_delay_and_never_goes_below_it():
     assert delays and all(
         low == pytest.approx(high / 2) for low, high in zip(delays, full, strict=True)
     )
+
+
+# --- A request that does not fit the model's window ---------------------------
+#
+# Spec 7.4: a context overflow reported by the provider is answered by one forced
+# compaction and one retry. For the session to do that, the adapters' errors have
+# to say it is an overflow, and they all get that from classify_status. One test per
+# marker: a table where only some rows are exercised leaves the others decorative.
+
+OVERFLOW_BODIES = {
+    # Anthropic, a conversation longer than the window.
+    "prompt is too long": (
+        '{"type":"error","error":{"type":"invalid_request_error",'
+        '"message":"prompt is too long: 213456 tokens > 200000 maximum"}}'
+    ),
+    # OpenAI's error code, which comes with a message of its own wording.
+    "context_length_exceeded": (
+        '{"error":{"message":"Your input is over the limit for this model.",'
+        '"type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}'
+    ),
+    # OpenAI's message, and vLLM's.
+    "maximum context length": (
+        '{"object":"error","message":"This model\'s maximum context length is 4096 tokens. '
+        'However, you requested 5000 tokens.","type":"BadRequestError","code":400}'
+    ),
+    # Anthropic again, when the input and the output allowance together do not fit.
+    "exceed context limit": (
+        '{"type":"error","error":{"type":"invalid_request_error","message":"input length '
+        "and `max_tokens` exceed context limit: 188240 + 21333 > 200000, decrease input "
+        'length or `max_tokens` and try again"}}'
+    ),
+    # llama.cpp's server.
+    "exceeds the available context size": (
+        '{"error":{"code":400,"message":"the request exceeds the available context size, '
+        'try increasing it","type":"exceed_context_size_error"}}'
+    ),
+}
+
+
+MARKER_IDS = [marker.replace(" ", "-") for marker in OVERFLOW_BODIES]
+
+
+@pytest.mark.parametrize("marker", list(OVERFLOW_BODIES), ids=MARKER_IDS)
+def test_a_400_that_reports_the_context_window_is_flagged_as_an_overflow(marker):
+    body = OVERFLOW_BODIES[marker]
+    # The row under test is the only marker this body contains.
+    assert [m for m in OVERFLOW_BODIES if m in body.lower()] == [marker]
+    error = classify_status(400, body)
+    assert error.context_overflow is True
+    # Still the same error to everything that does not care: not retried as it
+    # stands, reported with the provider's own words.
+    assert error.retryable is False and error.status == 400
+    assert str(error).startswith("the provider rejected the request (HTTP 400): ")
+
+
+@pytest.mark.parametrize("marker", list(OVERFLOW_BODIES), ids=MARKER_IDS)
+def test_the_markers_are_matched_whatever_the_case(marker):
+    assert classify_status(400, OVERFLOW_BODIES[marker].upper()).context_overflow is True
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '{"error":{"message":"tools.0.name: invalid"}}',
+        '{"error":{"message":"max_tokens must be at least 1"}}',
+        "the context was fine",  # "context", but nothing about a window
+        "",
+    ],
+    ids=["bad-schema", "bad-parameter", "mentions-context", "empty-body"],
+)
+def test_a_400_that_is_not_about_the_window_is_a_plain_rejection(body):
+    error = classify_status(400, body)
+    assert error.context_overflow is False
+    assert error.retryable is False
+
+
+@pytest.mark.parametrize("status", [401, 404, 413, 429, 500, 529])
+def test_only_a_400_is_taken_for_an_overflow(status):
+    # The same words under another status are not what the session knows how to fix.
+    assert classify_status(status, OVERFLOW_BODIES["prompt is too long"]).context_overflow is False
+
+
+def test_the_marker_is_found_in_the_body_even_past_the_part_of_it_that_is_quoted():
+    # The message quoted back to the person is cut at 500 characters. What decides
+    # whether it was an overflow is the whole body.
+    body = '{"error":{"message":"' + "x" * 600 + ' prompt is too long"}}'
+    error = classify_status(400, body)
+    assert error.context_overflow is True
+    assert "prompt is too long" not in str(error)
+
+
+def test_an_error_is_not_an_overflow_unless_it_says_so():
+    assert ModelError("boom").context_overflow is False
+    assert ModelError("boom", context_overflow=True).context_overflow is True
