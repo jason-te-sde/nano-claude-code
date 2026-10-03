@@ -1,4 +1,5 @@
 import json
+import re
 
 import httpx
 import pytest
@@ -10,6 +11,7 @@ from nanoclaude.conversation.transcript import (
     ToolUseBlock,
     Transcript,
     user_text,
+    validate,
 )
 from nanoclaude.providers.base import ModelClient, ModelError, ModelRequest, StopKind, ToolSpec
 from nanoclaude.providers.ollama import (
@@ -249,6 +251,74 @@ async def test_a_native_tool_call_is_decoded():
     assert reply.stop is StopKind.TOOL_USE
     assert isinstance(reply.blocks[0], ToolUseBlock)
     assert reply.blocks[0].arguments == {"path": "a.py"}
+
+
+async def test_replies_whose_calls_come_without_ids_get_ids_of_their_own():
+    # Ollama's tool calls carry no id. The adapter mints one, and it must not be the
+    # same in every reply: the transcript refuses a tool_use id it already holds, so
+    # the second tool round of a conversation would have ended the session.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return stream_response(
+            [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {"function": {"name": "Read", "arguments": {"path": "a.py"}}},
+                            {"function": {"name": "Read", "arguments": {"path": "b.py"}}},
+                        ]
+                    },
+                    "done": True,
+                    "done_reason": "stop",
+                }
+            ]
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = OllamaClient(model="m", client=http)
+        ask = ModelRequest("s", Transcript((user_text("hi"),)), (), 64)
+        first = await client.complete(ask)
+        second = await client.complete(ask)
+    calls = [b for reply in (first, second) for b in reply.blocks if isinstance(b, ToolUseBlock)]
+    assert len(calls) == 4
+    assert len({call.id for call in calls}) == 4
+    assert all(re.fullmatch(r"call_[0-9a-f]{12}", call.id) for call in calls)
+    # As the loop would build the conversation from them.
+    answered = tuple(
+        ToolResultBlock(b.id, "ok") for b in first.blocks if isinstance(b, ToolUseBlock)
+    )
+    validate(
+        Transcript(
+            (
+                user_text("hi"),
+                Message("assistant", tuple(first.blocks)),
+                Message("user", answered),
+                Message("assistant", tuple(second.blocks)),
+            )
+        )
+    )
+
+
+async def test_an_id_the_server_does_send_is_kept():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return stream_response(
+            [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {"id": "call_fromserver", "function": {"name": "Read", "arguments": {}}}
+                        ]
+                    },
+                    "done": True,
+                }
+            ]
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        reply = await OllamaClient(model="m", client=http).complete(
+            ModelRequest("s", Transcript((user_text("hi"),)), (), 64)
+        )
+    call = reply.blocks[0]
+    assert isinstance(call, ToolUseBlock) and call.id == "call_fromserver"
 
 
 async def test_a_tool_calls_arguments_as_a_json_string_are_decoded():
