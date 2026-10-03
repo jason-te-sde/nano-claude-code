@@ -286,6 +286,15 @@ class Store:
         )
         self.db.commit()
 
+    def session_row(self, session_id: str) -> SessionRow | None:
+        """One session's row, or None when no such session is stored."""
+        row = self.db.execute(
+            "SELECT id, started_at, ended_at, cwd, total_cost_usd, total_input_tokens, "
+            "total_output_tokens FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        return SessionRow(**dict(row)) if row else None
+
     def recent_sessions(self, limit: int = 10) -> list[SessionRow]:
         rows = self.db.execute(
             "SELECT id, started_at, ended_at, cwd, total_cost_usd, total_input_tokens, "

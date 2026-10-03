@@ -126,6 +126,46 @@ def test_recent_sessions_are_newest_first_and_respect_the_limit(tmp_path, monkey
     assert [row.id for row in store.recent_sessions(2)] == ["b", "c"]
 
 
+def test_one_stored_session_can_be_read_back_by_its_id(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, 4.0, 9.0)
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/proj", roles={"main": "sonnet"})
+    store.finish_session("s1", Usage(input_tokens=100, output_tokens=20), cost_usd=0.0031)
+    assert store.session_row("s1") == SessionRow(
+        id="s1",
+        started_at=4.0,
+        ended_at=9.0,
+        cwd="/proj",
+        total_cost_usd=0.0031,
+        total_input_tokens=100,
+        total_output_tokens=20,
+    )
+
+
+def test_a_session_that_never_finished_reads_back_with_an_unknown_cost(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    row = store.session_row("s1")
+    assert row is not None
+    assert (row.ended_at, row.total_cost_usd, row.total_input_tokens) == (None, None, 0)
+
+
+def test_a_session_that_is_not_stored_reads_back_as_none(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    assert store.session_row("s2") is None
+
+
+def test_the_row_read_by_id_is_the_one_the_listing_shows(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    assert store.recent_sessions(1) == [store.session_row("s1")]
+
+
 def test_latest_session_id_is_none_for_an_empty_database(tmp_path):
     store = Store(tmp_path / "s.db")
     store.open()
