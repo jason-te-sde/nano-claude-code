@@ -40,7 +40,14 @@ from nanoclaude.permissions.policy import (
     evaluate,
 )
 from nanoclaude.permissions.redact import Redactor
-from nanoclaude.tools.base import Tool, ToolArgumentError, ToolContext, ToolOutcome, failed
+from nanoclaude.tools.base import (
+    Tool,
+    ToolArgumentError,
+    ToolContext,
+    ToolOutcome,
+    failed,
+    sanitize,
+)
 from nanoclaude.tools.registry import ToolRegistry, UnknownToolError
 
 MAX_CONCURRENT_READS = 8
@@ -273,11 +280,14 @@ class Executor:
         """What a call whose tool raised something it should not have comes to.
 
         Returns the outcome the model sees and the ``Type: message`` the audit row
-        keeps. The text is scrubbed like any tool output: an exception can quote the
-        value the tool was handling, and this goes to the transcript and the audit
-        table. The first line is the one the REPL prints.
+        and the front end keep. The text is treated like any tool output: an
+        exception can quote the value the tool was handling, so it is stripped of
+        terminal control sequences, which would otherwise be played back to the
+        person reading the audit or the screen, and scrubbed of anything shaped like
+        a credential. In that order: a secret split by an escape sequence would
+        otherwise get past the scrubber. The first line is the one the REPL prints.
         """
-        detail, _ = self.redactor.scrub(f"{type(exc).__name__}: {exc}")
+        detail, _ = self.redactor.scrub(sanitize(f"{type(exc).__name__}: {exc}"))
         outcome = failed(
             call.id,
             f"Internal error in {call.name}: {detail}\n"

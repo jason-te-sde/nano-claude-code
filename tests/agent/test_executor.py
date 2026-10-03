@@ -1005,6 +1005,102 @@ async def test_what_a_failing_permission_request_says_is_scrubbed_like_any_tool_
     assert secret not in row["error"] and "[redacted:" in row["error"], dict(row)
 
 
+#: What a message can hold that a terminal would act on: a colour sequence and a
+#: carriage return that redraws the line.
+ESCAPES = "\x1b[31mred\x1b[0m and\rmore"
+
+
+def _free_of_escapes(text: str) -> bool:
+    return "\x1b" not in text and "\r" not in text
+
+
+async def test_an_internal_error_from_run_carries_no_terminal_control_sequences(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    async def broken(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise RuntimeError(ESCAPES)
+
+    class Seen(SilentUI):
+        def __init__(self) -> None:
+            self.outcomes: list[ToolOutcome] = []
+
+        def on_outcome(self, _call: ToolUseBlock, outcome: ToolOutcome) -> None:
+            self.outcomes.append(outcome)
+
+    monkeypatch.setattr(ReadTool, "run", broken)
+    (tmp_repo / "a.py").write_text("x")
+    ui, store = Seen(), _store(tmp_repo)
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert "RuntimeError: red andmore" in outcomes[0].content
+    row = _audit_row(store, "t1")
+    assert row["error"] == "RuntimeError: red andmore", dict(row)
+    assert all(_free_of_escapes(o.content) for o in (*outcomes, *ui.outcomes))
+
+
+async def test_a_credential_split_by_an_escape_sequence_is_still_scrubbed(
+    policy, tmp_repo, monkeypatch
+):
+    """The scrubber matches a credential as it is written. An escape sequence in the
+    middle of one hides it from the scrubber and is gone once the text is stripped, so
+    stripping has to come first. Built at run time so no literal here is shaped like a
+    key."""
+    from nanoclaude.tools.read import ReadTool
+
+    secret = "sk-" + "Qz7" * 12
+    split = secret[:10] + "\x1b[0m" + secret[10:]
+
+    async def leak(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise ValueError(f"cannot use token {split}")
+
+    monkeypatch.setattr(ReadTool, "run", leak)
+    (tmp_repo / "a.py").write_text("x")
+    store = _store(tmp_repo)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    row = _audit_row(store, "t1")
+    for text in (outcomes[0].content, row["error"]):
+        assert secret not in text and "[redacted:" in text, text
+
+
+async def test_an_internal_error_from_a_permission_request_carries_no_terminal_control_sequences(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    def broken(self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]) -> PermissionRequest:
+        raise RuntimeError(ESCAPES)
+
+    class Seen(SilentUI):
+        def __init__(self) -> None:
+            self.reasons: list[str] = []
+
+        def on_decision(
+            self, _call: ToolUseBlock, _request: PermissionRequest, result: PermissionResult
+        ) -> None:
+            self.reasons.append(result.reason)
+
+    monkeypatch.setattr(ReadTool, "permission_request", broken)
+    (tmp_repo / "a.py").write_text("x")
+    ui, store = Seen(), _store(tmp_repo)
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert "RuntimeError: red andmore" in outcomes[0].content
+    row = _audit_row(store, "t1")
+    assert row["error"] == "RuntimeError: red andmore", dict(row)
+    assert ui.reasons == ["RuntimeError: red andmore"]
+    assert _free_of_escapes(outcomes[0].content)
+
+
 @pytest.mark.parametrize(
     "error",
     [
