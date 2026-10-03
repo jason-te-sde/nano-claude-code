@@ -162,6 +162,19 @@ def stored_row(session: ScriptedSession) -> Any:
     ).fetchone()
 
 
+def row_after_closing(session: ScriptedSession) -> Any:
+    """The session's row, read through a connection of its own: the session closed its."""
+    assert session.store is not None
+    reader = Store(session.store.path)
+    reader.open()
+    try:
+        return reader.db.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session.session_id,)
+        ).fetchone()
+    finally:
+        reader.close()
+
+
 # --------------------------------------------------------------------------
 # The brief's own tests
 # --------------------------------------------------------------------------
@@ -1885,6 +1898,132 @@ async def test_closing_a_session_closes_its_clients_and_its_store(tmp_repo):
     assert session.store is not None
     with pytest.raises(RuntimeError, match="store is not open"):
         _ = session.store.db
+
+
+async def test_closing_after_a_prompt_that_failed_still_records_what_was_spent(tmp_repo):
+    # No prompt reached a stop, so nothing wrote the row. The round that was paid for
+    # still cost what it cost, and a session that is closed has ended.
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [
+            calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=1_000, output_tokens=100),
+            ModelError("bad gateway", retryable=False, status=502),
+        ],
+    )
+    with pytest.raises(ModelError, match="bad gateway"):
+        await session.run("read it")
+    assert stored_row(session)["ended_at"] is None
+    await session.aclose()
+    row = row_after_closing(session)
+    assert row["total_cost_usd"] == pytest.approx(0.003)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["ended_at"] is not None
+
+
+async def test_closing_after_a_cancelled_prompt_still_records_what_was_spent(tmp_repo, monkeypatch):
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=1_000, output_tokens=100)],
+    )
+    asked_again = asyncio.Event()
+    answer = session.model.complete
+
+    async def stops_answering(request: ModelRequest) -> ModelReply:
+        if session.model.requests:  # the first request was answered; this one never is
+            asked_again.set()
+            await asyncio.Event().wait()
+        return await answer(request)
+
+    monkeypatch.setattr(session.model, "complete", stops_answering)
+    task = asyncio.create_task(session.run("read it"))
+    await reached(asked_again)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await session.aclose()
+    row = row_after_closing(session)
+    assert row["total_cost_usd"] == pytest.approx(0.003)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["ended_at"] is not None
+
+
+async def test_the_row_is_finished_even_when_a_client_fails_to_close(tmp_repo, monkeypatch):
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [
+            calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=1_000, output_tokens=100),
+            ModelError("bad gateway", retryable=False, status=502),
+        ],
+    )
+    with pytest.raises(ModelError, match="bad gateway"):
+        await session.run("read it")
+
+    async def refuse() -> None:
+        raise RuntimeError("would not close")
+
+    monkeypatch.setattr(session.router, "aclose", refuse)
+    with pytest.raises(RuntimeError, match="would not close"):
+        await session.aclose()
+    row = row_after_closing(session)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["ended_at"] is not None
+
+
+async def test_the_row_is_written_before_the_clients_are_asked_to_close(tmp_repo, monkeypatch):
+    # Closing a client can be slow, or be interrupted; what was spent is not lost to that.
+    session = build_session(tmp_repo, [])
+    ended_when_asked: list[float | None] = []
+    close_clients = session.router.aclose
+
+    async def watching() -> None:
+        ended_when_asked.append(stored_row(session)["ended_at"])
+        await close_clients()
+
+    monkeypatch.setattr(session.router, "aclose", watching)
+    await session.aclose()
+    assert len(ended_when_asked) == 1 and ended_when_asked[0] is not None
+
+
+async def test_closing_again_after_a_close_that_failed_does_nothing(tmp_repo, monkeypatch):
+    # The failure was reported once. A cleanup that closes again must not trade it for
+    # a second, different one about a store that is already closed.
+    session = build_session(tmp_repo, [])
+
+    async def refuse() -> None:
+        raise RuntimeError("would not close")
+
+    monkeypatch.setattr(session.router, "aclose", refuse)
+    with pytest.raises(RuntimeError, match="would not close"):
+        await session.aclose()
+    await session.aclose()
+
+
+async def test_the_clients_and_the_store_are_closed_even_when_the_row_cannot_be_written(
+    tmp_repo, monkeypatch
+):
+    session = build_session(tmp_repo, [])
+    assert session.store is not None
+
+    def refuse(*_args: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(session.store, "finish_session", refuse)
+    with pytest.raises(RuntimeError, match="disk full"):
+        await session.aclose()
+    assert session.model.closed
+    with pytest.raises(RuntimeError, match="store is not open"):
+        _ = session.store.db
+
+
+async def test_a_session_can_be_closed_twice(tmp_repo):
+    # A front end may close from its normal exit and from its cleanup.
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hello")
+    await session.aclose()
+    await session.aclose()
 
 
 async def test_the_store_is_closed_even_when_a_client_fails_to_close(tmp_repo, monkeypatch):

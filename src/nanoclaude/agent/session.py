@@ -148,6 +148,7 @@ class Session:
     # The messages the store holds for this session, as of the last _persist().
     _stored: tuple[Message, ...] = field(default=(), init=False, repr=False)
     _call_ids: count[int] = field(default_factory=lambda: count(1), init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Empty rather than a placeholder prompt: follow_up() is a valid first
@@ -488,9 +489,22 @@ class Session:
         return used, budget.available()
 
     async def aclose(self) -> None:
-        """Close every client the router holds, then the store, even if a client would not close."""
+        """Record what the session spent, then close every client and the store.
+
+        A prompt that stops normally records it as it goes. One that failed or was
+        cancelled never reached that, so closing does it: the money for the rounds
+        that were paid for is spent either way. Whatever fails along the way, the
+        rest still happens. Closing twice is harmless: a front end may close from its
+        normal exit and from its cleanup.
+        """
+        if self._closed:
+            return
+        self._closed = True
         try:
-            await self.router.aclose()
+            try:
+                self._finish()
+            finally:
+                await self.router.aclose()
         finally:
             if self.store is not None:
                 self.store.close()
