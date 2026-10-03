@@ -2,8 +2,9 @@
 
 OpenAI, OpenRouter, Groq, DeepSeek, Together, Azure, vLLM, LM Studio and
 llama.cpp's server all do. Writing this against the *format* rather than
-against OpenAI is the highest reach-per-line decision in the project, so there
-is deliberately no vendor name in the logic.
+against OpenAI is the highest reach-per-line decision in the project, so vendor
+names stay out of the logic but for one choice: which parameter carries the
+output cap (see ``_COMPLETION_TOKENS_DOMAINS``).
 
 Two places where reality and the documentation differ, both handled:
 ``function.arguments`` is documented as a JSON string and is sometimes an
@@ -16,6 +17,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -47,6 +49,23 @@ _FINISH = {
 
 #: Providers disagree on where reasoning lives.
 _REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
+
+#: Domains whose hosts take max_completion_tokens: OpenAI's own API with its
+#: regional hosts (eu.api.openai.com and the like), and Azure OpenAI. There
+#: max_tokens is deprecated and reasoning models refuse it. The other servers
+#: this adapter talks to mostly know only max_tokens, so they keep it.
+_COMPLETION_TOKENS_DOMAINS = ("api.openai.com", "openai.azure.com")
+
+
+def _output_cap_parameter(base_url: str) -> str:
+    try:
+        host = (urlsplit(base_url).hostname or "").rstrip(".")
+    except ValueError:  # a malformed address, which the request itself reports
+        return "max_tokens"
+    first_party = any(
+        host == domain or host.endswith(f".{domain}") for domain in _COMPLETION_TOKENS_DOMAINS
+    )
+    return "max_completion_tokens" if first_party else "max_tokens"
 
 
 def parse_arguments(raw: Any) -> Mapping[str, Any]:
@@ -220,6 +239,7 @@ class OpenAICompatClient:
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(timeout=timeout_s)
         self._base_url = base_url.rstrip("/")
+        self._output_cap = _output_cap_parameter(base_url)
         self._headers = {"content-type": "application/json", "authorization": f"Bearer {api_key}"}
 
     @property
@@ -233,8 +253,7 @@ class OpenAICompatClient:
     def payload(self, request: ModelRequest) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self._model,
-            "max_tokens": request.max_output_tokens,
-            "temperature": request.temperature,
+            self._output_cap: request.max_output_tokens,
             "messages": [
                 {"role": "system", "content": request.system},
                 *encode_messages(request.transcript),
@@ -242,6 +261,8 @@ class OpenAICompatClient:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        if request.temperature is not None:
+            body["temperature"] = request.temperature
         if request.tools:
             body["tools"] = encode_tools(request.tools)
         return body

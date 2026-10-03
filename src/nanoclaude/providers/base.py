@@ -61,7 +61,9 @@ class ModelRequest:
     transcript: Transcript
     tools: Sequence[ToolSpec]
     max_output_tokens: int
-    temperature: float = 0.0
+    #: None sends no temperature at all, so the provider's default applies. Current
+    #: Claude models and OpenAI's reasoning models refuse any other value.
+    temperature: float | None = None
 
     # Embeds a Transcript and a sequence of ToolSpec, both declared unhashable
     # (see transcript.py and above) -- the same defect resurfacing one level

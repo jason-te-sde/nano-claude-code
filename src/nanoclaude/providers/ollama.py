@@ -122,11 +122,10 @@ class OllamaClient:
             "model": self._model,
             "messages": encode_messages(request.system, request.transcript),
             "stream": True,
-            "options": {
-                "temperature": request.temperature,
-                "num_predict": request.max_output_tokens,
-            },
+            "options": {"num_predict": request.max_output_tokens},
         }
+        if request.temperature is not None:
+            body["options"]["temperature"] = request.temperature
         if request.tools:
             body["tools"] = encode_tools(request.tools)
         return body

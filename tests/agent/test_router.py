@@ -530,8 +530,8 @@ def test_a_role_usage_is_a_hashable_snapshot():
 
 async def test_a_known_models_capabilities_come_from_the_table(make):
     caps = await make(config_with()).capabilities_for("main")
-    assert caps.context_window == 200_000
-    assert caps.max_output == 32_000
+    assert caps.context_window == 1_000_000
+    assert caps.max_output == 128_000
     assert caps.native_tools is True
 
 
@@ -545,7 +545,8 @@ async def test_what_the_config_says_beats_what_the_table_says(make):
     caps = await make(config).capabilities_for("main")
     assert caps.context_window == 64_000
     assert caps.native_tools is False
-    assert caps.max_output == 32_000  # not overridden, so still the table's
+    # Not set in the config, but bounded by the window that was: a quarter of it.
+    assert caps.max_output == 16_000
 
 
 async def test_an_ollama_model_is_probed_once_at_its_own_server_and_remembered(make, monkeypatch):

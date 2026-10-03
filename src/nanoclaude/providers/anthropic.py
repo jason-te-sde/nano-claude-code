@@ -279,11 +279,12 @@ class AnthropicClient:
         body: dict[str, Any] = {
             "model": self._model,
             "max_tokens": request.max_output_tokens,
-            "temperature": request.temperature,
             "system": system,
             "messages": encode_messages(request.transcript),
             "stream": True,
         }
+        if request.temperature is not None:
+            body["temperature"] = request.temperature
         if tools:
             body["tools"] = tools
         return body
