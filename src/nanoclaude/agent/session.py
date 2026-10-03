@@ -367,6 +367,8 @@ class Session:
     async def compact(self, instructions: str | None = None) -> None:
         """Summarise the older part of the conversation now: the ``/compact`` command."""
         self._mend()
+        # The summary may never arrive, and the store holds what the model is shown.
+        self._persist()
         capabilities = await self.router.capabilities_for("main")
         await self._compact_fully(capabilities, instructions)
 

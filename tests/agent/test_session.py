@@ -1635,6 +1635,33 @@ async def test_compacting_right_after_an_interrupted_tool_does_not_trip_on_the_o
     assert not session.state.transcript.pending_tool_uses()
 
 
+async def test_compacting_after_an_interrupted_turn_stores_the_repair_before_asking_for_a_summary(
+    tmp_repo,
+):
+    # A provider error cut the turn short, so the conversation ends on results the
+    # model never answered. compact() closes that with a note before it asks for a
+    # summary. The store holds what the model is shown, so the note is stored then,
+    # not after a summary that may never come.
+    (tmp_repo / "a.py").write_text("x\n")
+    reads = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(4)]
+    session = build_session(
+        tmp_repo,
+        [
+            *reads,
+            ModelError("bad gateway", retryable=False, status=502),
+            ModelError("summary refused", retryable=False, status=400),
+        ],
+    )
+    with pytest.raises(ModelError, match="bad gateway"):
+        await session.run("read it")
+    with pytest.raises(ModelError, match="could not summarise"):
+        await session.compact()
+    assert session.store is not None
+    stored = session.store.load_transcript(session.session_id)
+    assert "interrupted" in stored.messages[-1].text().lower()
+    assert stored == session.state.transcript
+
+
 async def test_each_prompt_gets_the_whole_turn_limit(tmp_repo):
     # Two turns allowed: one tool round and then the answer. Each follow_up uses both.
     (tmp_repo / "a.py").write_text("x\n")
