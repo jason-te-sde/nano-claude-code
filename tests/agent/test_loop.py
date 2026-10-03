@@ -17,6 +17,7 @@ from nanoclaude.agent.loop import (
 )
 from nanoclaude.conversation.transcript import Transcript, validate
 from nanoclaude.testing.scripted import calls, calls_many, says
+from nanoclaude.tools.base import ToolOutcome
 
 
 class FakeOutcome:
@@ -47,6 +48,20 @@ def test_a_tool_reply_asks_for_the_calls():
     outcome = step(start("hi"), calls("Read", {"path": "a.py"}, call_id="t1"))
     assert isinstance(outcome, RunTools)
     assert [c.id for c in outcome.calls] == ["t1"]
+
+
+def test_observe_takes_the_real_tool_outcome_and_not_only_a_stand_in():
+    # Observation says ToolOutcome satisfies it, and nothing checked that: every
+    # other test here passes FakeOutcome, a class whose fields can be assigned.
+    # ToolOutcome is a frozen dataclass, whose cannot, so a protocol of plain
+    # attributes is refused by mypy --strict at the one call that matters, the
+    # session's. This is that call, typed.
+    outcomes: tuple[ToolOutcome, ...] = (ToolOutcome("t1", "1\tx = 1"),)
+    outcome = step(start("hi"), calls("Read", {"path": "a.py"}, call_id="t1"))
+    state = observe(outcome.state, outcomes)
+    assert state.turn == 1
+    last = state.transcript.last()
+    assert last is not None and last.tool_results()[0].content == "1\tx = 1"
 
 
 def test_observe_advances_the_turn_and_records_what_was_seen():

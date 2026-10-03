@@ -42,12 +42,23 @@ class StopReason(StrEnum):
 
 @runtime_checkable
 class Observation(Protocol):
-    """What :func:`observe` needs from a tool result. ``ToolOutcome`` satisfies it."""
+    """What :func:`observe` needs from a tool result. ``ToolOutcome`` satisfies it.
 
-    tool_use_id: str
-    content: str
-    is_error: bool
-    observed: tuple[tuple[str, Any], ...]
+    Read-only, because observe() only reads them. Plain attributes would declare
+    them settable, which a frozen dataclass such as ``ToolOutcome`` is not.
+    """
+
+    @property
+    def tool_use_id(self) -> str: ...
+
+    @property
+    def content(self) -> str: ...
+
+    @property
+    def is_error(self) -> bool: ...
+
+    @property
+    def observed(self) -> tuple[tuple[str, Any], ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
