@@ -1101,6 +1101,49 @@ async def test_an_internal_error_from_a_permission_request_carries_no_terminal_c
     assert _free_of_escapes(outcomes[0].content)
 
 
+@pytest.mark.parametrize("where", ["permission_request", "run"])
+def test_a_real_keyboard_interrupt_in_a_tool_ends_the_batch_and_is_not_made_a_result(
+    policy, tmp_repo, monkeypatch, where
+):
+    """The stand-in the tests above use is a BaseException that is not an Exception.
+    KeyboardInterrupt is both of those things and one more: asyncio re-raises it out of
+    the task that raised it and through run_until_complete. Inside the event loop pytest
+    runs its async tests in, that would end the whole test run, so this one is a plain
+    test with a loop of its own."""
+    from nanoclaude.tools.read import ReadTool
+
+    def interrupted_request(
+        self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]
+    ) -> PermissionRequest:
+        raise KeyboardInterrupt
+
+    async def interrupted_run(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        ReadTool,
+        where,
+        interrupted_request if where == "permission_request" else interrupted_run,
+    )
+    (tmp_repo / "a.py").write_text("x")
+    batch = executor(policy).run_batch((ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi"))
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            loop.run_until_complete(batch)
+    finally:
+        # Whatever the interrupted batch left running is cancelled and finished before
+        # the loop goes, or the loop's closing would warn about it.
+        unfinished = asyncio.all_tasks(loop)
+        for task in unfinished:
+            task.cancel()
+        if unfinished:
+            loop.run_until_complete(asyncio.gather(*unfinished, return_exceptions=True))
+        loop.close()
+
+
 @pytest.mark.parametrize(
     "error",
     [

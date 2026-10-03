@@ -423,6 +423,21 @@ async def test_a_reply_of_only_complaints_is_asked_for_again_with_the_complaints
     assert "x = 1" in transcript_text(done.state.transcript)
 
 
+async def test_every_complaint_in_a_reply_is_fed_back_not_only_the_first(tmp_repo):
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    two_bad = '<tool name="Read">{"path": </tool>\n<tool name="Grep">{not json}</tool>'
+    session = build_session(
+        tmp_repo,
+        [says(two_bad), says('<tool name="Read">{"path": "a.py"}</tool>'), says("done")],
+        capabilities=TEXT_ONLY,
+    )
+    await session.run("go")
+    correction = session.model.requests[1].transcript.messages[-1].text()
+    complaints = [line for line in correction.splitlines() if line.startswith("- ")]
+    assert len(complaints) == 2
+    assert "Read" in complaints[0] and "Grep" in complaints[1]
+
+
 async def test_a_reply_of_only_complaints_is_retried_at_most_the_limit_and_then_stops(tmp_repo):
     script = [says(f"{BAD_CALL} attempt {n}") for n in range(MAX_PARSE_RETRIES + 3)]
     session = build_session(tmp_repo, script, capabilities=TEXT_ONLY)
@@ -590,6 +605,23 @@ async def test_asking_again_in_the_middle_of_a_prompt_does_not_give_its_turns_ba
     assert done.reason is StopReason.TURN_LIMIT
     assert len(session.model.requests) == 4
     assert not session.model.exhausted
+
+
+async def test_under_the_text_protocol_the_ui_is_shown_the_reply_as_parsed(tmp_repo):
+    # The person sees the call the model made, not the markup it wrote it in.
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    watcher = Watcher()
+    session = build_session(
+        tmp_repo,
+        [says('<tool name="Read">{"path": "a.py"}</tool>'), says("done")],
+        capabilities=TEXT_ONLY,
+        ui=watcher,
+    )
+    await session.run("go")
+    shown = watcher.replies[0]
+    [call] = [b for b in shown.blocks if isinstance(b, ToolUseBlock)]
+    assert (call.name, dict(call.arguments)) == ("Read", {"path": "a.py"})
+    assert shown.stop is StopKind.TOOL_USE
 
 
 async def test_a_model_with_native_tools_is_never_asked_again_for_a_text_call(tmp_repo):
@@ -805,6 +837,24 @@ async def test_the_context_figure_counts_the_tool_definitions_a_request_carries(
     # The system prompt and, in some form, at least the descriptions of the tools.
     descriptions = "".join(spec.description for spec in request.tools)
     assert fixed >= counter.count(request.system) + counter.count(descriptions)
+
+
+async def test_the_fixed_part_of_the_context_is_the_system_prompt_and_the_tool_definitions_in_full(
+    tmp_repo,
+):
+    # The definitions count with their schemas, which are most of their size, and not
+    # only their names and descriptions.
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    request = session.model.requests[0]
+    session.state = replace(session.state, transcript=Transcript())
+    fixed, _ = await session.context_usage()
+    definitions = [
+        {"name": spec.name, "description": spec.description, "input_schema": dict(spec.schema)}
+        for spec in request.tools
+    ]
+    counter = HeuristicCounter()
+    assert fixed == counter.count(request.system) + counter.count(json.dumps(definitions))
 
 
 @pytest.mark.parametrize("capabilities", [None, TEXT_ONLY], ids=["native-tools", "text-protocol"])
