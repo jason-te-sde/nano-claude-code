@@ -32,6 +32,7 @@ coverage of the UI protocol's three concrete implementations.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Hashable, Mapping
 from pathlib import Path
 from typing import Any, Never
@@ -982,6 +983,89 @@ async def test_a_tool_whose_permission_request_raises_costs_one_call_not_the_bat
         ("t3", "rule.allow"),
     ]
     assert ui.outcomes.count("t2") == 1 and sorted(ui.outcomes) == ["t1", "t2", "t3"]
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        PermissionRequest("Read", None),  # type: ignore[arg-type]
+        PermissionRequest("Read", "b.py", resolved_paths=None),  # type: ignore[arg-type]
+    ],
+    ids=["subject-is-none", "resolved-paths-is-none"],
+)
+async def test_a_request_the_policy_cannot_evaluate_costs_one_call_not_the_batch(
+    policy, tmp_repo, monkeypatch, malformed
+):
+    """The tool answered its permission request, wrongly, and evaluating the answer is
+    what raises. That is the same failure as a tool that cannot answer: the call ends
+    as an error under tool.internal-error and does not run, and the rest of the batch
+    goes on. Left to escape, it would abort run_batch and leave the calls decided
+    before it, and the ones after it, pending."""
+    from nanoclaude.tools.read import ReadTool
+
+    for name, text in (("a.py", "alpha"), ("b.py", "bravo"), ("c.py", "charlie")):
+        (tmp_repo / name).write_text(f"{text}\n")
+    real_request, real_run = ReadTool.permission_request, ReadTool.run
+    ran: list[str] = []
+
+    def malformed_for_b(
+        self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]
+    ) -> PermissionRequest:
+        if arguments.get("path") == "b.py":
+            answer: PermissionRequest = malformed
+            return answer
+        return real_request(self, ctx, arguments)
+
+    async def tracking_run(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        ran.append(call_id)
+        return await real_run(self, ctx, call_id, arguments)
+
+    monkeypatch.setattr(ReadTool, "permission_request", malformed_for_b)
+    monkeypatch.setattr(ReadTool, "run", tracking_run)
+    ui, store = _Recorder(), _store(tmp_repo)
+    calls = (
+        ToolUseBlock("t1", "Read", {"path": "a.py"}),
+        ToolUseBlock("t2", "Read", {"path": "b.py"}),
+        ToolUseBlock("t3", "Read", {"path": "c.py"}),
+    )
+    outcomes = await executor(policy, ui, store).run_batch(calls, start("hi"))
+
+    assert [o.tool_use_id for o in outcomes] == ["t1", "t2", "t3"]
+    assert [o.is_error for o in outcomes] == [False, True, False]
+    assert "alpha" in outcomes[0].content and "charlie" in outcomes[2].content
+    assert sorted(ran) == ["t1", "t3"]  # the call whose request could not be judged never ran
+    # Which exception the policy raises depends on the field and on the Python; the form
+    # the model and the audit row get is the same for all of them.
+    assert re.match(r"Internal error in Read: (AttributeError|TypeError): ", outcomes[1].content)
+    assert "bug" in outcomes[1].content
+    row = _audit_row(store, "t2")
+    assert (row["decision"], row["rule"], row["outcome"]) == (
+        "deny",
+        "tool.internal-error",
+        "error",
+    )
+    assert re.match(r"(AttributeError|TypeError): ", row["error"]), dict(row)
+    assert [result.rule for _, result in ui.decisions] == [
+        "rule.allow",
+        "tool.internal-error",
+        "rule.allow",
+    ]
+
+
+async def test_an_exception_that_is_not_an_exception_still_propagates_from_the_policy(
+    policy, tmp_repo, monkeypatch
+):
+    def abort(request: PermissionRequest, *_rest: object) -> PermissionResult:
+        raise _Abort("stop everything")
+
+    monkeypatch.setattr("nanoclaude.agent.executor.evaluate", abort)
+    (tmp_repo / "a.py").write_text("x")
+    with pytest.raises(_Abort, match="stop everything"):
+        await executor(policy).run_batch(
+            (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+        )
 
 
 async def test_what_a_failing_permission_request_says_is_scrubbed_like_any_tool_output(

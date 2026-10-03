@@ -245,7 +245,15 @@ class Executor:
             # cancellation and KeyboardInterrupt still propagate.
             return self._crashed(call, exc, turn)
 
-        result = evaluate(request, self.policy, self.grants)
+        try:
+            result = evaluate(request, self.policy, self.grants)
+        except Exception as exc:
+            # The tool answered its question, and what it answered cannot be judged
+            # (a subject that is not a string, a list of paths that is not a list).
+            # That is the same failure as a tool that cannot answer, and it ends the
+            # call the same way: as an error under tool.internal-error, not run, with
+            # the batch going on.
+            return self._crashed(call, exc, turn)
         # A reason quotes what the model asked for (the path that is outside the
         # sandbox, the command that was refused).
         result = replace(result, reason=sanitize(result.reason))
