@@ -150,6 +150,41 @@ class SessionRow:
     total_output_tokens: int
 
 
+def _same_messages(
+    old: Sequence[tuple[str, str]], new: Sequence[tuple[str, str]]
+) -> list[tuple[int, int]]:
+    """Which messages two transcripts share: pairs of (index in old, index in new).
+
+    A replacement keeps messages in one of two shapes, and the shape says which. If
+    the number of messages is unchanged (a micro-compaction that shrank some tool
+    results) each position that holds the same message holds that message. If it
+    changed (compaction writes a summary and keeps the last turns, ``/clear`` keeps
+    nothing) what is kept is the run both begin with and the run both end with, matched
+    from the end.
+
+    Never by what a message says alone. The same "continue" can be there ten times, and
+    matching it by its words gives one copy the time of another, or leaves a message at
+    a position where an earlier copy happened to be. Position, from the front or from
+    the back, is what says which copy it is.
+    """
+    if len(old) == len(new):
+        return [
+            (i, i)
+            for i, (before, after) in enumerate(zip(old, new, strict=True))
+            if before == after
+        ]
+    shortest = min(len(old), len(new))
+    start = 0
+    while start < shortest and old[start] == new[start]:
+        start += 1
+    end = 0
+    while end < shortest - start and old[-1 - end] == new[-1 - end]:
+        end += 1
+    return [(i, i) for i in range(start)] + [
+        (len(old) - end + j, len(new) - end + j) for j in range(end)
+    ]
+
+
 class Store:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
@@ -225,7 +260,7 @@ class Store:
         copied to ``messages_archive``: a row is archived when its position now
         holds another message, or none. Rows that did not change are not touched,
         and a message that moves to another position keeps the time it was first
-        stored.
+        stored (see :func:`_same_messages` for which messages those are).
 
         Archiving, deleting and inserting are one transaction, so a failure part-way
         (a value the table refuses, a full disk) leaves the old transcript in place
@@ -239,16 +274,13 @@ class Store:
                 "WHERE session_id = ? ORDER BY seq",
                 (session_id,),
             ).fetchall()
-            unchanged = {
-                row["seq"]
-                for row in live
-                if row["seq"] < len(wanted)
-                and (row["role"], row["blocks_json"]) == wanted[row["seq"]]
-            }
-            removed = [(row["seq"], row) for row in live if row["seq"] not in unchanged]
-            first_stored: dict[tuple[str, str], float] = {}
-            for _, row in removed:
-                first_stored.setdefault((row["role"], row["blocks_json"]), row["created_at"])
+            pairs = _same_messages([(row["role"], row["blocks_json"]) for row in live], wanted)
+            # A pair whose row is already at its position stays; the others are moves.
+            stays = [(i, at) for i, at in pairs if live[i]["seq"] == at]
+            moved = {at: live[i]["created_at"] for i, at in pairs if live[i]["seq"] != at}
+            staying_rows = {i for i, _ in stays}
+            staying_positions = {at for _, at in stays}
+            removed = [(row["seq"], row) for i, row in enumerate(live) if i not in staying_rows]
             self._archive(session_id, removed, now)
             self.db.executemany(
                 "DELETE FROM messages WHERE session_id = ? AND seq = ?",
@@ -258,9 +290,9 @@ class Store:
                 "INSERT INTO messages (session_id, seq, role, blocks_json, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
                 [
-                    (session_id, seq, role, blocks_json, first_stored.get((role, blocks_json), now))
-                    for seq, (role, blocks_json) in enumerate(wanted)
-                    if seq not in unchanged
+                    (session_id, at, role, blocks_json, moved.get(at, now))
+                    for at, (role, blocks_json) in enumerate(wanted)
+                    if at not in staying_positions
                 ],
             )
 

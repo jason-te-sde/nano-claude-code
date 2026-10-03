@@ -19,11 +19,13 @@ a delay of a millisecond, and cancellation is driven with events.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1508,6 +1510,38 @@ async def test_micro_compaction_archives_the_full_results_it_shrank_and_only_tho
     assert session.store.load_transcript(session.session_id) == done.state.transcript
     # Three results fall outside the recent turns; their messages are indexes 2, 4 and 6.
     assert archived_messages(session) == [history.messages[i] for i in (2, 4, 6)]
+
+
+async def test_compacting_a_conversation_of_repeated_messages_keeps_each_kept_message_its_time(
+    tmp_repo, monkeypatch
+):
+    # The person types "continue" at every turn. Compaction keeps the last two turns, and
+    # the messages it keeps are the ones that were last, whatever else is the same.
+    ticks = itertools.count(1)
+    monkeypatch.setattr(
+        "nanoclaude.conversation.store.time", SimpleNamespace(time=lambda: float(next(ticks)))
+    )
+    script = [says("r1"), says("r2"), says("r3"), says("r4"), says("SUMMARY")]
+    session = build_session(tmp_repo, script, keep_recent_turns=2)
+    await session.run("continue")
+    for _ in range(3):
+        await session.follow_up("continue")
+    assert session.store is not None
+
+    def times() -> list[float]:
+        assert session.store is not None
+        rows = session.store.db.execute(
+            "SELECT created_at FROM messages WHERE session_id = ? ORDER BY seq",
+            (session.session_id,),
+        ).fetchall()
+        return [row["created_at"] for row in rows]
+
+    before = times()
+    await session.compact()
+    after = times()
+    # [continue, r1, continue, r2, continue, r3, continue, r4] became [summary, r3, continue, r4].
+    assert len(before) == 8 and len(after) == 4
+    assert after[1:] == before[5:]
 
 
 async def test_everything_a_session_ever_stored_is_in_the_live_rows_or_the_archive(

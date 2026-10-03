@@ -387,9 +387,11 @@ def test_a_message_that_moves_to_another_position_keeps_the_time_it_was_first_st
     assert _live_times(store, "s1") == {0: 8.0, 1: 5.0, 2: 6.0, 3: 7.0}
 
 
-def test_a_message_that_comes_back_more_than_once_keeps_the_earliest_time_it_was_stored(
+def test_the_last_copy_of_a_message_that_comes_back_is_the_one_a_replacement_keeps(
     tmp_path, monkeypatch
 ):
+    # What a replacement keeps it keeps from the end: the compaction that wrote it kept
+    # the latest messages, so a message with several copies is the latest of them.
     _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
     store = Store(tmp_path / "s.db")
     store.open()
@@ -401,7 +403,62 @@ def test_a_message_that_comes_back_more_than_once_keeps_the_earliest_time_it_was
     store.replace_transcript("s1", longer)  # tick 8
 
     assert store.load_transcript("s1") == longer
-    assert _live_times(store, "s1")[7] == 3.0
+    assert _live_times(store, "s1")[7] == 7.0
+
+
+def test_a_repeated_message_that_compaction_keeps_has_its_own_time_and_not_an_earlier_copys(
+    tmp_path, monkeypatch
+):
+    # "continue" typed twice, at ticks 2 and 6, and compaction keeps the later one.
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    old = _transcript("continue", "r1", "q", "r2", "continue", "r3")
+    for seq, message in enumerate(old.messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 7
+
+    kept = _transcript("summary", "r2", "continue", "r3")
+    store.replace_transcript("s1", kept)  # tick 8
+
+    assert store.load_transcript("s1") == kept
+    assert _live_times(store, "s1") == {0: 8.0, 1: 5.0, 2: 6.0, 3: 7.0}
+    # Every message left the position it was at, the kept ones for their new ones.
+    assert _archived(store, "s1") == list(enumerate(old.messages))
+
+
+def test_a_message_repeated_at_every_turn_keeps_its_own_time_through_compaction(
+    tmp_path, monkeypatch
+):
+    # Every user message is "continue", so the one compaction keeps is also what already
+    # sat at the position it moves to. Matching by what a message says would leave it
+    # there, with the time of an earlier copy, and the times would run out of order.
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    old = _transcript("continue", "r1", "continue", "r2", "continue", "r3", "continue", "r4")
+    for seq, message in enumerate(old.messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 9
+
+    store.replace_transcript("s1", _transcript("summary", "r3", "continue", "r4"))  # tick 10
+
+    assert _live_times(store, "s1") == {0: 10.0, 1: 7.0, 2: 8.0, 3: 9.0}
+
+
+def test_a_shorter_replacement_leaves_the_rows_it_starts_with_alone(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    old = _transcript("a", "b", "c", "d")
+    for seq, message in enumerate(old.messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 5
+
+    store.replace_transcript("s1", _transcript("a", "b", "X"))  # tick 6
+
+    assert _live_times(store, "s1") == {0: 2.0, 1: 3.0, 2: 6.0}
+    assert _archived(store, "s1") == [(2, old.messages[2]), (3, old.messages[3])]
 
 
 def test_a_row_whose_role_changed_is_replaced_even_when_its_text_did_not(tmp_path):
