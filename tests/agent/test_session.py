@@ -38,7 +38,7 @@ from nanoclaude.conversation.budget import (
     transcript_text,
 )
 from nanoclaude.conversation.compaction import SUMMARY_TEMPLATE
-from nanoclaude.conversation.store import Store
+from nanoclaude.conversation.store import Store, decode_blocks
 from nanoclaude.conversation.transcript import (
     Message,
     TextBlock,
@@ -160,6 +160,16 @@ def stored_row(session: ScriptedSession) -> Any:
     return session.store.db.execute(
         "SELECT * FROM sessions WHERE id = ?", (session.session_id,)
     ).fetchone()
+
+
+def archived_messages(session: ScriptedSession) -> list[Message]:
+    """What the store moved out of the live transcript, in the order it was moved."""
+    assert session.store is not None
+    rows = session.store.db.execute(
+        "SELECT role, blocks_json FROM messages_archive WHERE session_id = ? ORDER BY rowid",
+        (session.session_id,),
+    ).fetchall()
+    return [Message(row["role"], decode_blocks(row["blocks_json"])) for row in rows]
 
 
 def row_after_closing(session: ScriptedSession) -> Any:
@@ -1390,6 +1400,76 @@ async def test_a_conversation_replaced_from_outside_is_stored_as_the_new_one(tmp
     reloaded = session.store.load_transcript(session.session_id)
     assert [m.text() for m in reloaded.messages] == ["second question", "second answer"]
     assert reloaded == done.state.transcript
+
+
+async def test_a_full_compaction_leaves_the_messages_it_replaced_in_the_archive(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    reads = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(4)]
+    session = build_session(tmp_repo, [*reads, says("done"), says("SUMMARY")])
+    before = (await session.run("read it")).state.transcript
+    await session.compact()
+    assert session.store is not None
+    live = session.store.load_transcript(session.session_id)
+    assert live == session.state.transcript  # the live rows are what the model is shown
+    archived = archived_messages(session)
+    assert before.messages[0] in archived  # the request the summary replaced
+    assert all(message in (*live.messages, *archived) for message in before.messages)
+
+
+async def test_a_conversation_replaced_from_outside_is_archived_not_lost(tmp_repo):
+    session = build_session(tmp_repo, [says("first answer"), says("second answer")])
+    first = await session.run("first question")
+    session.state = replace(session.state, transcript=Transcript(), turn=0)
+    done = await session.follow_up("second question")
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+    assert archived_messages(session) == list(first.state.transcript.messages)
+
+
+async def test_micro_compaction_archives_the_full_results_it_shrank_and_only_those(tmp_repo):
+    session = build_session(tmp_repo, [says("answer")], compact_soft=0.0001, compact_hard=0.9999)
+    history = tool_history(5, result_chars=400)
+    session.state = replace(session.state, transcript=history)
+    done = await session.follow_up("what next")
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+    # Three results fall outside the recent turns; their messages are indexes 2, 4 and 6.
+    assert archived_messages(session) == [history.messages[i] for i in (2, 4, 6)]
+
+
+async def test_everything_a_session_ever_stored_is_in_the_live_rows_or_the_archive(
+    tmp_repo, monkeypatch
+):
+    stored: list[Message] = []
+    real_append, real_replace = Store.append_message, Store.replace_transcript
+
+    def recording_append(self: Store, session_id: str, seq: int, message: Message) -> None:
+        stored.append(message)
+        real_append(self, session_id, seq, message)
+
+    def recording_replace(self: Store, session_id: str, transcript: Transcript) -> None:
+        stored.extend(transcript.messages)
+        real_replace(self, session_id, transcript)
+
+    monkeypatch.setattr(Store, "append_message", recording_append)
+    monkeypatch.setattr(Store, "replace_transcript", recording_replace)
+    (tmp_repo / "a.py").write_text("x\n")
+    reads = [calls("Read", {"path": "a.py"}, call_id=f"t{i}") for i in range(4)]
+    session = build_session(
+        tmp_repo, [*reads, says("done"), says("SUMMARY"), says("after the summary"), says("fresh")]
+    )
+    await session.run("read it")
+    await session.compact()
+    await session.follow_up("and then?")
+    session.state = replace(session.state, transcript=Transcript(), turn=0)
+    await session.follow_up("a fresh start")
+
+    assert session.store is not None
+    live = session.store.load_transcript(session.session_id)
+    assert live == session.state.transcript
+    archived = archived_messages(session)
+    assert archived  # the compaction and the clear each removed something
+    assert all(message in (*live.messages, *archived) for message in stored)
 
 
 async def test_each_message_is_written_once_and_a_plain_conversation_is_never_rewritten(

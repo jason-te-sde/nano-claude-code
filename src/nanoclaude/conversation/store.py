@@ -4,6 +4,13 @@ The schema is spec 17.8 verbatim and the column names are a contract: the audit
 CLI reads them, and a database written by one version is opened by the next.
 Migrations are additive only.
 
+One table is added to it: ``messages_archive``. ``messages`` is the transcript the
+model is shown, which is what a resumed session reloads, so compaction and
+``/clear`` have to replace its rows. The audit trail is append-only, so a row a
+replacement removes or changes is moved to the archive, with the time it was
+archived, in the same transaction. Between them the two tables hold every message
+ever stored.
+
 ``total_cost_usd`` is NULL when the cost is not known: a model with no price, or
 a session that has not finished. It is never 0 in those cases, because a zero
 reads as free and that is the one answer known to be wrong. The column was
@@ -56,6 +63,16 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at REAL NOT NULL,
     PRIMARY KEY (session_id, seq)
 );
+CREATE TABLE IF NOT EXISTS messages_archive (
+    session_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    blocks_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    archived_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_archive_session
+    ON messages_archive(session_id, archived_at);
 CREATE TABLE IF NOT EXISTS tool_calls (
     session_id TEXT NOT NULL,
     turn INTEGER NOT NULL,
@@ -165,14 +182,31 @@ class Store:
         self.db.commit()
 
     def append_message(self, session_id: str, seq: int, message: Message) -> None:
-        self.db.execute(
-            "INSERT OR REPLACE INTO messages (session_id, seq, role, blocks_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (session_id, seq, message.role, encode_blocks(message.blocks), time.time()),
-        )
-        self.db.commit()
+        """Store ``message`` as the message at ``seq``.
+
+        A different message already stored at ``seq`` is archived, not overwritten:
+        the audit trail only grows. The same message again changes nothing.
+        """
+        role, blocks_json = message.role, encode_blocks(message.blocks)
+        now = time.time()
+        with self.db:
+            stored = self.db.execute(
+                "SELECT role, blocks_json, created_at FROM messages "
+                "WHERE session_id = ? AND seq = ?",
+                (session_id, seq),
+            ).fetchone()
+            if stored is not None:
+                if (stored["role"], stored["blocks_json"]) == (role, blocks_json):
+                    return
+                self._archive(session_id, [(seq, stored)], now)
+            self.db.execute(
+                "INSERT OR REPLACE INTO messages "
+                "(session_id, seq, role, blocks_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                (session_id, seq, role, blocks_json, now),
+            )
 
     def load_transcript(self, session_id: str) -> Transcript:
+        """The live messages: the transcript the model is shown, not the archive."""
         rows = self.db.execute(
             "SELECT role, blocks_json FROM messages WHERE session_id = ? ORDER BY seq",
             (session_id,),
@@ -182,26 +216,66 @@ class Store:
         )
 
     def replace_transcript(self, session_id: str, transcript: Transcript) -> None:
-        """Make the stored messages exactly ``transcript``.
+        """Make the live messages exactly ``transcript``, and keep what that removes.
 
         Compaction and ``/clear`` replace a transcript instead of extending it.
         Inserting the new rows over the old ones would leave the old tail behind,
         and the session would reload as a summary followed by the messages it
-        replaced. The delete and the inserts are one transaction, so a failure
-        part-way (a message that cannot be encoded, a full disk) leaves the old
-        transcript in place, not an empty or half-replaced one.
+        replaced. So the rows that no longer belong are deleted, and each is first
+        copied to ``messages_archive``: a row is archived when its position now
+        holds another message, or none. Rows that did not change are not touched,
+        and a message that moves to another position keeps the time it was first
+        stored.
+
+        Archiving, deleting and inserting are one transaction, so a failure part-way
+        (a value the table refuses, a full disk) leaves the old transcript in place
+        and the archive as it was.
         """
+        wanted = [(m.role, encode_blocks(m.blocks)) for m in transcript.messages]
         now = time.time()
         with self.db:
-            self.db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            live = self.db.execute(
+                "SELECT seq, role, blocks_json, created_at FROM messages "
+                "WHERE session_id = ? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+            unchanged = {
+                row["seq"]
+                for row in live
+                if row["seq"] < len(wanted)
+                and (row["role"], row["blocks_json"]) == wanted[row["seq"]]
+            }
+            removed = [(row["seq"], row) for row in live if row["seq"] not in unchanged]
+            first_stored: dict[tuple[str, str], float] = {}
+            for _, row in removed:
+                first_stored.setdefault((row["role"], row["blocks_json"]), row["created_at"])
+            self._archive(session_id, removed, now)
+            self.db.executemany(
+                "DELETE FROM messages WHERE session_id = ? AND seq = ?",
+                [(session_id, seq) for seq, _ in removed],
+            )
             self.db.executemany(
                 "INSERT INTO messages (session_id, seq, role, blocks_json, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (
-                    (session_id, seq, message.role, encode_blocks(message.blocks), now)
-                    for seq, message in enumerate(transcript.messages)
-                ),
+                [
+                    (session_id, seq, role, blocks_json, first_stored.get((role, blocks_json), now))
+                    for seq, (role, blocks_json) in enumerate(wanted)
+                    if seq not in unchanged
+                ],
             )
+
+    def _archive(
+        self, session_id: str, rows: Sequence[tuple[int, sqlite3.Row]], archived_at: float
+    ) -> None:
+        self.db.executemany(
+            "INSERT INTO messages_archive "
+            "(session_id, seq, role, blocks_json, created_at, archived_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (session_id, seq, row["role"], row["blocks_json"], row["created_at"], archived_at)
+                for seq, row in rows
+            ],
+        )
 
     def finish_session(self, session_id: str, usage: Usage, cost_usd: float | None) -> None:
         """Record what a session used. ``None`` is stored as NULL: cost not known."""

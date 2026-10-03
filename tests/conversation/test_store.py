@@ -5,6 +5,7 @@ into the repository itself.
 """
 
 import json
+import sqlite3
 from collections.abc import Hashable
 from types import SimpleNamespace
 
@@ -246,8 +247,8 @@ def test_a_replacement_that_cannot_be_stored_changes_nothing(tmp_path):
     original = _transcript("a", "b", "c")
     store.replace_transcript("s1", original)
 
-    # The first message encodes fine and the second cannot, so by the time it
-    # fails the old rows are already deleted and the first new one inserted.
+    # The first message encodes fine and the second cannot. Nothing is changed:
+    # the next test makes the failure come after the first changes were made.
     unstorable = Transcript(
         (original.messages[0], Message("assistant", (TextBlock(object()),)))  # type: ignore[arg-type]
     )
@@ -255,6 +256,221 @@ def test_a_replacement_that_cannot_be_stored_changes_nothing(tmp_path):
         store.replace_transcript("s1", unstorable)
 
     assert store.load_transcript("s1") == original
+
+
+# -- the archive: what a replacement removes is kept ---------------------------
+
+
+def _archived(store: Store, session_id: str) -> list[tuple[int, Message]]:
+    """The archived rows of a session in the order they were archived, as (seq, message)."""
+    rows = store.db.execute(
+        "SELECT seq, role, blocks_json FROM messages_archive WHERE session_id = ? ORDER BY rowid",
+        (session_id,),
+    ).fetchall()
+    return [(row["seq"], Message(row["role"], decode_blocks(row["blocks_json"]))) for row in rows]
+
+
+def _live_times(store: Store, session_id: str) -> dict[int, float]:
+    rows = store.db.execute(
+        "SELECT seq, created_at FROM messages WHERE session_id = ? ORDER BY seq", (session_id,)
+    ).fetchall()
+    return {row["seq"]: row["created_at"] for row in rows}
+
+
+def _stored_six(store: Store) -> Transcript:
+    store.create_session("s1", cwd="/p", roles={})
+    stored = _transcript("a", "b", "c", "d", "e", "f")
+    for seq, message in enumerate(stored.messages):
+        store.append_message("s1", seq, message)
+    return stored
+
+
+def test_what_a_replacement_removes_is_moved_to_the_archive_and_not_lost(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    old = _stored_six(store)
+
+    shorter = _transcript("summary", "kept")
+    store.replace_transcript("s1", shorter)
+
+    assert store.load_transcript("s1") == shorter  # the live rows are the working transcript
+    assert _archived(store, "s1") == list(enumerate(old.messages))
+
+
+def test_the_archive_and_the_live_rows_hold_every_message_ever_stored(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    ever = list(_stored_six(store).messages)
+    for replacement in (
+        _transcript("summary", "kept", "next"),
+        _transcript("second summary", "last"),
+        Transcript(),
+    ):
+        store.replace_transcript("s1", replacement)
+        ever.extend(replacement.messages)
+    live = store.load_transcript("s1").messages
+    archived = [message for _, message in _archived(store, "s1")]
+    assert all(message in (*live, *archived) for message in ever)
+
+
+def test_rows_a_replacement_leaves_as_they_were_keep_their_time_and_are_not_archived(
+    tmp_path, monkeypatch
+):
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    for seq, message in enumerate(_transcript("a", "b", "c", "d").messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 5
+
+    changed = _transcript("a", "b", "X", "Y")
+    store.replace_transcript("s1", changed)  # tick 6
+
+    assert store.load_transcript("s1") == changed
+    assert _live_times(store, "s1") == {0: 2.0, 1: 3.0, 2: 6.0, 3: 6.0}
+    assert [seq for seq, _ in _archived(store, "s1")] == [2, 3]
+
+
+def test_a_message_that_moves_to_another_position_keeps_the_time_it_was_first_stored(
+    tmp_path, monkeypatch
+):
+    # Compaction renumbers the messages it keeps. They are the same messages.
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    for seq, message in enumerate(_transcript("a", "b", "c", "d", "e", "f").messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 7: d, e, f at 5, 6, 7
+
+    store.replace_transcript("s1", _transcript("summary", "d", "e", "f"))  # tick 8
+
+    assert _live_times(store, "s1") == {0: 8.0, 1: 5.0, 2: 6.0, 3: 7.0}
+
+
+def test_a_message_that_comes_back_more_than_once_keeps_the_earliest_time_it_was_stored(
+    tmp_path, monkeypatch
+):
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    for seq, message in enumerate(_transcript("x", "ok", "y", "ok", "z", "ok").messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 7: "ok" at 3, 5 and 7
+
+    longer = _transcript("s", "p", "q", "r", "t", "u", "v", "ok")  # "ok" moves to position 7
+    store.replace_transcript("s1", longer)  # tick 8
+
+    assert store.load_transcript("s1") == longer
+    assert _live_times(store, "s1")[7] == 3.0
+
+
+def test_a_row_whose_role_changed_is_replaced_even_when_its_text_did_not(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    was = Message("user", (TextBlock("same words"),))
+    now = Message("assistant", (TextBlock("same words"),))
+    store.append_message("s1", 0, was)
+    store.replace_transcript("s1", Transcript((now,)))
+    assert store.load_transcript("s1").messages == (now,)
+    assert _archived(store, "s1") == [(0, was)]
+
+
+def test_a_replacement_stamps_a_row_that_changed_at_the_time_of_the_replacement(
+    tmp_path, monkeypatch
+):
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    store.append_message("s1", 0, _transcript("a").messages[0])  # tick 2
+    store.replace_transcript("s1", _transcript("b"))  # tick 3
+    assert _live_times(store, "s1") == {0: 3.0}
+    archived_at = store.db.execute(
+        "SELECT created_at, archived_at FROM messages_archive"
+    ).fetchall()
+    assert [(row["created_at"], row["archived_at"]) for row in archived_at] == [(2.0, 3.0)]
+
+
+def test_a_replacement_that_cannot_be_stored_part_way_leaves_both_tables_as_they_were(tmp_path):
+    # The first row is kept and the second is archived and deleted before the third
+    # is refused: a role the table will not take. All of it is one transaction.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    original = _transcript("a", "b", "c")
+    store.replace_transcript("s1", original)
+    before = store.db.execute("SELECT * FROM messages ORDER BY seq").fetchall()
+
+    refused = Transcript(
+        (
+            original.messages[0],
+            Message("assistant", (TextBlock("changed"),)),
+            Message(None, (TextBlock("no role"),)),  # type: ignore[arg-type]
+        )
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        store.replace_transcript("s1", refused)
+
+    assert store.load_transcript("s1") == original
+    assert [tuple(row) for row in store.db.execute("SELECT * FROM messages ORDER BY seq")] == [
+        tuple(row) for row in before
+    ]
+    assert _archived(store, "s1") == []
+
+
+def test_replacing_one_sessions_transcript_archives_nothing_of_another(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s2", cwd="/p", roles={})
+    store.replace_transcript("s2", _transcript("x", "y", "z"))
+    old = _stored_six(store)
+    store.replace_transcript("s1", _transcript("only"))
+    assert store.load_transcript("s2") == _transcript("x", "y", "z")
+    assert _archived(store, "s2") == []
+    assert _archived(store, "s1") == list(enumerate(old.messages))  # none of s2's among them
+
+
+def test_writing_a_different_message_over_a_stored_one_archives_the_old_one(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    first, second = _transcript("a", "b").messages
+    store.append_message("s1", 0, first)
+    store.append_message("s1", 0, second)
+    assert store.load_transcript("s1").messages == (second,)
+    assert _archived(store, "s1") == [(0, first)]
+
+
+def test_writing_the_message_that_is_already_stored_changes_nothing(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    message = _transcript("a").messages[0]
+    store.append_message("s1", 0, message)  # tick 2
+    store.append_message("s1", 0, message)  # tick 3
+    assert _live_times(store, "s1") == {0: 2.0}
+    assert _archived(store, "s1") == []
+
+
+def test_a_database_made_before_the_archive_existed_gains_it_and_keeps_its_data(tmp_path):
+    path = tmp_path / "s.db"
+    earlier = Store(path)
+    earlier.open()
+    earlier.create_session("s1", cwd="/p", roles={})
+    kept = _transcript("a", "b")
+    for seq, message in enumerate(kept.messages):
+        earlier.append_message("s1", seq, message)
+    earlier.db.execute("DROP TABLE messages_archive")  # what a build without it left behind
+    earlier.db.commit()
+    earlier.close()
+
+    later = Store(path)
+    later.open()
+    assert later.load_transcript("s1") == kept
+    later.replace_transcript("s1", _transcript("summary"))
+    assert [seq for seq, _ in _archived(later, "s1")] == [0, 1]
 
 
 def test_opening_an_existing_database_does_not_lose_data(tmp_path):
