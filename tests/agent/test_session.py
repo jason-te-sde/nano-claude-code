@@ -406,10 +406,12 @@ async def test_a_reply_of_only_complaints_is_retried_at_most_the_limit_and_then_
     # The first ask and MAX_PARSE_RETRIES more; the rest of the script is never used.
     assert len(session.model.requests) == MAX_PARSE_RETRIES + 1
     assert not session.model.exhausted
-    # It stops with the last reply, complaints and all, as a finished turn.
-    assert done.reason is StopReason.COMPLETED
-    assert f"attempt {MAX_PARSE_RETRIES}" in done.text
-    assert "[tool protocol]" in done.text
+    # It gives up (the reason and what the person is told are pinned below), and the
+    # transcript ends on the last reply, complaints and all.
+    assert done.reason is StopReason.MODEL_UNSUITABLE
+    last = done.state.transcript.last()
+    assert last is not None and last.role == "assistant"
+    assert f"attempt {MAX_PARSE_RETRIES}" in last.text() and "[tool protocol]" in last.text()
     validate(done.state.transcript)
 
 
@@ -443,6 +445,84 @@ async def test_the_parse_retry_limit_counts_failures_in_a_row_not_in_a_session(t
     assert done.text == "finished"
     assert session.model.exhausted
     assert len(session.model.requests) == 6
+
+
+UNSUITABLE = (
+    "error: qwen3-coder did not produce a valid tool call in {attempts} attempts "
+    "\u2014 choose a model with native tool calling (--model)"
+)
+
+
+async def test_a_model_that_never_writes_a_valid_call_is_given_up_on_by_name(tmp_repo):
+    # Spec 4.4: after the retries are spent the tool gives up and says the model is
+    # not suitable. The first reply and MAX_PARSE_RETRIES more are the attempts.
+    script = [says(f"{BAD_CALL} attempt {n}") for n in range(MAX_PARSE_RETRIES + 3)]
+    session = build_session(tmp_repo, script, model="qwen3-coder", capabilities=TEXT_ONLY)
+    done = await session.run("read a.py")
+    attempts = MAX_PARSE_RETRIES + 1
+    assert len(session.model.requests) == attempts
+    assert done.reason is StopReason.MODEL_UNSUITABLE
+    # The value headless prints as stop_reason, and anything but "completed" makes
+    # it exit non-zero.
+    assert done.reason.value == "model_unsuitable"
+    # The last text a person sees is the 17.9 form, with the real model and the count.
+    assert done.text == UNSUITABLE.format(attempts=attempts)
+    validate(done.state.transcript)
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+
+
+@pytest.mark.parametrize(
+    ("last_reply", "text"),
+    [
+        (says('<tool name="Read">{"path": "a.py"}</tool>'), "all read"),
+        (
+            says("I cannot call tools, but here is the answer"),
+            "I cannot call tools, but here is the answer",
+        ),
+    ],
+    ids=["a-valid-call", "an-answer-in-prose"],
+)
+async def test_a_success_on_the_last_allowed_retry_is_not_a_failure(tmp_repo, last_reply, text):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [says(BAD_CALL)] * MAX_PARSE_RETRIES + [last_reply, says("all read")]
+    session = build_session(tmp_repo, script, model="qwen3-coder", capabilities=TEXT_ONLY)
+    done = await session.run("read a.py")
+    assert done.reason is StopReason.COMPLETED and done.text == text
+    assert len(session.model.requests) >= MAX_PARSE_RETRIES + 1
+
+
+async def test_the_attempts_counted_are_the_failures_in_a_row_not_every_reply_so_far(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    good = '<tool name="Read">{"path": "a.py"}</tool>'
+    script = [says(good)] + [says(BAD_CALL)] * (MAX_PARSE_RETRIES + 1)
+    session = build_session(tmp_repo, script, model="qwen3-coder", capabilities=TEXT_ONLY)
+    done = await session.run("go")
+    assert done.reason is StopReason.MODEL_UNSUITABLE
+    assert done.text == UNSUITABLE.format(
+        attempts=MAX_PARSE_RETRIES + 1
+    )  # not one more for the call
+
+
+async def test_a_turn_limit_is_not_mistaken_for_an_unsuitable_model(tmp_repo):
+    # A reply with a valid call and a malformed one, at the turn limit: the calls
+    # are what stopped it, and the complaint beside them is not a spent retry.
+    (tmp_repo / "a.py").write_text("x\n")
+    both = '<tool name="Read">{"path": "a.py"}</tool>\n<tool name="Grep">{not json}</tool>'
+    session = build_session(tmp_repo, [says(both)], capabilities=TEXT_ONLY, max_turns=1)
+    done = await session.run("go")
+    assert done.reason is StopReason.TURN_LIMIT
+
+
+async def test_a_reply_cut_off_in_the_middle_of_a_call_keeps_its_own_reason(tmp_repo):
+    # Out of output tokens is not a verdict on the model, and "choose another model"
+    # would be the wrong advice for it.
+    cut = ModelReply(
+        (TextBlock('<tool name="Read">{"path": "a.py"'),), StopKind.MAX_TOKENS, Usage(), "scripted"
+    )
+    session = build_session(tmp_repo, [cut] * (MAX_PARSE_RETRIES + 1), capabilities=TEXT_ONLY)
+    done = await session.run("go")
+    assert done.reason is StopReason.MAX_TOKENS
 
 
 async def test_every_attempt_is_billed_and_shown_even_the_ones_that_were_asked_again(tmp_repo):

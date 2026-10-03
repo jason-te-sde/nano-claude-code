@@ -38,6 +38,10 @@ class StopReason(StrEnum):
     TURN_LIMIT = "turn_limit"
     REFUSAL = "refusal"
     MAX_TOKENS = "max_tokens"
+    #: A model without native tool calling was asked again as often as the text
+    #: protocol allows and still wrote no call that could be run. The session sets
+    #: it, since the session owns the retries; the loop never produces it.
+    MODEL_UNSUITABLE = "model_unsuitable"
 
 
 @runtime_checkable

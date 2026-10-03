@@ -8,9 +8,9 @@ This is the least reliable path in the project and it is documented as such:
 small models emit malformed JSON, forget the closing tag, and wrap everything
 in code fences. Two of those three are tolerated here; the third is reported to
 the model so it can try again, at most :data:`MAX_PARSE_RETRIES` times in a row,
-after which the session stops and hands back the last reply with its complaints.
-Whether to retry is the session's decision: :func:`parse_reply` only says what
-was wrong.
+after which the session stops with ``StopReason.MODEL_UNSUITABLE`` and tells the
+person to choose another model. Whether to retry is the session's decision:
+:func:`parse_reply` only says what was wrong.
 
 The grammar is XML-ish rather than JSON because a model that cannot emit a
 well-formed function call reliably also cannot emit a well-formed JSON envelope

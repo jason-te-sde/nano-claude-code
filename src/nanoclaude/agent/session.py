@@ -33,7 +33,7 @@ from pathlib import Path
 
 from nanoclaude.agent import loop
 from nanoclaude.agent.executor import Executor
-from nanoclaude.agent.loop import Done, LoopState
+from nanoclaude.agent.loop import Done, LoopState, StopReason
 from nanoclaude.agent.router import Router
 from nanoclaude.agent.ui import UI, AutoDecline
 from nanoclaude.config.schema import ROLES, Config
@@ -84,6 +84,17 @@ def _correction(complaints: Sequence[str]) -> str:
         f"Your last reply contained no tool call that could be run:\n{listed}\n"
         'Write each call again as <tool name="Name"> followed by one JSON object and '
         "</tool>, or answer without a tool call if you do not need one."
+    )
+
+
+def _unsuitable(model: str, attempts: int) -> str:
+    """What a person is told when a model has used every retry without writing a call.
+
+    Spec 4.4 asks for exactly this, and spec 17.9 gives the form.
+    """
+    return (
+        f"error: {model} did not produce a valid tool call in {attempts} attempts "
+        "\u2014 choose a model with native tool calling (--model)"
     )
 
 
@@ -203,24 +214,36 @@ class Session:
                 reply, complaints = parse_reply(raw, next_id=self._next_call_id)
             self.ui.on_reply(reply)
 
-            if complaints and not _has_calls(reply) and failures < MAX_PARSE_RETRIES:
-                # Ask the same model again. What it said goes into the transcript as
-                # it said it, and the complaints come back as the user's next message:
-                # a tool_result cannot carry them, because there is no call to answer.
-                # Not loop.resume(): that starts a new prompt and its turn count, and
-                # this is the same prompt still running.
-                failures += 1
-                said = loop.step(self.state, raw).state
-                self.state = replace(
-                    said, transcript=said.transcript.append(user_text(_correction(complaints)))
-                )
-                continue
+            spent = 0  # the attempts made, once the model has used every retry for nothing
+            if complaints and not _has_calls(reply):
+                if failures < MAX_PARSE_RETRIES:
+                    # Ask the same model again. What it said goes into the transcript
+                    # as it said it, and the complaints come back as the user's next
+                    # message: a tool_result cannot carry them, because there is no
+                    # call to answer. Not loop.resume(): that starts a new prompt and
+                    # its turn count, and this is the same prompt still running.
+                    failures += 1
+                    said = loop.step(self.state, raw).state
+                    self.state = replace(
+                        said, transcript=said.transcript.append(user_text(_correction(complaints)))
+                    )
+                    continue
+                spent = failures + 1
             failures = 0
 
             outcome = loop.step(self.state, reply)
             self.state = outcome.state
             self._persist()
             if isinstance(outcome, Done):
+                if spent and outcome.reason is StopReason.COMPLETED:
+                    # A reply cut off by the output limit keeps its own reason: that
+                    # is not a verdict on the model.
+                    model = self._adapter_and_model("main")[1]
+                    outcome = replace(
+                        outcome,
+                        text=_unsuitable(model, spent),
+                        reason=StopReason.MODEL_UNSUITABLE,
+                    )
                 self._finish()
                 return outcome
 
