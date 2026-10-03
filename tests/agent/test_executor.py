@@ -869,7 +869,8 @@ async def test_cancelling_a_running_tool_still_cancels_the_batch(policy, tmp_rep
     ex = executor(policy, AutoApprove(), store)
     call = ToolUseBlock("t1", "Write", {"path": "a.txt", "content": "A"})
     task = asyncio.create_task(ex.run_batch((call,), start("hi")))
-    await started.wait()
+    # Bounded: a tool that never starts must fail this test, not hang the run.
+    await asyncio.wait_for(started.wait(), timeout=5)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
