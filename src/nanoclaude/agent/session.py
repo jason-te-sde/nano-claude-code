@@ -71,6 +71,13 @@ _INTERRUPTED_CALL = (
 #: Stands where the reply a stopped turn never got would have been.
 _INTERRUPTED_TURN = "[this turn was interrupted before it finished]"
 
+#: A main model whose window is smaller than this many tokens keeps at most
+#: ``SMALL_WINDOW_KEEP_RECENT`` recent turns whatever ``keep_recent_turns`` says
+#: (spec 7.3): three verbatim turns would leave it little room for a summary and
+#: its own reply.
+SMALL_WINDOW_TOKENS = 32_000
+SMALL_WINDOW_KEEP_RECENT = 2
+
 
 def new_session_id() -> str:
     """A short random identifier for a session: twelve hexadecimal characters."""
@@ -291,7 +298,7 @@ class Session:
                 raise
             overflow = error
         before = self.state.transcript
-        await self._compact_fully()
+        await self._compact_fully(capabilities)
         if self.state.transcript == before:
             raise self._does_not_fit(overflow) from overflow
         try:
@@ -337,25 +344,41 @@ class Session:
         if verdict == "micro":
             compacted = micro_compact(
                 transcript,
-                keep_recent=self.config.limits.keep_recent_turns,
+                keep_recent=self._keep_recent(capabilities),
                 counter=HeuristicCounter(),
             )
             self.state = replace(self.state, transcript=compacted)
             self._persist()
         elif verdict == "full":
-            await self._compact_fully()
+            await self._compact_fully(capabilities)
+
+    def _keep_recent(self, capabilities: Capabilities) -> int:
+        """How many recent turns a compaction leaves as they were.
+
+        The configured number, except that a main model with a small window keeps at
+        most two (spec 7.3). ``capabilities`` are the main model's: it is the one
+        that has to fit the result.
+        """
+        configured = self.config.limits.keep_recent_turns
+        if capabilities.context_window < SMALL_WINDOW_TOKENS:
+            return min(configured, SMALL_WINDOW_KEEP_RECENT)
+        return configured
 
     async def compact(self, instructions: str | None = None) -> None:
         """Summarise the older part of the conversation now: the ``/compact`` command."""
         self._mend()
-        await self._compact_fully(instructions)
+        capabilities = await self.router.capabilities_for("main")
+        await self._compact_fully(capabilities, instructions)
 
-    async def _compact_fully(self, instructions: str | None = None) -> None:
+    async def _compact_fully(
+        self, capabilities: Capabilities, instructions: str | None = None
+    ) -> None:
         """Replace the older part of the conversation with a summary, and store it.
 
         The one place a full compaction happens: the budget calls it at the hard
         threshold, ``/compact`` calls it, and so does the answer to a provider that
         says the conversation does not fit. They differ in why, not in how.
+        ``capabilities`` are the main model's.
         """
         extra = f"\n\nPay particular attention to: {instructions}" if instructions else ""
 
@@ -364,7 +387,7 @@ class Session:
 
         compacted = await full_compact(
             self.state.transcript,
-            keep_recent=self.config.limits.keep_recent_turns,
+            keep_recent=self._keep_recent(capabilities),
             summarise=summarise,
         )
         self.state = replace(self.state, transcript=compacted)

@@ -1178,6 +1178,120 @@ async def test_an_overflow_on_the_summary_request_is_the_compact_roles_error_not
     assert len(session.model.requests) == 1
 
 
+# --------------------------------------------------------------------------
+# Spec 7.3: a small-window model keeps at most two recent turns
+# --------------------------------------------------------------------------
+
+# The tests below compact `tool_history(5)`: a request, five tool rounds h0..h4 and
+# an answer. Keeping two turns leaves the call and result of h4; keeping three
+# also leaves h3's. What is asserted is which results stay, whichever way the
+# compaction was reached.
+WINDOWS = pytest.mark.parametrize(
+    ("window", "retained"),
+    [(31_999, ["h4"]), (32_000, ["h3", "h4"])],
+    ids=["31999-tokens-keeps-two-turns", "32000-tokens-keeps-the-configured-three"],
+)
+
+
+def window_of(tokens: int) -> Capabilities:
+    return Capabilities(True, True, "none", context_window=tokens, max_output=2_000)
+
+
+def retained_ids(transcript: Transcript) -> list[str]:
+    return [result.tool_use_id for result in tool_results(transcript)]
+
+
+@WINDOWS
+async def test_a_budget_compaction_keeps_the_recent_turns_the_window_allows(
+    tmp_repo, window, retained
+):
+    session = build_session(
+        tmp_repo,
+        [says("SUMMARY"), says("answer")],
+        capabilities=window_of(window),
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert is_summary_request(session.model.requests[0])
+    assert retained_ids(session.model.requests[1].transcript) == retained
+
+
+@WINDOWS
+async def test_a_manual_compaction_keeps_the_recent_turns_the_window_allows(
+    tmp_repo, window, retained
+):
+    session = build_session(tmp_repo, [says("SUMMARY")], capabilities=window_of(window))
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    assert retained_ids(session.state.transcript) == retained
+
+
+@WINDOWS
+async def test_a_compaction_forced_by_the_provider_keeps_the_recent_turns_the_window_allows(
+    tmp_repo, window, retained
+):
+    session = build_session(
+        tmp_repo, [overflow(), says("SUMMARY"), says("answer")], capabilities=window_of(window)
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert is_summary_request(session.model.requests[1])
+    assert retained_ids(session.model.requests[2].transcript) == retained
+
+
+@WINDOWS
+async def test_shrinking_old_tool_results_spares_the_recent_turns_the_window_allows(
+    tmp_repo, window, retained
+):
+    session = build_session(
+        tmp_repo,
+        [says("answer")],
+        capabilities=window_of(window),
+        compact_soft=0.0001,
+        compact_hard=0.9999,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    sent = session.model.requests[0].transcript
+    shrunk = {r.tool_use_id: r.content.startswith("[compacted:") for r in tool_results(sent)}
+    assert shrunk == {f"h{i}": f"h{i}" not in retained for i in range(5)}
+
+
+async def test_a_small_window_does_not_raise_the_turns_kept_above_what_is_configured(tmp_repo):
+    # min(configured, 2), not 2: a person who asked to keep one turn keeps one.
+    session = build_session(
+        tmp_repo, [says("SUMMARY")], capabilities=window_of(31_999), keep_recent_turns=1
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    assert retained_ids(session.state.transcript) == []
+
+
+async def test_a_large_window_keeps_as_many_turns_as_are_configured(tmp_repo):
+    session = build_session(
+        tmp_repo, [says("SUMMARY")], capabilities=window_of(32_000), keep_recent_turns=4
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    assert retained_ids(session.state.transcript) == ["h2", "h3", "h4"]
+
+
+async def test_the_window_that_counts_is_the_main_models_not_the_compact_roles(tmp_repo):
+    session = build_session(
+        tmp_repo,
+        [],
+        compact_script=[says("SUMMARY")],
+        capabilities=window_of(32_000),
+        compact_model="scripted-compact",
+        compact_capabilities=window_of(31_999),
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.compact()
+    assert retained_ids(session.state.transcript) == ["h3", "h4"]
+
+
 async def test_a_manual_compaction_summarises_with_the_instructions_given(tmp_repo):
     session = build_session(tmp_repo, [says("SUMMARY about auth")])
     session.state = replace(session.state, transcript=tool_history(5, result_chars=400))

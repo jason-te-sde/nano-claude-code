@@ -98,6 +98,7 @@ def build_session(
     max_turns: int = 40,
     compact_soft: float = 0.70,
     compact_hard: float = 0.85,
+    keep_recent_turns: int = 3,
     ui: UI | None = None,
     retry: RetryPolicy | None = None,
     home: Path | None = None,
@@ -148,7 +149,10 @@ def build_session(
         models=models,
         roles=RolesConfig("m", "m", "m", "m", compact_alias, "m"),
         limits=LimitsConfig(
-            max_turns=max_turns, compact_soft=compact_soft, compact_hard=compact_hard
+            max_turns=max_turns,
+            compact_soft=compact_soft,
+            compact_hard=compact_hard,
+            keep_recent_turns=keep_recent_turns,
         ),
     )
     store = Store(state_dir / "sessions.db")
