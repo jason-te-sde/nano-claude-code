@@ -337,6 +337,17 @@ class Store:
         )
         self.db.commit()
 
+    def next_tool_turn(self, session_id: str) -> int:
+        """The first turn number no audited call of this session has been recorded under.
+
+        One past the largest, 0 when nothing has been audited. The audit's turn is
+        the session's own count and a resumed session carries on from it.
+        """
+        row = self.db.execute(
+            "SELECT MAX(turn) AS latest FROM tool_calls WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        return 0 if row["latest"] is None else int(row["latest"]) + 1
+
     def session_row(self, session_id: str) -> SessionRow | None:
         """One session's row, or None when no such session is stored."""
         row = self.db.execute(

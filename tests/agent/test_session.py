@@ -1904,6 +1904,117 @@ async def test_a_prompt_that_hit_the_limit_does_not_use_up_the_next_one(tmp_repo
     assert (again.reason, again.text) == (StopReason.COMPLETED, "recovered")
 
 
+def audited_turns(session: ScriptedSession) -> dict[str, int]:
+    """The turn each audited call was recorded under, by call id."""
+    assert session.store is not None
+    rows = session.store.db.execute(
+        "SELECT tool_use_id, turn FROM tool_calls WHERE session_id = ?", (session.session_id,)
+    ).fetchall()
+    return {row["tool_use_id"]: row["turn"] for row in rows}
+
+
+@pytest.mark.parametrize("second", ["run", "follow_up"])
+async def test_the_audit_numbers_turns_across_prompts_not_within_each(tmp_repo, second):
+    # The limit counts a prompt's turns and starts again with every prompt. The audit's
+    # (session, turn) has to say which turn of the session a call was, or a later
+    # prompt's first turn is turn 0 again and nothing can tell it from the first.
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="p1a"),
+        calls("Read", {"path": "a.py"}, call_id="p1b"),
+        says("one is done"),
+        calls("Read", {"path": "a.py"}, call_id="p2a"),
+        says("two is done"),
+        calls("Read", {"path": "a.py"}, call_id="p3a"),
+        says("three is done"),
+    ]
+    session = build_session(tmp_repo, script)
+    await session.run("first prompt")
+    await getattr(session, second)("second prompt")
+    await session.follow_up("third prompt")
+    assert audited_turns(session) == {"p1a": 0, "p1b": 1, "p2a": 2, "p3a": 3}
+
+
+async def test_a_prompt_after_an_interrupted_turn_does_not_reuse_its_turn_number(
+    tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.write import WriteTool
+
+    started = asyncio.Event()
+
+    async def hang(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the tool was allowed to finish")
+
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [
+            calls("Write", {"path": "w.txt", "content": "w"}, call_id="w1"),
+            calls("Read", {"path": "a.py"}, call_id="t1"),
+            says("done"),
+        ],
+    )
+    with monkeypatch.context() as local:
+        local.setattr(WriteTool, "run", hang)
+        task = asyncio.create_task(session.run("write it"))
+        await reached(started)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    await session.follow_up("read it instead")
+    assert audited_turns(session) == {"w1": 0, "t1": 1}
+
+
+async def test_a_prompt_after_clearing_goes_on_numbering_where_the_session_was(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    script = [
+        calls("Read", {"path": "a.py"}, call_id="t1"),
+        says("done"),
+        calls("Read", {"path": "a.py"}, call_id="t2"),
+        says("done again"),
+    ]
+    session = build_session(tmp_repo, script)
+    await session.run("first")
+    session.clear()
+    await session.follow_up("second")
+    assert audited_turns(session) == {"t1": 0, "t2": 1}
+
+
+async def test_a_resumed_session_goes_on_numbering_from_the_stored_maximum(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    first = build_session(
+        tmp_repo,
+        [
+            calls("Read", {"path": "a.py"}, call_id="p1a"),
+            calls("Read", {"path": "a.py"}, call_id="p1b"),
+            says("first done"),
+        ],
+    )
+    await first.run("first question")
+    await first.aclose()
+    session = resumed(
+        tmp_repo,
+        first,
+        [calls("Read", {"path": "a.py"}, call_id="p2a"), says("second done")],
+    )
+    await session.follow_up("second question")
+    assert audited_turns(session) == {"p1a": 0, "p1b": 1, "p2a": 2}
+
+
+async def test_a_resumed_session_with_nothing_audited_starts_at_turn_zero(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    first = await stored_session(tmp_repo, [says("first answer")])
+    session = resumed(
+        tmp_repo, first, [calls("Read", {"path": "a.py"}, call_id="t1"), says("second answer")]
+    )
+    await session.follow_up("second question")
+    assert audited_turns(session) == {"t1": 0}
+
+
 @pytest.mark.parametrize("entry", ["run", "follow_up"])
 async def test_each_prompt_reads_the_turn_limit_the_config_has_when_it_arrives(tmp_repo, entry):
     # A front end builds the session, then replaces its config (--max-turns applied,

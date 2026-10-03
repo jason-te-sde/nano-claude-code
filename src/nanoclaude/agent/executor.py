@@ -163,9 +163,16 @@ class Executor:
         )
 
     async def run_batch(
-        self, calls: Sequence[ToolUseBlock], state: LoopState
+        self, calls: Sequence[ToolUseBlock], state: LoopState, *, turn: int | None = None
     ) -> tuple[ToolOutcome, ...]:
+        """Decide, then run, the calls of one model turn; one outcome for each, in order.
+
+        ``turn`` is the number the audit records the batch under. It defaults to the
+        state's own count, which starts again with every prompt: a session that
+        wants its audit numbered across prompts says which turn this is.
+        """
         ctx = self.context(state)
+        audit_turn = state.turn if turn is None else turn
         # Every call's _Plan is built from this one snapshot of self.grants,
         # taken before any of them is confirmed. An ALWAYS answer to call 1
         # updates self.grants in the loop below, but call 2's _Plan was
@@ -175,7 +182,7 @@ class Executor:
         # run_batch, not retroactively within this one; that is what keeps
         # the first phase's promise that no call's outcome in a batch depends
         # on how a *later* one in the same batch turns out.
-        plans = [self._decide(ctx, call, state.turn) for call in calls]
+        plans = [self._decide(ctx, call, audit_turn) for call in calls]
         results: dict[str, ToolOutcome] = {}
 
         for plan in plans:

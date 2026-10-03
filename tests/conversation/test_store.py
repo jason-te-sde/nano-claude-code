@@ -172,6 +172,36 @@ def test_the_row_read_by_id_is_the_one_the_listing_shows(tmp_path):
     assert store.recent_sessions(1) == [store.session_row("s1")]
 
 
+def _audit(store: Store, session_id: str, tool_use_id: str, turn: int) -> None:
+    store.db.execute(
+        "INSERT INTO tool_calls "
+        "(session_id, turn, tool_use_id, ts, tool, args_json, decision, rule) "
+        "VALUES (?, ?, ?, 0, 'Read', '{}', 'allow', 'rule.allow')",
+        (session_id, turn, tool_use_id),
+    )
+    store.db.commit()
+
+
+def test_the_next_turn_to_audit_is_one_past_the_largest_already_audited(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    assert store.next_tool_turn("s1") == 0  # nothing audited yet
+    for tool_use_id, turn in (("a", 0), ("b", 3), ("c", 1)):
+        _audit(store, "s1", tool_use_id, turn)
+    assert store.next_tool_turn("s1") == 4
+
+
+def test_the_next_turn_to_audit_counts_only_the_session_asked_about(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.create_session("s2", cwd="/p", roles={})
+    _audit(store, "s2", "a", 7)
+    assert store.next_tool_turn("s1") == 0
+    assert store.next_tool_turn("s2") == 8
+
+
 def test_latest_session_id_is_none_for_an_empty_database(tmp_path):
     store = Store(tmp_path / "s.db")
     store.open()

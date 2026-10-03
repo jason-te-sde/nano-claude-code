@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import Hashable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Never
 
@@ -67,6 +68,18 @@ def _store(tmp_repo: Path) -> Store:
     store.open()
     store.create_session("s1", cwd=str(tmp_repo), roles={})
     return store
+
+
+async def test_the_audit_records_the_turn_the_state_is_on_unless_told_another(policy, tmp_repo):
+    (tmp_repo / "a.py").write_text("a\n")
+    (tmp_repo / "b.py").write_text("b\n")
+    store = _store(tmp_repo)
+    batch = executor(policy, store=store)
+    on_turn_two = replace(start("hi"), turn=2)
+    await batch.run_batch((ToolUseBlock("t1", "Read", {"path": "a.py"}),), on_turn_two)
+    await batch.run_batch((ToolUseBlock("t2", "Read", {"path": "b.py"}),), on_turn_two, turn=9)
+    rows = store.db.execute("SELECT tool_use_id, turn FROM tool_calls ORDER BY tool_use_id")
+    assert [(row["tool_use_id"], row["turn"]) for row in rows] == [("t1", 2), ("t2", 9)]
 
 
 async def test_results_come_back_in_the_order_the_model_asked(policy, tmp_repo):

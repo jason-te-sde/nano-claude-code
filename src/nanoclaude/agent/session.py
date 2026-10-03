@@ -176,6 +176,11 @@ class Session:
     # for a new one, which has used nothing: a cost of zero, a known one.
     _earlier_usage: Usage = field(default_factory=Usage, init=False, repr=False)
     _earlier_cost: float | None = field(default=0.0, init=False, repr=False)
+    # The audit numbers turns across the whole session, and the loop's own count starts
+    # again with every prompt. A prompt's turn n is audited as _audit_turn_base + n, and
+    # _next_audit_turn is the first number no batch has used: the base of the next prompt.
+    _audit_turn_base: int = field(default=0, init=False, repr=False)
+    _next_audit_turn: int = field(default=0, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -223,6 +228,7 @@ class Session:
         self._stored = transcript.messages
         self._earlier_usage = Usage(row.total_input_tokens, row.total_output_tokens)
         self._earlier_cost = row.total_cost_usd
+        self._next_audit_turn = self.store.next_tool_turn(self.session_id)
 
     @property
     def usage(self) -> Usage:
@@ -237,6 +243,7 @@ class Session:
     async def run(self, prompt: str) -> Done:
         """Start a new conversation with ``prompt`` and drive it until the model stops."""
         self.state = loop.start(self._expand(prompt), max_turns=self.config.limits.max_turns)
+        self._audit_turn_base = self._next_audit_turn
         return await self._drive()
 
     async def follow_up(self, prompt: str) -> Done:
@@ -246,6 +253,7 @@ class Session:
         # may have replaced the config since the session was built.
         state = replace(self.state, max_turns=self.config.limits.max_turns)
         self.state = loop.resume(state, self._expand(prompt))
+        self._audit_turn_base = self._next_audit_turn
         return await self._drive()
 
     def _expand(self, prompt: str) -> str:
@@ -306,7 +314,11 @@ class Session:
                 self._finish()
                 return outcome
 
-            results = await self.executor.run_batch(outcome.calls, self.state)
+            audit_turn = self._audit_turn_base + self.state.turn
+            # Claimed as the batch starts, not when it ends: one that is interrupted has
+            # already audited its calls under this number.
+            self._next_audit_turn = audit_turn + 1
+            results = await self.executor.run_batch(outcome.calls, self.state, turn=audit_turn)
             self.state = loop.observe(self.state, results)
 
     def _prompt(self, capabilities: Capabilities) -> tuple[str, tuple[ToolSpec, ...]]:
