@@ -451,9 +451,11 @@ async def test_every_attempt_is_billed_and_shown_even_the_ones_that_were_asked_a
         says(BAD_CALL, input_tokens=10, output_tokens=1) for _ in range(MAX_PARSE_RETRIES + 1)
     ]
     session = build_session(tmp_repo, script, capabilities=TEXT_ONLY, ui=watcher)
-    await session.run("go")
+    done = await session.run("go")
     attempts = MAX_PARSE_RETRIES + 1
     assert session.router.by_role()["main"].usage == Usage(10 * attempts, attempts)
+    # And in the conversation's own count, which is what a Done carries.
+    assert done.state.usage == Usage(10 * attempts, attempts)
     assert len(watcher.replies) == attempts
 
 
@@ -467,6 +469,22 @@ async def test_asking_again_does_not_use_up_turns(tmp_repo):
     done = await session.run("go")
     assert done.reason is StopReason.COMPLETED and done.text == "finished"
     assert done.state.turn == 1
+
+
+async def test_asking_again_in_the_middle_of_a_prompt_does_not_give_its_turns_back(tmp_repo):
+    # Three turns allowed, so the second reply with calls after the first is the
+    # limit. A malformed reply between tool rounds is asked for again; that is the
+    # same prompt still running and must not start its count over, or a model that
+    # fails once between calls could keep going for ever.
+    (tmp_repo / "a.py").write_text("x\n")
+    good = '<tool name="Read">{"path": "a.py"}</tool>'
+    script = [says(good), says(BAD_CALL), says(good), says(good), says("never reached")]
+    session = build_session(tmp_repo, script, capabilities=TEXT_ONLY, max_turns=3)
+    done = await session.run("go")
+    # call, [malformed, asked again], call, call: the third tool round is the limit.
+    assert done.reason is StopReason.TURN_LIMIT
+    assert len(session.model.requests) == 4
+    assert not session.model.exhausted
 
 
 async def test_a_model_with_native_tools_is_never_asked_again_for_a_text_call(tmp_repo):

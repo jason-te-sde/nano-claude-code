@@ -207,8 +207,13 @@ class Session:
                 # Ask the same model again. What it said goes into the transcript as
                 # it said it, and the complaints come back as the user's next message:
                 # a tool_result cannot carry them, because there is no call to answer.
+                # Not loop.resume(): that starts a new prompt and its turn count, and
+                # this is the same prompt still running.
                 failures += 1
-                self.state = loop.resume(loop.step(self.state, raw).state, _correction(complaints))
+                said = loop.step(self.state, raw).state
+                self.state = replace(
+                    said, transcript=said.transcript.append(user_text(_correction(complaints)))
+                )
                 continue
             failures = 0
 
