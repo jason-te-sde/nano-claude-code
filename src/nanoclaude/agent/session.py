@@ -28,7 +28,6 @@ import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from itertools import count
 from pathlib import Path
 
 from nanoclaude.agent import loop
@@ -53,7 +52,14 @@ from nanoclaude.conversation.transcript import (
 from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import Policy
 from nanoclaude.permissions.redact import Redactor
-from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, ToolSpec, Usage
+from nanoclaude.providers.base import (
+    ModelError,
+    ModelReply,
+    ModelRequest,
+    ToolSpec,
+    Usage,
+    new_call_id,
+)
 from nanoclaude.providers.capabilities import Capabilities
 from nanoclaude.providers.retry import RetryPolicy, with_retry
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES, parse_reply, render_tools
@@ -82,6 +88,10 @@ SMALL_WINDOW_KEEP_RECENT = 2
 def new_session_id() -> str:
     """A short random identifier for a session: twelve hexadecimal characters."""
     return uuid.uuid4().hex[:12]
+
+
+class UnknownSessionError(RuntimeError):
+    """A session to resume is not in the store. The message is for the person, as it stands."""
 
 
 def _correction(complaints: Sequence[str]) -> str:
@@ -125,6 +135,11 @@ class Session:
     ``store`` and ``audit`` are optional, and a session without them keeps nothing
     on disk. The attributes are plain and mutable on purpose: a front end replaces
     ``state`` to clear a conversation.
+
+    ``resume`` takes up a stored session instead of starting one: ``session_id`` is
+    the one to continue, its conversation is loaded, and what the session stores and
+    spends from then on is added to its rows. Continue it with :meth:`follow_up`;
+    :meth:`run` starts a new conversation, in the same row.
     """
 
     root: str
@@ -143,11 +158,15 @@ class Session:
     #: A parameter rather than a read of the real home inside each turn, so that a
     #: session in a test cannot pick up the instructions of whoever runs it.
     home: str = field(default_factory=lambda: str(Path.home()))
+    resume: bool = False
     state: LoopState = field(init=False)
     executor: Executor = field(init=False)
     # The messages the store holds for this session, as of the last _persist().
     _stored: tuple[Message, ...] = field(default=(), init=False, repr=False)
-    _call_ids: count[int] = field(default_factory=lambda: count(1), init=False, repr=False)
+    # What a resumed session had used before this run, from its stored row. Nothing
+    # for a new one, which has used nothing: a cost of zero, a known one.
+    _earlier_usage: Usage = field(default_factory=Usage, init=False, repr=False)
+    _earlier_cost: float | None = field(default=0.0, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -155,7 +174,9 @@ class Session:
         # call (the REPL makes it after /clear), and it must find the configured
         # turn limit and a transcript it can start.
         self.state = LoopState(Transcript(), turn=0, max_turns=self.config.limits.max_turns)
-        if self.store is not None:
+        if self.resume:
+            self._take_up_stored_session()
+        elif self.store is not None:
             self.store.create_session(
                 self.session_id,
                 cwd=self.root,
@@ -169,6 +190,30 @@ class Session:
             session_id=self.session_id,
             redactor=self.redactor,
         )
+
+    def _take_up_stored_session(self) -> None:
+        """Load the session ``session_id`` names, or say that the store does not hold it.
+
+        Nothing is written: the row exists, and the first save of this session adds
+        to what is stored. A tail the earlier process left open (a call nobody
+        answered, a request nobody replied to) is closed when the next prompt
+        arrives, as it is after an interruption within one process. What the
+        conversation had read is not stored, so the model reads a file again before
+        it edits it.
+        """
+        if self.store is None:
+            raise ValueError("resume needs a store to read the session from")
+        row = self.store.session_row(self.session_id)
+        if row is None:
+            raise UnknownSessionError(
+                f'no stored session "{self.session_id}" \u2014 check the id, or leave out '
+                "--resume to start a new session"
+            )
+        transcript = self.store.load_transcript(self.session_id)
+        self.state = replace(self.state, transcript=transcript)
+        self._stored = transcript.messages
+        self._earlier_usage = Usage(row.total_input_tokens, row.total_output_tokens)
+        self._earlier_cost = row.total_cost_usd
 
     @property
     def usage(self) -> Usage:
@@ -455,7 +500,7 @@ class Session:
         return entry.adapter, entry.model
 
     def _next_call_id(self) -> str:
-        return f"tt_{next(self._call_ids)}"
+        return new_call_id("tt")
 
     def _persist(self) -> None:
         if self.store is None:
@@ -473,9 +518,18 @@ class Session:
         self._stored = messages
 
     def _finish(self) -> None:
-        if self.store is not None:
-            # An unknown cost is None here, and the store keeps it as NULL.
-            self.store.finish_session(self.session_id, self.usage, self.cost)
+        if self.store is None:
+            return
+        # What the session had used before it was resumed, and this run. A cost that
+        # is unknown on either side makes the total unknown, which is None here and
+        # NULL in the store: it is not zero, and must not read as free.
+        usage = self._earlier_usage + self.usage
+        cost = self.cost
+        if cost is not None and self._earlier_cost is not None:
+            cost += self._earlier_cost
+        else:
+            cost = None
+        self.store.finish_session(self.session_id, usage, cost)
 
     async def context_usage(self) -> tuple[int, int]:
         """(tokens used, tokens available) for /status. Estimated, not billed.

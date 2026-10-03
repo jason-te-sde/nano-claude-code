@@ -102,6 +102,8 @@ def build_session(
     ui: UI | None = None,
     retry: RetryPolicy | None = None,
     home: Path | None = None,
+    session_id: str | None = None,
+    resume: bool = False,
 ) -> ScriptedSession:
     """A session in ``root`` whose model replies from ``script``, in order.
 
@@ -125,6 +127,10 @@ def build_session(
     Retries wait no time unless a ``retry`` policy says otherwise, and global
     instructions are looked for under ``home`` (a directory that does not exist,
     by default) and never in the real home directory.
+
+    The store is the file ``root`` always gets, so a second session built in the
+    same ``root`` sees the first one's rows. ``session_id`` with ``resume=True``
+    makes it the continuation of that stored session.
     """
     state_dir = root / ".nanoclaude"
     model_id = model or (SCRIPTED_MODEL if capabilities is not None else DEFAULT_MODEL)
@@ -176,7 +182,8 @@ def build_session(
         ui=ui or AutoApprove(),
         store=store,
         audit=AuditLog(store),
-        session_id=new_session_id(),
+        session_id=session_id or new_session_id(),
+        resume=resume,
         todo_state=todo,
         retry=retry or RetryPolicy(base_delay_s=0.0, max_delay_s=0.0),
         home=str(home if home is not None else state_dir / "home"),

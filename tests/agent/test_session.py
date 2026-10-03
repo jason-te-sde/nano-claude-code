@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -449,7 +450,8 @@ async def test_a_reply_with_one_valid_call_is_not_retried_for_the_malformed_one_
     assert len(session.model.requests) == 2
     assert done.text == "done"
     after = session.model.requests[1].transcript
-    assert [r.tool_use_id for r in tool_results(after)] == ["tt_1"]  # the call ran
+    [ran] = tool_results(after)  # the call ran
+    assert re.fullmatch(r"tt_[0-9a-f]{12}", ran.tool_use_id)
     # The complaint stays in the reply for the model to see, but nobody asked it
     # to write the call again: no user message in the history is a correction.
     assert "[tool protocol]" in after.messages[1].text()
@@ -605,7 +607,8 @@ async def test_text_protocol_calls_get_ids_that_are_unique_across_turns(tmp_repo
     session = build_session(tmp_repo, [says(one), says(one), says("done")], capabilities=TEXT_ONLY)
     done = await session.run("go")
     ids = [r.tool_use_id for r in tool_results(done.state.transcript)]
-    assert ids == ["tt_1", "tt_2"]
+    assert len(ids) == 2 and len(set(ids)) == 2
+    assert all(re.fullmatch(r"tt_[0-9a-f]{12}", one) for one in ids)
     validate(done.state.transcript)  # validate() rejects a repeated id
 
 
@@ -2061,6 +2064,286 @@ async def test_the_audit_log_is_kept_under_the_sessions_own_id(tmp_repo):
         ("t1", session.session_id, "ok"),
         ("t2", session.session_id, "ok"),
     ]
+
+
+# --------------------------------------------------------------------------
+# Resuming a stored session
+# --------------------------------------------------------------------------
+
+
+async def stored_session(
+    tmp_repo: Path, script: Sequence[ModelReply | ModelError], **options: Any
+) -> ScriptedSession:
+    """A session that ran its script and was closed: what is left behind to resume."""
+    first = build_session(tmp_repo, script, **options)
+    await first.run("first question")
+    await first.aclose()
+    return first
+
+
+def resumed(
+    tmp_repo: Path,
+    first: ScriptedSession,
+    script: Sequence[ModelReply | ModelError],
+    **options: Any,
+) -> ScriptedSession:
+    return build_session(tmp_repo, script, session_id=first.session_id, resume=True, **options)
+
+
+async def test_a_stored_session_can_be_resumed_and_goes_on_from_where_it_stopped(tmp_repo):
+    first = await stored_session(tmp_repo, [says("first answer")])
+    session = resumed(tmp_repo, first, [says("second answer")])
+    assert [m.text() for m in session.state.transcript.messages] == [
+        "first question",
+        "first answer",
+    ]
+
+    done = await session.follow_up("second question")
+
+    sent = session.model.requests[0].transcript
+    assert [m.text() for m in sent.messages] == [
+        "first question",
+        "first answer",
+        "second question",
+    ]
+    assert done.text == "second answer"
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+    assert len(done.state.transcript.messages) == 4
+
+
+async def test_resuming_does_not_create_the_session_again(tmp_repo):
+    first = await stored_session(tmp_repo, [says("first answer")])
+    assert first.store is not None
+    reader = Store(first.store.path)
+    reader.open()
+    started = reader.session_row(first.session_id)
+    session = resumed(tmp_repo, first, [says("second answer")])
+    await session.follow_up("second question")
+    assert [row.id for row in reader.recent_sessions(10)] == [first.session_id]
+    row = reader.session_row(first.session_id)
+    assert row is not None and started is not None
+    assert (row.started_at, row.cwd) == (started.started_at, started.cwd)
+    reader.close()
+
+
+async def test_a_resumed_session_adds_to_the_stored_rows_and_rewrites_none_of_them(
+    tmp_repo, monkeypatch
+):
+    first = await stored_session(tmp_repo, [says("first answer")])
+    appended: list[int] = []
+    rewritten: list[int] = []
+    real_append, real_replace = Store.append_message, Store.replace_transcript
+
+    def counting_append(self: Store, session_id: str, seq: int, message: Message) -> None:
+        appended.append(seq)
+        real_append(self, session_id, seq, message)
+
+    def counting_replace(self: Store, session_id: str, transcript: Transcript) -> None:
+        rewritten.append(len(transcript.messages))
+        real_replace(self, session_id, transcript)
+
+    monkeypatch.setattr(Store, "append_message", counting_append)
+    monkeypatch.setattr(Store, "replace_transcript", counting_replace)
+    session = resumed(tmp_repo, first, [says("second answer"), says("third answer")])
+    await session.follow_up("second question")
+    await session.follow_up("third question")
+    assert rewritten == []
+    assert appended == [2, 3, 4, 5]  # after the two stored messages, once each
+
+
+async def test_a_session_that_is_not_stored_cannot_be_resumed_and_is_not_started_instead(tmp_repo):
+    from nanoclaude.agent.session import UnknownSessionError
+
+    with pytest.raises(UnknownSessionError) as excinfo:
+        build_session(tmp_repo, [], session_id="0123456789ab", resume=True)
+    assert str(excinfo.value) == (
+        'no stored session "0123456789ab" \u2014 check the id, or leave out --resume to start a '
+        "new session"
+    )
+    # Nothing was created in its place.
+    reader = Store(tmp_repo / ".nanoclaude" / "sessions.db")
+    reader.open()
+    assert reader.recent_sessions(10) == []
+    reader.close()
+
+
+async def test_a_session_cannot_be_resumed_without_a_store_to_read_it_from(tmp_repo):
+    built = build_session(tmp_repo, [])
+    with pytest.raises(ValueError, match="needs a store"):
+        Session(
+            root=built.root,
+            config=built.config,
+            router=built.router,
+            registry=built.registry,
+            policy=built.policy,
+            session_id="0123456789ab",
+            resume=True,
+        )
+
+
+async def test_a_resumed_session_starts_with_the_configured_turn_limit_and_a_fresh_count(tmp_repo):
+    first = await stored_session(tmp_repo, [says("first answer")], max_turns=40)
+    session = resumed(tmp_repo, first, [], max_turns=7)
+    assert (session.state.turn, session.state.max_turns) == (0, 7)
+
+
+async def test_a_resumed_session_has_read_nothing_yet(tmp_repo):
+    # The stamps of what a conversation has read are not stored, and the files may have
+    # changed since: an edit has to follow a new read.
+    (tmp_repo / "a.py").write_text("x\n")
+    first = await stored_session(
+        tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), says("first answer")]
+    )
+    assert first.state.read_state
+    session = resumed(tmp_repo, first, [])
+    assert dict(session.state.read_state) == {}
+
+
+async def test_the_totals_of_a_resumed_session_add_to_the_stored_ones(tmp_repo):
+    first = await stored_session(
+        tmp_repo, [says("first answer", input_tokens=1_000, output_tokens=100)]
+    )
+    session = resumed(tmp_repo, first, [says("second", input_tokens=500, output_tokens=50)])
+    await session.follow_up("second question")
+    row = stored_row(session)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_500, 150)
+    assert row["total_cost_usd"] == pytest.approx(0.0045)  # $0.003, then $0.0015
+    # What the session reports for itself is what this run used.
+    assert session.usage == Usage(500, 50)
+    assert session.cost == pytest.approx(0.0015)
+    # Closing it records the same totals, not the earlier ones again.
+    await session.aclose()
+    closed = row_after_closing(session)
+    assert (closed["total_input_tokens"], closed["total_output_tokens"]) == (1_500, 150)
+    assert closed["total_cost_usd"] == pytest.approx(0.0045)
+
+
+async def test_a_resumed_session_that_used_nothing_keeps_the_stored_totals(tmp_repo):
+    first = await stored_session(
+        tmp_repo, [says("first answer", input_tokens=1_000, output_tokens=100)]
+    )
+    session = resumed(tmp_repo, first, [])
+    await session.aclose()
+    row = row_after_closing(session)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["total_cost_usd"] == pytest.approx(0.003)
+
+
+@pytest.mark.parametrize(
+    ("earlier", "now"),
+    [(UNPRICED, None), (None, UNPRICED)],
+    ids=["an-unpriced-model-then-a-priced-one", "a-priced-model-then-an-unpriced-one"],
+)
+async def test_a_cost_that_is_unknown_on_either_side_makes_the_total_unknown(
+    tmp_repo, earlier, now
+):
+    first = await stored_session(
+        tmp_repo, [says("first answer", input_tokens=1_000, output_tokens=100)], model=earlier
+    )
+    session = resumed(
+        tmp_repo, first, [says("second", input_tokens=500, output_tokens=50)], model=now
+    )
+    await session.follow_up("second question")
+    row = stored_row(session)
+    assert row["total_cost_usd"] is None
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_500, 150)
+
+
+async def test_a_session_that_never_finished_has_an_unknown_total_when_it_is_resumed(tmp_repo):
+    # Its row was created and never written to again, as after a crash: what it spent
+    # is not known, and adding to nothing must not read as adding to zero.
+    first = build_session(tmp_repo, [says("first answer", input_tokens=1_000)])
+    await first.run("first question")  # a prompt that stops records its totals ...
+    assert first.store is not None
+    first.store.db.execute("UPDATE sessions SET total_cost_usd = NULL, ended_at = NULL")
+    first.store.db.commit()  # ... so put the row back as a crash would have left it
+    session = resumed(tmp_repo, first, [says("second", input_tokens=500)])
+    await session.follow_up("second question")
+    assert stored_row(session)["total_cost_usd"] is None
+
+
+async def test_a_session_resumed_after_a_call_that_never_reported_back_closes_it_honestly(
+    tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.write import WriteTool
+
+    started = asyncio.Event()
+
+    async def hang(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the tool was allowed to finish")
+
+    first = build_session(
+        tmp_repo, [calls("Write", {"path": "w.txt", "content": "w"}, call_id="w1")]
+    )
+    with monkeypatch.context() as local:
+        local.setattr(WriteTool, "run", hang)
+        task = asyncio.create_task(first.run("write it"))
+        await reached(started)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    await first.aclose()
+
+    session = resumed(tmp_repo, first, [says("picked up again")])
+    assert session.state.transcript.pending_tool_uses()  # the stored tail is the open call
+    done = await session.follow_up("try again")
+
+    sent = session.model.requests[0].transcript
+    validate(sent)
+    [result] = tool_results(sent)
+    assert result.tool_use_id == "w1" and result.is_error and "may or may not" in result.content
+    assert sent.messages[-1].text() == "try again"
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+
+
+async def test_a_session_resumed_after_a_failed_request_closes_the_turn_that_got_no_reply(
+    tmp_repo,
+):
+    (tmp_repo / "a.py").write_text("x\n")
+    first = build_session(
+        tmp_repo,
+        [
+            calls("Read", {"path": "a.py"}, call_id="t1"),
+            ModelError("bad gateway", retryable=False, status=502),
+        ],
+    )
+    with pytest.raises(ModelError, match="bad gateway"):
+        await first.run("read it")
+    await first.aclose()
+
+    session = resumed(tmp_repo, first, [says("recovered")])
+    assert session.state.transcript.messages[-1].role == "user"  # the results, never answered
+    done = await session.follow_up("try again")
+    assert done.text == "recovered"
+    sent = session.model.requests[0].transcript
+    validate(sent)
+    assert "interrupted" in sent.messages[-2].text().lower()
+    assert [r.tool_use_id for r in tool_results(sent)] == ["t1"]
+
+
+async def test_ids_minted_after_a_resume_do_not_collide_with_the_stored_ones(tmp_repo):
+    # The text protocol has no ids from a server, so the session makes them up. The
+    # stored conversation holds the ones the first process made, the audit table is
+    # keyed by them, and the transcript refuses a repeat.
+    (tmp_repo / "a.py").write_text("x\n")
+    call = '<tool name="Read">{"path": "a.py"}</tool>'
+    first = await stored_session(tmp_repo, [says(call), says("done")], capabilities=TEXT_ONLY)
+    session = resumed(tmp_repo, first, [says(call), says("done again")], capabilities=TEXT_ONLY)
+    done = await session.follow_up("again")
+    ids = [r.tool_use_id for r in tool_results(done.state.transcript)]
+    assert len(ids) == 2 and len(set(ids)) == 2
+    validate(done.state.transcript)
+    assert session.store is not None
+    audited = session.store.db.execute(
+        "SELECT tool_use_id FROM tool_calls WHERE session_id = ?", (session.session_id,)
+    ).fetchall()
+    assert sorted(row["tool_use_id"] for row in audited) == sorted(ids)
 
 
 # --------------------------------------------------------------------------
