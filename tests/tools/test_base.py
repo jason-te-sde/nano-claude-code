@@ -36,6 +36,40 @@ def test_control_sequences_are_stripped_from_tool_output(raw, expected):
     assert sanitize(raw) == expected
 
 
+@pytest.mark.parametrize("code", range(0x80, 0xA0), ids=lambda code: f"U+{code:04X}")
+def test_every_c1_control_is_stripped(code):
+    # The 8-bit forms of the escape sequences: U+009B is a CSI, U+009D an OSC, U+0090 a
+    # DCS and U+009C the terminator of a string. A terminal that honours C1 in UTF-8
+    # acts on each as it would on the two-byte form, so they go with the rest.
+    assert sanitize(f"a{chr(code)}b") == "ab"
+
+
+def test_the_eight_bit_forms_of_the_sequences_lose_their_introducers():
+    # What is left is inert text: it does not introduce anything.
+    assert sanitize("a\x9b2Jb\x9d0;T\x9cc\x90qd") == "a2Jb0;Tcqd"
+
+
+def test_delete_is_stripped():
+    assert sanitize("del\x7fete") == "delete"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "no\u00a0break\u00a0space",  # U+00A0 is the first character after the C1 block
+        "caf\u00e9 \u00ff",
+        "bidi \u202a\u202b\u202c\u202d\u202e and \u2066\u2067\u2068\u2069 isolates",
+        "tab\tand\nnewline",
+    ],
+    ids=["no-break-space", "latin-1-letters", "bidirectional-controls", "tab-and-newline"],
+)
+def test_what_a_terminal_does_not_act_on_is_left_alone(text):
+    # The bidirectional controls do not act on a terminal, and file contents may hold
+    # them: stripping them from what Read returns would leave Edit unable to match
+    # the lines that have them.
+    assert sanitize(text) == text
+
+
 def test_require_str_names_the_argument_and_the_type_it_got():
     with pytest.raises(ToolArgumentError, match="path must be a string, got int"):
         require_str({"path": 3}, "path")
