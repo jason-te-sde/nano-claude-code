@@ -696,3 +696,199 @@ async def test_on_decision_is_called_for_refusals_that_never_reach_evaluate(poli
         ("t2", "tool.bad-arguments"),
         ("t3", "rule.allow"),
     ]
+
+
+# --- A bug in one tool must not end the session ---------------------------
+#
+# run_batch used to let any exception other than ToolArgumentError and OSError
+# out of _run. One raised by a tool aborted the whole batch, threw away the
+# outcomes of calls that had already finished, and reached the person as a
+# traceback. The three tests after the first pin the edges of the clause that
+# fixes it: it must come after the two existing clauses, and it must not catch
+# what is not an Exception.
+
+
+class _Abort(BaseException):
+    """Stands in for KeyboardInterrupt and SystemExit.
+
+    Raising either of those inside a task makes asyncio re-raise it into the
+    event loop, which would end the whole pytest run rather than this test. A
+    BaseException of our own takes the same path through ``except Exception``.
+    """
+
+
+def _audit_row(store: Store, call_id: str) -> Any:
+    return store.db.execute(
+        "SELECT outcome, duration_ms, error FROM tool_calls WHERE tool_use_id = ?", (call_id,)
+    ).fetchone()
+
+
+async def test_a_tool_raising_an_unexpected_exception_costs_one_call_not_the_batch(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    for name, text in (("a.py", "alpha"), ("b.py", "bravo"), ("c.py", "charlie")):
+        (tmp_repo / name).write_text(f"{text}\n")
+    real_run = ReadTool.run
+
+    async def explode_for_t2(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        if call_id == "t2":
+            raise RuntimeError("list index out of range")
+        return await real_run(self, ctx, call_id, arguments)
+
+    class Seen(SilentUI):
+        def __init__(self) -> None:
+            self.outcomes: list[ToolOutcome] = []
+
+        def on_outcome(self, _call: ToolUseBlock, outcome: ToolOutcome) -> None:
+            self.outcomes.append(outcome)
+
+    monkeypatch.setattr(ReadTool, "run", explode_for_t2)
+    ui, store = Seen(), _store(tmp_repo)
+    calls = (
+        ToolUseBlock("t1", "Read", {"path": "a.py"}),
+        ToolUseBlock("t2", "Read", {"path": "b.py"}),
+        ToolUseBlock("t3", "Read", {"path": "c.py"}),
+    )
+    outcomes = await executor(policy, ui, store).run_batch(calls, start("hi"))
+
+    # Every call is answered, in the order asked, and the siblings really ran.
+    assert [o.tool_use_id for o in outcomes] == ["t1", "t2", "t3"]
+    assert [o.is_error for o in outcomes] == [False, True, False]
+    assert "alpha" in outcomes[0].content and "charlie" in outcomes[2].content
+
+    # What the model is told: where it happened, what it was, that it is a bug.
+    bug = outcomes[1].content
+    assert "internal error" in bug.lower() and "Read" in bug, bug
+    assert "RuntimeError: list index out of range" in bug, bug
+    assert "bug" in bug, bug
+    # The person watching sees the failed call like any other outcome.
+    assert [o.tool_use_id for o in ui.outcomes] == ["t1", "t2", "t3"]
+
+    # The audit row says what happened, and the others are unaffected.
+    row = _audit_row(store, "t2")
+    assert row["outcome"] == "error", dict(row)
+    assert row["error"] == "RuntimeError: list index out of range", dict(row)
+    assert _audit_row(store, "t1")["outcome"] == "ok"
+    assert _audit_row(store, "t3")["outcome"] == "ok"
+
+
+async def test_what_an_unexpected_exception_says_is_scrubbed_like_any_tool_output(
+    policy, tmp_repo, monkeypatch
+):
+    """An exception message can quote a value the tool was handling. The result
+    goes into the transcript and the audit row goes into the database, and
+    neither may carry a credential. Built at run time so no literal in this file
+    is shaped like one."""
+    from nanoclaude.tools.read import ReadTool
+
+    secret = "sk-" + "Qz7" * 12
+    store = _store(tmp_repo)
+    (tmp_repo / "a.py").write_text("x")
+
+    async def leak(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise ValueError(f"cannot use token {secret}")
+
+    monkeypatch.setattr(ReadTool, "run", leak)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert secret not in outcomes[0].content and "[redacted:" in outcomes[0].content
+    row = _audit_row(store, "t1")
+    assert secret not in row["error"] and "[redacted:" in row["error"], dict(row)
+
+
+async def test_a_tool_argument_error_is_still_a_bad_arguments_result_not_an_internal_error(
+    policy, tmp_repo, monkeypatch
+):
+    """Raised from run() rather than from permission_request(), which is where
+    an argument the tool only inspects once it executes surfaces. It has its
+    own clause; the new one must sit after it and not swallow it."""
+    from nanoclaude.tools.base import ToolArgumentError
+    from nanoclaude.tools.read import ReadTool
+
+    async def reject(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise ToolArgumentError("offset must be an integer, got str")
+
+    monkeypatch.setattr(ReadTool, "run", reject)
+    (tmp_repo / "a.py").write_text("x")
+    store = _store(tmp_repo)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert outcomes[0].content == "bad arguments: offset must be an integer, got str"
+    assert _audit_row(store, "t1")["error"] == "offset must be an integer, got str"
+
+
+async def test_an_oserror_is_still_reported_as_itself_not_an_internal_error(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    async def fail(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise OSError("device not configured")
+
+    monkeypatch.setattr(ReadTool, "run", fail)
+    (tmp_repo / "a.py").write_text("x")
+    store = _store(tmp_repo)
+    outcomes = await executor(policy, AutoApprove(), store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert outcomes[0].content == "OSError: device not configured"
+    assert _audit_row(store, "t1")["error"] == "device not configured"
+
+
+async def test_cancelling_a_running_tool_still_cancels_the_batch(policy, tmp_repo, monkeypatch):
+    """CancelledError is a BaseException, so ``except Exception`` lets it through.
+    Written with a write rather than a read on purpose: a read runs inside
+    asyncio.gather, which cancels the batch by itself whatever _run does with
+    the error, so a clause that wrongly swallowed it would go unnoticed there.
+    A write is awaited directly, so swallowing the cancellation shows."""
+    from nanoclaude.tools.write import WriteTool
+
+    started = asyncio.Event()
+
+    async def hang(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        started.set()
+        await asyncio.Event().wait()  # never set; only cancellation ends this
+        raise AssertionError("the tool was allowed to finish")
+
+    monkeypatch.setattr(WriteTool, "run", hang)
+    store = _store(tmp_repo)
+    ex = executor(policy, AutoApprove(), store)
+    call = ToolUseBlock("t1", "Write", {"path": "a.txt", "content": "A"})
+    task = asyncio.create_task(ex.run_batch((call,), start("hi")))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Decided, never finished: the row's outcome stays NULL, which is the only
+    # thing a NULL there is allowed to mean.
+    assert _audit_row(store, "t1")["outcome"] is None
+
+
+async def test_an_exception_that_is_not_an_exception_still_propagates(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.write import WriteTool
+
+    async def abort(
+        self: WriteTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise _Abort("stop everything")
+
+    monkeypatch.setattr(WriteTool, "run", abort)
+    call = ToolUseBlock("t1", "Write", {"path": "a.txt", "content": "A"})
+    with pytest.raises(_Abort, match="stop everything"):
+        await executor(policy).run_batch((call,), start("hi"))

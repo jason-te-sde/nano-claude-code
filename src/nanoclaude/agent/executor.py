@@ -40,7 +40,7 @@ from nanoclaude.permissions.policy import (
     evaluate,
 )
 from nanoclaude.permissions.redact import Redactor
-from nanoclaude.tools.base import Tool, ToolArgumentError, ToolContext, ToolOutcome
+from nanoclaude.tools.base import Tool, ToolArgumentError, ToolContext, ToolOutcome, failed
 from nanoclaude.tools.registry import ToolRegistry, UnknownToolError
 
 MAX_CONCURRENT_READS = 8
@@ -287,6 +287,24 @@ class Executor:
         except OSError as exc:
             outcome = ToolOutcome(plan.call.id, f"{type(exc).__name__}: {exc}", is_error=True)
             error = str(exc)
+        except Exception as exc:
+            # A bug in one tool is that call's failure, not the batch's. Left to
+            # escape, it leaves run_batch, discards the outcomes of the calls
+            # that already finished, and reaches the person as a traceback. It
+            # sits after the two clauses above so the failures a tool is allowed
+            # to have keep their own wording, and it names Exception rather than
+            # BaseException so cancellation and KeyboardInterrupt still stop the
+            # batch instead of being reported to the model as a bug. The text is
+            # scrubbed like any tool output: an exception can quote the value
+            # the tool was handling, and this goes to the transcript and the
+            # audit table.
+            error, _ = self.redactor.scrub(f"{type(exc).__name__}: {exc}")
+            outcome = failed(
+                plan.call.id,
+                f"Internal error in {plan.call.name}: {error}\n"
+                "This is a bug in the tool, not in your arguments. Do not repeat the call; "
+                "try another approach, or tell the user what failed.",
+            )
         self.ui.on_outcome(plan.call, outcome)
         self._audit_outcome(
             plan.call.id,
