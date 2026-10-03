@@ -11,7 +11,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from nanoclaude.conversation.store import SessionRow, Store, decode_blocks, encode_blocks
+from nanoclaude.conversation.store import (
+    MessageConflictError,
+    SessionRow,
+    Store,
+    decode_blocks,
+    encode_blocks,
+)
 from nanoclaude.conversation.transcript import (
     Message,
     Role,
@@ -528,15 +534,39 @@ def test_replacing_one_sessions_transcript_archives_nothing_of_another(tmp_path)
     assert _archived(store, "s1") == list(enumerate(old.messages))  # none of s2's among them
 
 
-def test_writing_a_different_message_over_a_stored_one_archives_the_old_one(tmp_path):
+@pytest.mark.parametrize(
+    "other",
+    [
+        Message("assistant", (TextBlock("same words"),)),
+        Message("user", (TextBlock("other words"),)),
+    ],
+    ids=["another-role", "other-words"],
+)
+def test_writing_a_different_message_where_one_is_stored_is_refused_and_changes_nothing(
+    tmp_path, monkeypatch, other
+):
+    # Another process has written to the session: the rows are not the ones this writer
+    # believes they are, and the audit trail is not for overwriting.
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    stored = Message("user", (TextBlock("same words"),))
+    store.append_message("s1", 0, stored)  # tick 2
+    with pytest.raises(MessageConflictError) as caught:
+        store.append_message("s1", 0, other)  # tick 3
+    assert (caught.value.session_id, caught.value.seq) == ("s1", 0)
+    assert store.load_transcript("s1").messages == (stored,)
+    assert _live_times(store, "s1") == {0: 2.0}
+    assert _archived(store, "s1") == []
+
+
+def test_a_row_the_table_refuses_for_another_reason_is_not_reported_as_a_conflict(tmp_path):
     store = Store(tmp_path / "s.db")
     store.open()
     store.create_session("s1", cwd="/p", roles={})
-    first, second = _transcript("a", "b").messages
-    store.append_message("s1", 0, first)
-    store.append_message("s1", 0, second)
-    assert store.load_transcript("s1").messages == (second,)
-    assert _archived(store, "s1") == [(0, first)]
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        store.append_message("s1", 0, Message(None, (TextBlock("no role"),)))  # type: ignore[arg-type]
 
 
 def test_writing_the_message_that_is_already_stored_changes_nothing(tmp_path, monkeypatch):

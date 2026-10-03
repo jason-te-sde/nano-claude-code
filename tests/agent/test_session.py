@@ -41,7 +41,7 @@ from nanoclaude.conversation.budget import (
     transcript_text,
 )
 from nanoclaude.conversation.compaction import SUMMARY_TEMPLATE
-from nanoclaude.conversation.store import Store, decode_blocks
+from nanoclaude.conversation.store import MessageConflictError, Store, decode_blocks
 from nanoclaude.conversation.transcript import (
     Message,
     TextBlock,
@@ -2271,6 +2271,53 @@ async def test_a_session_that_is_not_stored_cannot_be_resumed_and_is_not_started
     reader.open()
     assert reader.recent_sessions(10) == []
     reader.close()
+
+
+CHANGED = (
+    "session {id} was changed by another process \u2014 start a new session, or resume it again"
+)
+
+
+async def test_two_processes_resuming_one_session_do_not_splice_its_rows(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    first = await stored_session(tmp_repo, [says("first answer")])
+    one = resumed(
+        tmp_repo,
+        first,
+        [calls("Read", {"path": "a.py"}, call_id="t1"), says("one is done")],
+    )
+    other = resumed(tmp_repo, first, [says("the other is done")])
+    await one.follow_up("what the first process asks")  # writes positions 2 to 5
+
+    from nanoclaude.agent.session import SessionChangedError
+
+    with pytest.raises(SessionChangedError) as caught:
+        await other.follow_up("what the second process asks")  # would write 2 and 3
+    assert str(caught.value) == CHANGED.format(id=first.session_id)
+    assert isinstance(caught.value.__cause__, MessageConflictError)
+    # Nothing was overwritten or archived, and the session still loads as a conversation.
+    assert one.store is not None
+    live = one.store.load_transcript(first.session_id)
+    assert live == one.state.transcript
+    validate(live)
+    assert archived_messages(one) == []
+    assert other.model.requests == []  # it did not even ask the model
+
+
+async def test_the_second_process_finds_out_at_the_first_message_that_differs(tmp_repo):
+    # Its prompt is the same words, so the first append finds its own message already
+    # there and has nothing to do; the reply it gets is what differs.
+    from nanoclaude.agent.session import SessionChangedError
+
+    first = await stored_session(tmp_repo, [says("first answer")])
+    one = resumed(tmp_repo, first, [says("one answer")])
+    other = resumed(tmp_repo, first, [says("another answer")])
+    await one.follow_up("the same prompt")
+    with pytest.raises(SessionChangedError):
+        await other.follow_up("the same prompt")
+    assert len(other.model.requests) == 1  # asked once, and could not store what came back
+    assert one.store is not None
+    assert one.store.load_transcript(first.session_id) == one.state.transcript
 
 
 async def test_a_session_cannot_be_resumed_without_a_store_to_read_it_from(tmp_repo):

@@ -40,7 +40,7 @@ from nanoclaude.context.assemble import assemble
 from nanoclaude.context.mentions import expand_mentions
 from nanoclaude.conversation.budget import Budget, HeuristicCounter
 from nanoclaude.conversation.compaction import SUMMARY_TEMPLATE, full_compact, micro_compact
-from nanoclaude.conversation.store import Store
+from nanoclaude.conversation.store import MessageConflictError, Store
 from nanoclaude.conversation.transcript import (
     Message,
     TextBlock,
@@ -92,6 +92,14 @@ def new_session_id() -> str:
 
 class UnknownSessionError(RuntimeError):
     """A session to resume is not in the store. The message is for the person, as it stands."""
+
+
+class SessionChangedError(RuntimeError):
+    """Another process wrote to the stored session this one is writing to.
+
+    The message is for the person, as it stands. Nothing of the other process's was
+    overwritten, and nothing of this one's was stored.
+    """
 
 
 def _correction(complaints: Sequence[str]) -> str:
@@ -509,7 +517,15 @@ class Session:
         stored = self._stored
         if messages[: len(stored)] == stored:
             for seq in range(len(stored), len(messages)):
-                self.store.append_message(self.session_id, seq, messages[seq])
+                try:
+                    self.store.append_message(self.session_id, seq, messages[seq])
+                except MessageConflictError as conflict:
+                    # The store holds another message where this one was to go, so
+                    # something else has written to the session since it was loaded.
+                    raise SessionChangedError(
+                        f"session {self.session_id} was changed by another process \u2014 "
+                        "start a new session, or resume it again"
+                    ) from conflict
         else:
             # Not an extension of what was stored: compaction replaced the head, or
             # the transcript was swapped for another. Appending would leave the old

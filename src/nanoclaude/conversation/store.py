@@ -139,6 +139,21 @@ def decode_blocks(payload: str) -> tuple[Block, ...]:
     return tuple(blocks)
 
 
+class MessageConflictError(RuntimeError):
+    """A different message is already stored where another was to be appended.
+
+    Another process has written to the session: the rows are not the ones the writer
+    believes they are. Nothing was written.
+    """
+
+    def __init__(self, session_id: str, seq: int) -> None:
+        super().__init__(
+            f"session {session_id} already holds a different message at position {seq}"
+        )
+        self.session_id = session_id
+        self.seq = seq
+
+
 @dataclass(frozen=True, slots=True)
 class SessionRow:
     id: str
@@ -217,28 +232,32 @@ class Store:
         self.db.commit()
 
     def append_message(self, session_id: str, seq: int, message: Message) -> None:
-        """Store ``message`` as the message at ``seq``.
+        """Store ``message`` as the message at ``seq``, the next one in its session.
 
-        A different message already stored at ``seq`` is archived, not overwritten:
-        the audit trail only grows. The same message again changes nothing.
+        The same message already stored there is not an error: a message is written
+        once, so an append that finds it has nothing to do. A different one is, and
+        raises :class:`MessageConflictError`: another process has written to this
+        session, and the rows are not the ones this writer believes they are. Nothing
+        is overwritten, since the audit trail only grows.
         """
         role, blocks_json = message.role, encode_blocks(message.blocks)
-        now = time.time()
-        with self.db:
+        try:
+            with self.db:
+                self.db.execute(
+                    "INSERT INTO messages (session_id, seq, role, blocks_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (session_id, seq, role, blocks_json, time.time()),
+                )
+        except sqlite3.IntegrityError:
             stored = self.db.execute(
-                "SELECT role, blocks_json, created_at FROM messages "
-                "WHERE session_id = ? AND seq = ?",
+                "SELECT role, blocks_json FROM messages WHERE session_id = ? AND seq = ?",
                 (session_id, seq),
             ).fetchone()
-            if stored is not None:
-                if (stored["role"], stored["blocks_json"]) == (role, blocks_json):
-                    return
-                self._archive(session_id, [(seq, stored)], now)
-            self.db.execute(
-                "INSERT OR REPLACE INTO messages "
-                "(session_id, seq, role, blocks_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                (session_id, seq, role, blocks_json, now),
-            )
+            if stored is None:
+                raise  # not a row in the way: the table refused the value itself
+            if (stored["role"], stored["blocks_json"]) == (role, blocks_json):
+                return
+            raise MessageConflictError(session_id, seq) from None
 
     def load_transcript(self, session_id: str) -> Transcript:
         """The live messages: the transcript the model is shown, not the archive."""
