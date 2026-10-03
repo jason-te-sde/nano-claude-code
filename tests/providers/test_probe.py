@@ -12,6 +12,7 @@ from nanoclaude.providers.capabilities import (
     Capabilities,
     CapabilityCache,
     _apply,
+    capabilities_for,
     resolve_capabilities,
 )
 from nanoclaude.providers.ollama import probe_ollama
@@ -371,10 +372,11 @@ def test_apply_with_no_overrides_returns_the_value_unchanged():
     assert _apply(CONSERVATIVE_DEFAULT, {}) == CONSERVATIVE_DEFAULT
 
 
-def test_apply_overrides_only_the_given_fields():
+def test_apply_overrides_the_given_fields_and_a_cut_window_bounds_the_output():
     result = _apply(CONSERVATIVE_DEFAULT, {"context_window": 4096})
     assert result.context_window == 4096
     assert result.native_tools == CONSERVATIVE_DEFAULT.native_tools
+    assert result.max_output == 1_024  # a quarter of the cut window
 
 
 def test_apply_ignores_none_valued_overrides():
@@ -463,3 +465,33 @@ async def test_any_window_set_in_the_config_leaves_room_for_the_conversation(tmp
         "anthropic", "claude-opus-5-5", cache=cache, overrides={"context_window": window}
     )
     assert Budget(caps).available() >= window // 2
+
+
+async def test_a_window_restated_in_the_config_leaves_the_output_alone(tmp_path):
+    # Haiku 4.5's output is more than a quarter of its window; restating that
+    # window is not a cut.
+    cache = CapabilityCache(tmp_path / "caps.json")
+    caps = await resolve_capabilities(
+        "anthropic", "claude-haiku-4-5", cache=cache, overrides={"context_window": 200_000}
+    )
+    assert (caps.context_window, caps.max_output) == (200_000, 64_000)
+
+
+def test_an_output_given_with_a_cut_window_is_kept():
+    caps = capabilities_for("anthropic", "claude-opus-5-5")
+    result = _apply(caps, {"context_window": 64_000, "max_output": 32_000})
+    assert (result.context_window, result.max_output) == (64_000, 32_000)
+
+
+async def test_the_cache_keeps_what_the_probe_found_not_what_the_config_made_of_it(tmp_path):
+    cache = CapabilityCache(tmp_path / "caps.json")
+    found = Capabilities(True, False, "none", 131_072, 4_096)
+
+    async def probe() -> Capabilities:
+        return found
+
+    caps = await resolve_capabilities(
+        "ollama", "m", cache=cache, probe=probe, overrides={"context_window": 8_192}
+    )
+    assert (caps.context_window, caps.max_output) == (8_192, 2_048)
+    assert cache.get("ollama", "m") == found

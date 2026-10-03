@@ -265,10 +265,12 @@ def test_no_temperature_is_sent_unless_one_is_asked_for():
     client = AnthropicClient("k")
     plain = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), (), 64))
     assert "temperature" not in plain
-    asked = client.payload(
-        ModelRequest("sys", Transcript((user_text("hi"),)), (), 64, temperature=0.3)
-    )
-    assert asked["temperature"] == 0.3
+    # 0.0 included: it is the one set value that is falsy.
+    for value in (0.0, 0.3):
+        asked = client.payload(
+            ModelRequest("sys", Transcript((user_text("hi"),)), (), 64, temperature=value)
+        )
+        assert asked["temperature"] == value
 
 
 def test_the_request_prefix_is_byte_stable_across_turns():

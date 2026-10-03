@@ -192,6 +192,10 @@ def test_no_temperature_option_is_sent_unless_one_is_asked_for():
     client = OllamaClient(model="m")
     payload = client.payload(ModelRequest("sys", Transcript((user_text("hi"),)), (), 64))
     assert payload["options"] == {"num_predict": 64}
+    zero = client.payload(
+        ModelRequest("sys", Transcript((user_text("hi"),)), (), 64, temperature=0.0)
+    )
+    assert zero["options"] == {"temperature": 0.0, "num_predict": 64}
 
 
 # -- complete(): happy paths, from the brief -----------------------------

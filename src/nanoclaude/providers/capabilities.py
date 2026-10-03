@@ -178,16 +178,17 @@ async def resolve_capabilities(
 def _apply(caps: Capabilities, overrides: dict[str, object] | None) -> Capabilities:
     """Config wins over anything discovered: the user may know better than us.
 
-    A window set in the config also bounds the output, to a quarter of it as the
-    Ollama probe does. The budget holds max_output of the window back for the
-    reply, so a window cut well below the model's own would otherwise leave
-    little or nothing for the conversation.
+    A window cut below the model's own also bounds the output, to a quarter of
+    the new window, the share CONSERVATIVE_DEFAULT keeps. The budget holds
+    max_output back for the reply, so the cut would otherwise leave little or
+    nothing for the conversation. A window restated or raised changes nothing
+    else, and neither does one given together with its own max_output.
     """
     if not overrides:
         return caps
     kwargs = {k: v for k, v in overrides.items() if v is not None}
     applied = replace(caps, **kwargs)  # type: ignore[arg-type]
     window = kwargs.get("context_window")
-    if isinstance(window, int):
+    if isinstance(window, int) and window < caps.context_window and "max_output" not in kwargs:
         applied = replace(applied, max_output=min(applied.max_output, window // 4))
     return applied

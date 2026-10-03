@@ -2,8 +2,9 @@
 
 OpenAI, OpenRouter, Groq, DeepSeek, Together, Azure, vLLM, LM Studio and
 llama.cpp's server all do. Writing this against the *format* rather than
-against OpenAI is the highest reach-per-line decision in the project, so there
-is deliberately no vendor name in the logic.
+against OpenAI is the highest reach-per-line decision in the project, so vendor
+names stay out of the logic but for one choice: which parameter carries the
+output cap (see ``_COMPLETION_TOKENS_DOMAINS``).
 
 Two places where reality and the documentation differ, both handled:
 ``function.arguments`` is documented as a JSON string and is sometimes an
@@ -49,15 +50,22 @@ _FINISH = {
 #: Providers disagree on where reasoning lives.
 _REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
 
-#: Hosts that take max_completion_tokens. On OpenAI's own API max_tokens is
-#: deprecated and its reasoning models refuse it; the other servers this adapter
-#: talks to mostly know only max_tokens, so they keep it.
-_COMPLETION_TOKENS_HOSTS = frozenset({"api.openai.com"})
+#: Domains whose hosts take max_completion_tokens: OpenAI's own API with its
+#: regional hosts (eu.api.openai.com and the like), and Azure OpenAI. There
+#: max_tokens is deprecated and reasoning models refuse it. The other servers
+#: this adapter talks to mostly know only max_tokens, so they keep it.
+_COMPLETION_TOKENS_DOMAINS = ("api.openai.com", "openai.azure.com")
 
 
 def _output_cap_parameter(base_url: str) -> str:
-    host = urlsplit(base_url).hostname or ""
-    return "max_completion_tokens" if host in _COMPLETION_TOKENS_HOSTS else "max_tokens"
+    try:
+        host = (urlsplit(base_url).hostname or "").rstrip(".")
+    except ValueError:  # a malformed address, which the request itself reports
+        return "max_tokens"
+    first_party = any(
+        host == domain or host.endswith(f".{domain}") for domain in _COMPLETION_TOKENS_DOMAINS
+    )
+    return "max_completion_tokens" if first_party else "max_tokens"
 
 
 def parse_arguments(raw: Any) -> Mapping[str, Any]:

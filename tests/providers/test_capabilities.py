@@ -7,11 +7,10 @@ def test_known_anthropic_model_has_explicit_cache_and_native_tools():
     caps = capabilities_for("anthropic", "claude-sonnet-5")
     assert caps.native_tools and caps.parallel_tools
     assert caps.cache == "explicit"
-    assert caps.context_window >= 200_000
-    # The _KNOWN exact entry and the "claude-" family fallback agree on every
-    # other field checked above, so only max_output (128_000 vs 8_192) can tell
-    # them apart. Without this line, bypassing _KNOWN entirely and always
-    # falling through to _FAMILIES still passes every test in this file.
+    # The _KNOWN entry and the "claude-" family fallback agree on the fields
+    # above and differ in these two (1M against 200K, 128K against 8K), so
+    # bypassing _KNOWN and falling through to _FAMILIES fails here.
+    assert caps.context_window == 1_000_000
     assert caps.max_output == 128_000
 
 
