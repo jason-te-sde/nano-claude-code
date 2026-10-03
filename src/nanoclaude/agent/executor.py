@@ -18,6 +18,15 @@ between one barrier and the next still go concurrently, capped by a
 semaphore; a refused or declined call never executes and so cannot split a
 run of reads around it. Concurrency buys latency within one run; no amount of
 it is worth an undefined order between a write and whatever depends on it.
+
+**Nothing the model chose reaches anything raw.** A path quoted in a refusal, a
+tool name it made up, the message of an error a tool raised over its arguments:
+each is text the model sent, and each is handed to the model, to the front end and
+to the audit log. The front end prints what it is given and a terminal acts on
+what it prints (a title change, a screen clear, a carriage return that rewrites a
+line), so the executor strips terminal control sequences with
+:func:`~nanoclaude.tools.base.sanitize` from every string it builds from outside
+input, once, where it is built, and all three get the clean one.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from nanoclaude.agent.loop import LoopState
 from nanoclaude.agent.ui import UI, Approval, AutoDecline
@@ -237,6 +246,9 @@ class Executor:
             return self._crashed(call, exc, turn)
 
         result = evaluate(request, self.policy, self.grants)
+        # A reason quotes what the model asked for (the path that is outside the
+        # sandbox, the command that was refused).
+        result = replace(result, reason=sanitize(result.reason))
         self.ui.on_decision(call, request, result)
         self._audit_decision(call, turn, result)
         if result.decision is Decision.DENY:
@@ -253,8 +265,11 @@ class Executor:
         # Reaches here before evaluate() ever runs (an unknown tool name, or
         # arguments bad enough that permission_request() itself raises), so
         # there is no real PermissionRequest to report -- the same placeholder
-        # used below is what on_decision and the audit log both see.
-        request = PermissionRequest(call.name, "")
+        # used below is what on_decision and the audit log both see. The message
+        # quotes the call, and the name may be one the registry never heard of: it
+        # is whatever the model wrote.
+        message = sanitize(message)
+        request = PermissionRequest(sanitize(call.name), "")
         result = PermissionResult(Decision.DENY, rule, message)
         self.ui.on_decision(call, request, result)
         self._audit_decision(call, turn, result)
@@ -303,7 +318,7 @@ class Executor:
             self.session_id,
             turn=turn,
             tool_use_id=call.id,
-            tool=call.name,
+            tool=sanitize(call.name),
             arguments=call.arguments,
             decision=result.decision,
             rule=result.rule,
@@ -339,11 +354,11 @@ class Executor:
         try:
             outcome = await plan.tool.run(ctx, plan.call.id, plan.call.arguments)
         except ToolArgumentError as exc:
-            outcome = ToolOutcome(plan.call.id, f"bad arguments: {exc}", is_error=True)
-            error = str(exc)
+            outcome = failed(plan.call.id, f"bad arguments: {exc}")
+            error = sanitize(str(exc))
         except OSError as exc:
-            outcome = ToolOutcome(plan.call.id, f"{type(exc).__name__}: {exc}", is_error=True)
-            error = str(exc)
+            outcome = failed(plan.call.id, f"{type(exc).__name__}: {exc}")
+            error = sanitize(str(exc))
         except Exception as exc:
             # A bug in one tool is that call's failure, not the batch's. Left to
             # escape, it leaves run_batch, discards the outcomes of the calls that

@@ -1190,3 +1190,148 @@ async def test_an_exception_that_is_not_an_exception_still_propagates_from_a_per
         await executor(policy).run_batch(
             (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
         )
+
+
+# --- Text the model chose never reaches anything raw ----------------------------
+#
+# Every string the executor builds from what the model sent (a path quoted in a
+# refusal, a tool name it made up, the message of an error a tool raised over its
+# arguments) goes through sanitize() before it reaches the model, the front end or
+# the audit log. The front end prints what it is given, and a terminal acts on
+# what it prints: one test per path, each reading everything that path produced.
+
+#: A window-title change, a clear-screen and a carriage return, in the order a
+#: hostile string would carry them.
+HOSTILE = "\x1b]0;TITLE\x07\x1b[2J\r"
+
+
+class _Recorder(SilentUI):
+    """Remembers everything the executor tells the front end."""
+
+    def __init__(self) -> None:
+        self.decisions: list[tuple[PermissionRequest, PermissionResult]] = []
+        self.outcomes: list[ToolOutcome] = []
+
+    def on_decision(
+        self, _call: ToolUseBlock, request: PermissionRequest, result: PermissionResult
+    ) -> None:
+        self.decisions.append((request, result))
+
+    def on_outcome(self, _call: ToolUseBlock, outcome: ToolOutcome) -> None:
+        self.outcomes.append(outcome)
+
+
+def _every_text_the_executor_wrote(
+    outcomes: tuple[ToolOutcome, ...], ui: _Recorder, store: Store
+) -> list[str]:
+    """What the model, the front end and the audit table were each handed.
+
+    Not the subject of a request a tool built (the path or the command it asked
+    about): the executor hands that on as it is, because the rules judge the
+    original, and a front end that shows it has to render it safely.
+    """
+    texts = [outcome.content for outcome in (*outcomes, *ui.outcomes)]
+    for request, result in ui.decisions:
+        texts += [request.tool, result.rule, result.reason]
+    columns = "tool, args_json, decision, rule, outcome, error"
+    for row in store.db.execute(f"SELECT {columns} FROM tool_calls"):  # noqa: S608
+        texts += [value for value in row if isinstance(value, str)]
+    return texts
+
+
+def _what_a_terminal_would_act_on(texts: list[str]) -> list[str]:
+    return [text for text in texts if any(char in text for char in ("\x1b", "\x07", "\r"))]
+
+
+async def test_a_policy_refusal_quoting_the_models_path_carries_no_terminal_sequences(
+    policy, tmp_repo
+):
+    ui, store = _Recorder(), _store(tmp_repo)
+    elsewhere = tmp_repo.parent / "elsewhere"  # beside the sandbox root, not in it
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": f"{elsewhere}/{HOSTILE}passwd"}),), start("hi")
+    )
+    # The words are still there; what a terminal would act on is not.
+    quoted = f"{elsewhere}/passwd is outside the working directory"
+    assert outcomes[0].content.startswith(f"Refused (sandbox.outside-root): {quoted}")
+    [(_, result)] = ui.decisions
+    assert result.reason.startswith(quoted)
+    assert _what_a_terminal_would_act_on(_every_text_the_executor_wrote(outcomes, ui, store)) == []
+
+
+async def test_an_unknown_tool_name_carrying_terminal_sequences_is_shown_and_stored_without_them(
+    policy, tmp_repo
+):
+    ui, store = _Recorder(), _store(tmp_repo)
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", f"Nope{HOSTILE}", {}),), start("hi")
+    )
+    assert outcomes[0].content.startswith("Refused (tool.unknown): ")
+    [(request, _)] = ui.decisions
+    assert request.tool == "Nope"
+    stored = store.db.execute("SELECT tool FROM tool_calls WHERE tool_use_id = 't1'").fetchone()
+    assert stored["tool"] == "Nope"
+    assert _what_a_terminal_would_act_on(_every_text_the_executor_wrote(outcomes, ui, store)) == []
+
+
+@pytest.mark.parametrize(
+    ("where", "error", "content", "recorded"),
+    [
+        (
+            "permission_request",
+            ToolArgumentError(f"offset {HOSTILE}must be a number"),
+            "Refused (tool.bad-arguments): bad arguments: offset must be a number",
+            None,
+        ),
+        (
+            "permission_request",
+            OSError(f"cannot stat {HOSTILE}file"),
+            "Refused (tool.bad-arguments): bad arguments: OSError: cannot stat file",
+            None,
+        ),
+        (
+            "run",
+            ToolArgumentError(f"offset {HOSTILE}must be a number"),
+            "bad arguments: offset must be a number",
+            "offset must be a number",
+        ),
+        (
+            "run",
+            OSError(f"cannot stat {HOSTILE}file"),
+            "OSError: cannot stat file",
+            "cannot stat file",
+        ),
+    ],
+    ids=[
+        "tool-argument-error-in-the-permission-request",
+        "os-error-in-the-permission-request",
+        "tool-argument-error-in-run",
+        "os-error-in-run",
+    ],
+)
+async def test_the_message_of_an_error_over_a_calls_arguments_carries_no_terminal_sequences(
+    policy, tmp_repo, monkeypatch, where, error, content, recorded
+):
+    from nanoclaude.tools.read import ReadTool
+
+    def raising_request(
+        self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]
+    ) -> PermissionRequest:
+        raise error
+
+    async def raising_run(
+        self: ReadTool, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        raise error
+
+    monkeypatch.setattr(
+        ReadTool, where, raising_request if where == "permission_request" else raising_run
+    )
+    (tmp_repo / "a.py").write_text("x")
+    ui, store = _Recorder(), _store(tmp_repo)
+    outcomes = await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert outcomes[0].content == content
+    assert _audit_row(store, "t1")["error"] == recorded
+    assert _what_a_terminal_would_act_on(_every_text_the_executor_wrote(outcomes, ui, store)) == []
