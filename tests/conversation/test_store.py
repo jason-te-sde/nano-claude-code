@@ -5,18 +5,27 @@ into the repository itself.
 """
 
 import json
+import sqlite3
 from collections.abc import Hashable
 from types import SimpleNamespace
 
 import pytest
 
-from nanoclaude.conversation.store import SessionRow, Store, decode_blocks, encode_blocks
+from nanoclaude.conversation.store import (
+    MessageConflictError,
+    SessionRow,
+    Store,
+    decode_blocks,
+    encode_blocks,
+)
 from nanoclaude.conversation.transcript import (
     Message,
+    Role,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    Transcript,
     user_text,
     validate,
 )
@@ -123,6 +132,76 @@ def test_recent_sessions_are_newest_first_and_respect_the_limit(tmp_path, monkey
     assert [row.id for row in store.recent_sessions(2)] == ["b", "c"]
 
 
+def test_one_stored_session_can_be_read_back_by_its_id(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, 4.0, 9.0)
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/proj", roles={"main": "sonnet"})
+    store.finish_session("s1", Usage(input_tokens=100, output_tokens=20), cost_usd=0.0031)
+    assert store.session_row("s1") == SessionRow(
+        id="s1",
+        started_at=4.0,
+        ended_at=9.0,
+        cwd="/proj",
+        total_cost_usd=0.0031,
+        total_input_tokens=100,
+        total_output_tokens=20,
+    )
+
+
+def test_a_session_that_never_finished_reads_back_with_an_unknown_cost(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    row = store.session_row("s1")
+    assert row is not None
+    assert (row.ended_at, row.total_cost_usd, row.total_input_tokens) == (None, None, 0)
+
+
+def test_a_session_that_is_not_stored_reads_back_as_none(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    assert store.session_row("s2") is None
+
+
+def test_the_row_read_by_id_is_the_one_the_listing_shows(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    assert store.recent_sessions(1) == [store.session_row("s1")]
+
+
+def _audit(store: Store, session_id: str, tool_use_id: str, turn: int) -> None:
+    store.db.execute(
+        "INSERT INTO tool_calls "
+        "(session_id, turn, tool_use_id, ts, tool, args_json, decision, rule) "
+        "VALUES (?, ?, ?, 0, 'Read', '{}', 'allow', 'rule.allow')",
+        (session_id, turn, tool_use_id),
+    )
+    store.db.commit()
+
+
+def test_the_next_turn_to_audit_is_one_past_the_largest_already_audited(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    assert store.next_tool_turn("s1") == 0  # nothing audited yet
+    for tool_use_id, turn in (("a", 0), ("b", 3), ("c", 1)):
+        _audit(store, "s1", tool_use_id, turn)
+    assert store.next_tool_turn("s1") == 4
+
+
+def test_the_next_turn_to_audit_counts_only_the_session_asked_about(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.create_session("s2", cwd="/p", roles={})
+    _audit(store, "s2", "a", 7)
+    assert store.next_tool_turn("s1") == 0
+    assert store.next_tool_turn("s2") == 8
+
+
 def test_latest_session_id_is_none_for_an_empty_database(tmp_path):
     store = Store(tmp_path / "s.db")
     store.open()
@@ -136,6 +215,419 @@ def test_finishing_a_session_records_usage_and_cost(tmp_path):
     store.finish_session("s1", Usage(input_tokens=100, output_tokens=20), cost_usd=0.0031)
     row = store.recent_sessions(1)[0]
     assert (row.total_input_tokens, row.total_cost_usd) == (100, 0.0031)
+
+
+def _stored_cost(store: Store, session_id: str) -> object:
+    """The raw column, so a NULL is seen as NULL and not as whatever the row type makes of it."""
+    return store.db.execute(
+        "SELECT total_cost_usd FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()[0]
+
+
+def test_a_session_whose_cost_is_unknown_is_stored_as_null_not_zero(tmp_path):
+    # Router.total_cost() is None when any model used has no price. Stored as 0
+    # it would read as "free", which is the one answer that is known to be wrong.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.finish_session("s1", Usage(input_tokens=100, output_tokens=20), cost_usd=None)
+    row = store.recent_sessions(1)[0]
+    assert row.total_cost_usd is None
+    assert _stored_cost(store, "s1") is None
+    # Everything else about the session is still recorded.
+    assert (row.total_input_tokens, row.total_output_tokens) == (100, 20)
+    assert row.ended_at is not None
+
+
+def test_a_known_zero_cost_is_stored_as_zero_and_stays_distinct_from_unknown(tmp_path):
+    # A local model is priced at exactly zero. That is a known cost and must not
+    # collapse into the unknown one, whichever way the fix for it is written.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.finish_session("s1", Usage(), cost_usd=0.0)
+    assert _stored_cost(store, "s1") == 0.0
+    assert store.recent_sessions(1)[0].total_cost_usd == 0.0
+
+
+def test_a_session_that_has_not_finished_has_no_cost_yet(tmp_path):
+    # The column has no default: a row created and never finished says "not
+    # known", where the old DEFAULT 0 said "free".
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    assert _stored_cost(store, "s1") is None
+    assert store.recent_sessions(1)[0].total_cost_usd is None
+
+
+def test_a_cost_that_becomes_unknown_replaces_the_one_that_was_known(tmp_path):
+    # A session can start on a priced model and switch to an unpriced one. The
+    # later total is unknown, and a stale partial figure must not outlive it.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.finish_session("s1", Usage(input_tokens=10), cost_usd=0.5)
+    store.finish_session("s1", Usage(input_tokens=20), cost_usd=None)
+    assert _stored_cost(store, "s1") is None
+
+
+def _transcript(*texts: str) -> Transcript:
+    """Alternating user and assistant text messages, starting with the user."""
+    roles: tuple[Role, ...] = ("user", "assistant")
+    return Transcript(tuple(Message(roles[i % 2], (TextBlock(t),)) for i, t in enumerate(texts)))
+
+
+def test_replacing_a_transcript_with_a_shorter_one_leaves_none_of_the_old_tail(tmp_path):
+    # Compaction swaps a long history for a short one. Writing the short one over
+    # the first rows would leave the old tail after it, and the session would
+    # reload as the summary followed by messages it was meant to replace.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    for seq, message in enumerate(_transcript("a", "b", "c", "d", "e", "f").messages):
+        store.append_message("s1", seq, message)
+
+    shorter = _transcript("summary", "kept")
+    store.replace_transcript("s1", shorter)
+
+    assert store.load_transcript("s1") == shorter
+
+
+def test_replacing_a_transcript_with_an_empty_one_clears_it(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.replace_transcript("s1", _transcript("a", "b"))
+    store.replace_transcript("s1", Transcript())
+    assert store.load_transcript("s1") == Transcript()
+
+
+def test_replacing_one_sessions_transcript_leaves_every_other_session_alone(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.create_session("s2", cwd="/p", roles={})
+    keep = _transcript("x", "y", "z")
+    store.replace_transcript("s2", keep)
+    store.replace_transcript("s1", _transcript("only"))
+    assert store.load_transcript("s2") == keep
+    assert store.load_transcript("s1") == _transcript("only")
+
+
+def test_a_replacement_that_cannot_be_stored_changes_nothing(tmp_path):
+    # The delete and the inserts are one transaction: a failure part-way must
+    # leave the old transcript, not an empty one and not half of each.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    original = _transcript("a", "b", "c")
+    store.replace_transcript("s1", original)
+
+    # The first message encodes fine and the second cannot. Nothing is changed:
+    # the next test makes the failure come after the first changes were made.
+    unstorable = Transcript(
+        (original.messages[0], Message("assistant", (TextBlock(object()),)))  # type: ignore[arg-type]
+    )
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        store.replace_transcript("s1", unstorable)
+
+    assert store.load_transcript("s1") == original
+
+
+# -- the archive: what a replacement removes is kept ---------------------------
+
+
+def _archived(store: Store, session_id: str) -> list[tuple[int, Message]]:
+    """The archived rows of a session in the order they were archived, as (seq, message)."""
+    rows = store.db.execute(
+        "SELECT seq, role, blocks_json FROM messages_archive WHERE session_id = ? ORDER BY rowid",
+        (session_id,),
+    ).fetchall()
+    return [(row["seq"], Message(row["role"], decode_blocks(row["blocks_json"]))) for row in rows]
+
+
+def _live_times(store: Store, session_id: str) -> dict[int, float]:
+    rows = store.db.execute(
+        "SELECT seq, created_at FROM messages WHERE session_id = ? ORDER BY seq", (session_id,)
+    ).fetchall()
+    return {row["seq"]: row["created_at"] for row in rows}
+
+
+def _stored_six(store: Store) -> Transcript:
+    store.create_session("s1", cwd="/p", roles={})
+    stored = _transcript("a", "b", "c", "d", "e", "f")
+    for seq, message in enumerate(stored.messages):
+        store.append_message("s1", seq, message)
+    return stored
+
+
+def test_what_a_replacement_removes_is_moved_to_the_archive_and_not_lost(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    old = _stored_six(store)
+
+    shorter = _transcript("summary", "kept")
+    store.replace_transcript("s1", shorter)
+
+    assert store.load_transcript("s1") == shorter  # the live rows are the working transcript
+    assert _archived(store, "s1") == list(enumerate(old.messages))
+
+
+def test_the_archive_and_the_live_rows_hold_every_message_ever_stored(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    ever = list(_stored_six(store).messages)
+    for replacement in (
+        _transcript("summary", "kept", "next"),
+        _transcript("second summary", "last"),
+        Transcript(),
+    ):
+        store.replace_transcript("s1", replacement)
+        ever.extend(replacement.messages)
+    live = store.load_transcript("s1").messages
+    archived = [message for _, message in _archived(store, "s1")]
+    assert all(message in (*live, *archived) for message in ever)
+
+
+def test_rows_a_replacement_leaves_as_they_were_keep_their_time_and_are_not_archived(
+    tmp_path, monkeypatch
+):
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    for seq, message in enumerate(_transcript("a", "b", "c", "d").messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 5
+
+    changed = _transcript("a", "b", "X", "Y")
+    store.replace_transcript("s1", changed)  # tick 6
+
+    assert store.load_transcript("s1") == changed
+    assert _live_times(store, "s1") == {0: 2.0, 1: 3.0, 2: 6.0, 3: 6.0}
+    assert [seq for seq, _ in _archived(store, "s1")] == [2, 3]
+
+
+def test_a_message_that_moves_to_another_position_keeps_the_time_it_was_first_stored(
+    tmp_path, monkeypatch
+):
+    # Compaction renumbers the messages it keeps. They are the same messages.
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    for seq, message in enumerate(_transcript("a", "b", "c", "d", "e", "f").messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 7: d, e, f at 5, 6, 7
+
+    store.replace_transcript("s1", _transcript("summary", "d", "e", "f"))  # tick 8
+
+    assert _live_times(store, "s1") == {0: 8.0, 1: 5.0, 2: 6.0, 3: 7.0}
+
+
+def test_the_last_copy_of_a_message_that_comes_back_is_the_one_a_replacement_keeps(
+    tmp_path, monkeypatch
+):
+    # What a replacement keeps it keeps from the end: the compaction that wrote it kept
+    # the latest messages, so a message with several copies is the latest of them.
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    for seq, message in enumerate(_transcript("x", "ok", "y", "ok", "z", "ok").messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 7: "ok" at 3, 5 and 7
+
+    longer = _transcript("s", "p", "q", "r", "t", "u", "v", "ok")  # "ok" moves to position 7
+    store.replace_transcript("s1", longer)  # tick 8
+
+    assert store.load_transcript("s1") == longer
+    assert _live_times(store, "s1")[7] == 7.0
+
+
+def test_a_repeated_message_that_compaction_keeps_has_its_own_time_and_not_an_earlier_copys(
+    tmp_path, monkeypatch
+):
+    # "continue" typed twice, at ticks 2 and 6, and compaction keeps the later one.
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    old = _transcript("continue", "r1", "q", "r2", "continue", "r3")
+    for seq, message in enumerate(old.messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 7
+
+    kept = _transcript("summary", "r2", "continue", "r3")
+    store.replace_transcript("s1", kept)  # tick 8
+
+    assert store.load_transcript("s1") == kept
+    assert _live_times(store, "s1") == {0: 8.0, 1: 5.0, 2: 6.0, 3: 7.0}
+    # Every message left the position it was at, the kept ones for their new ones.
+    assert _archived(store, "s1") == list(enumerate(old.messages))
+
+
+def test_a_message_repeated_at_every_turn_keeps_its_own_time_through_compaction(
+    tmp_path, monkeypatch
+):
+    # Every user message is "continue", so the one compaction keeps is also what already
+    # sat at the position it moves to. Matching by what a message says would leave it
+    # there, with the time of an earlier copy, and the times would run out of order.
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    old = _transcript("continue", "r1", "continue", "r2", "continue", "r3", "continue", "r4")
+    for seq, message in enumerate(old.messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 9
+
+    store.replace_transcript("s1", _transcript("summary", "r3", "continue", "r4"))  # tick 10
+
+    assert _live_times(store, "s1") == {0: 10.0, 1: 7.0, 2: 8.0, 3: 9.0}
+
+
+def test_a_shorter_replacement_leaves_the_rows_it_starts_with_alone(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    old = _transcript("a", "b", "c", "d")
+    for seq, message in enumerate(old.messages):
+        store.append_message("s1", seq, message)  # ticks 2 to 5
+
+    store.replace_transcript("s1", _transcript("a", "b", "X"))  # tick 6
+
+    assert _live_times(store, "s1") == {0: 2.0, 1: 3.0, 2: 6.0}
+    assert _archived(store, "s1") == [(2, old.messages[2]), (3, old.messages[3])]
+
+
+def test_a_row_whose_role_changed_is_replaced_even_when_its_text_did_not(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    was = Message("user", (TextBlock("same words"),))
+    now = Message("assistant", (TextBlock("same words"),))
+    store.append_message("s1", 0, was)
+    store.replace_transcript("s1", Transcript((now,)))
+    assert store.load_transcript("s1").messages == (now,)
+    assert _archived(store, "s1") == [(0, was)]
+
+
+def test_a_replacement_stamps_a_row_that_changed_at_the_time_of_the_replacement(
+    tmp_path, monkeypatch
+):
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    store.append_message("s1", 0, _transcript("a").messages[0])  # tick 2
+    store.replace_transcript("s1", _transcript("b"))  # tick 3
+    assert _live_times(store, "s1") == {0: 3.0}
+    archived_at = store.db.execute(
+        "SELECT created_at, archived_at FROM messages_archive"
+    ).fetchall()
+    assert [(row["created_at"], row["archived_at"]) for row in archived_at] == [(2.0, 3.0)]
+
+
+def test_a_replacement_that_cannot_be_stored_part_way_leaves_both_tables_as_they_were(tmp_path):
+    # The first row is kept and the second is archived and deleted before the third
+    # is refused: a role the table will not take. All of it is one transaction.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    original = _transcript("a", "b", "c")
+    store.replace_transcript("s1", original)
+    before = store.db.execute("SELECT * FROM messages ORDER BY seq").fetchall()
+
+    refused = Transcript(
+        (
+            original.messages[0],
+            Message("assistant", (TextBlock("changed"),)),
+            Message(None, (TextBlock("no role"),)),  # type: ignore[arg-type]
+        )
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        store.replace_transcript("s1", refused)
+
+    assert store.load_transcript("s1") == original
+    assert [tuple(row) for row in store.db.execute("SELECT * FROM messages ORDER BY seq")] == [
+        tuple(row) for row in before
+    ]
+    assert _archived(store, "s1") == []
+
+
+def test_replacing_one_sessions_transcript_archives_nothing_of_another(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s2", cwd="/p", roles={})
+    store.replace_transcript("s2", _transcript("x", "y", "z"))
+    old = _stored_six(store)
+    store.replace_transcript("s1", _transcript("only"))
+    assert store.load_transcript("s2") == _transcript("x", "y", "z")
+    assert _archived(store, "s2") == []
+    assert _archived(store, "s1") == list(enumerate(old.messages))  # none of s2's among them
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        Message("assistant", (TextBlock("same words"),)),
+        Message("user", (TextBlock("other words"),)),
+    ],
+    ids=["another-role", "other-words"],
+)
+def test_writing_a_different_message_where_one_is_stored_is_refused_and_changes_nothing(
+    tmp_path, monkeypatch, other
+):
+    # Another process has written to the session: the rows are not the ones this writer
+    # believes they are, and the audit trail is not for overwriting.
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    stored = Message("user", (TextBlock("same words"),))
+    store.append_message("s1", 0, stored)  # tick 2
+    with pytest.raises(MessageConflictError) as caught:
+        store.append_message("s1", 0, other)  # tick 3
+    assert (caught.value.session_id, caught.value.seq) == ("s1", 0)
+    assert store.load_transcript("s1").messages == (stored,)
+    assert _live_times(store, "s1") == {0: 2.0}
+    assert _archived(store, "s1") == []
+
+
+def test_a_row_the_table_refuses_for_another_reason_is_not_reported_as_a_conflict(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        store.append_message("s1", 0, Message(None, (TextBlock("no role"),)))  # type: ignore[arg-type]
+
+
+def test_writing_the_message_that_is_already_stored_changes_nothing(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 40)))
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})  # tick 1
+    message = _transcript("a").messages[0]
+    store.append_message("s1", 0, message)  # tick 2
+    store.append_message("s1", 0, message)  # tick 3
+    assert _live_times(store, "s1") == {0: 2.0}
+    assert _archived(store, "s1") == []
+
+
+def test_a_database_made_before_the_archive_existed_gains_it_and_keeps_its_data(tmp_path):
+    path = tmp_path / "s.db"
+    earlier = Store(path)
+    earlier.open()
+    earlier.create_session("s1", cwd="/p", roles={})
+    kept = _transcript("a", "b")
+    for seq, message in enumerate(kept.messages):
+        earlier.append_message("s1", seq, message)
+    earlier.db.execute("DROP TABLE messages_archive")  # what a build without it left behind
+    earlier.db.commit()
+    earlier.close()
+
+    later = Store(path)
+    later.open()
+    assert later.load_transcript("s1") == kept
+    later.replace_transcript("s1", _transcript("summary"))
+    assert [seq for seq, _ in _archived(later, "s1")] == [0, 1]
 
 
 def test_opening_an_existing_database_does_not_lose_data(tmp_path):

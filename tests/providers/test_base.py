@@ -1,9 +1,21 @@
+import os
+import re
+import subprocess
+import sys
 from collections.abc import Hashable
+from pathlib import Path
 
 import pytest
 
 from nanoclaude.conversation.transcript import ToolUseBlock, Transcript, user_text
-from nanoclaude.providers.base import ModelReply, ModelRequest, StopKind, ToolSpec, Usage
+from nanoclaude.providers.base import (
+    ModelReply,
+    ModelRequest,
+    StopKind,
+    ToolSpec,
+    Usage,
+    new_call_id,
+)
 
 
 def test_usage_add_accumulates_all_four_fields():
@@ -56,3 +68,29 @@ def test_model_request_is_not_hashable():
     assert not isinstance(request, Hashable)  # type: ignore[unreachable]
     with pytest.raises(TypeError, match="unhashable type: 'ModelRequest'"):
         hash(request)
+
+
+def test_a_minted_call_id_is_the_prefix_and_twelve_hex_characters():
+    assert re.fullmatch(r"call_[0-9a-f]{12}", new_call_id("call"))
+    assert re.fullmatch(r"tt_[0-9a-f]{12}", new_call_id("tt"))
+
+
+def test_minted_call_ids_do_not_repeat_within_a_process():
+    # Two calls in one conversation must never share an id; chance gets no say in it.
+    ids = {new_call_id("call") for _ in range(2_000)}
+    assert len(ids) == 2_000
+
+
+def test_a_new_process_does_not_mint_the_ids_an_earlier_one_did():
+    # What a resumed conversation depends on: it already holds the ids the process
+    # that wrote it made, and a counter would start again at the same number.
+    code = "from nanoclaude.providers.base import new_call_id; print(new_call_id('call'))"
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2] / "src")}
+    minted = [
+        subprocess.run(  # noqa: S603
+            [sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        for _ in range(2)
+    ]
+    assert all(re.fullmatch(r"call_[0-9a-f]{12}", one) for one in minted)
+    assert minted[0] != minted[1]

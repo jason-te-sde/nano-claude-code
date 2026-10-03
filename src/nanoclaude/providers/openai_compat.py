@@ -36,6 +36,7 @@ from nanoclaude.providers.base import (
     StopKind,
     ToolSpec,
     Usage,
+    new_call_id,
 )
 from nanoclaude.providers.retry import classify_status
 
@@ -205,7 +206,7 @@ class ChunkAccumulator:
                 raise ModelError(f"tool call {index} arrived with no function name")
             blocks.append(
                 ToolUseBlock(
-                    slot["id"] or f"call_{index}",
+                    slot["id"] or new_call_id("call"),
                     slot["name"],
                     parse_arguments(slot["arguments"]),
                 )

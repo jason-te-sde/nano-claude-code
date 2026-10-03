@@ -18,6 +18,34 @@ between one barrier and the next still go concurrently, capped by a
 semaphore; a refused or declined call never executes and so cannot split a
 run of reads around it. Concurrency buys latency within one run; no amount of
 it is worth an undefined order between a write and whatever depends on it.
+
+**What is stripped of terminal control sequences, and what is not.** The front end
+prints what it is given and a terminal acts on what it prints: a title change, a
+screen clear, a carriage return that rewrites a line. So every string the executor
+*builds* from text the model chose goes through
+:func:`~nanoclaude.tools.base.sanitize` once, where it is built, and the model, the
+front end and the audit log all get the clean one:
+
+* the reason of every policy result, which quotes the path or the command asked
+  about;
+* the message of a refusal made before the policy runs (an unknown tool name, an
+  error a tool raised over its arguments), the tool name on the placeholder request
+  the front end is handed for such a call, and the tool column of the audit row;
+* the text of an error raised while a tool runs, and the error column it sets;
+* the detail of an internal error, which is also scrubbed of credentials.
+
+What a tool returns is built by the tool, through ``ok()`` and ``failed()``, which
+strip it; the executor does not strip it again. The call's arguments are stored in
+the audit row as JSON.
+
+Two things reach the front end as they are, and that is deliberate: the request a
+tool built (its subject is the path or the command it asks about), which goes to
+``ui.confirm`` and ``ui.on_decision``, and the model's own call (its name and
+arguments), which goes to those two and to ``ui.on_outcome``. The policy has to judge
+what would really run, and a rule matched against a stripped copy of a command is
+matched against something the shell never receives. Whatever draws a confirmation,
+which is where a carriage return or a screen clear could change what a person thinks
+they are approving, has to render these two safely itself.
 """
 
 from __future__ import annotations
@@ -25,7 +53,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from nanoclaude.agent.loop import LoopState
 from nanoclaude.agent.ui import UI, Approval, AutoDecline
@@ -40,10 +68,23 @@ from nanoclaude.permissions.policy import (
     evaluate,
 )
 from nanoclaude.permissions.redact import Redactor
-from nanoclaude.tools.base import Tool, ToolArgumentError, ToolContext, ToolOutcome
+from nanoclaude.tools.base import (
+    Tool,
+    ToolArgumentError,
+    ToolContext,
+    ToolOutcome,
+    failed,
+    sanitize,
+)
 from nanoclaude.tools.registry import ToolRegistry, UnknownToolError
 
 MAX_CONCURRENT_READS = 8
+
+#: The rule recorded for a call whose tool broke while it was being asked what the
+#: call would touch. Not one of the 17 ids in spec 17.4: none of them describes a
+#: bug, and the audit row needs some decision and rule to exist at all. It is a deny
+#: because the call did not go ahead.
+INTERNAL_ERROR_RULE = "tool.internal-error"
 
 
 def _refusal_text(rule: str, reason: str) -> str:
@@ -88,6 +129,8 @@ class _Plan:
     request: PermissionRequest
     result: PermissionResult
     refusal: ToolOutcome | None
+    #: True when ``refusal`` is the result of the tool breaking, not of a decision.
+    crashed: bool = False
 
     # Declared unhashable rather than left to the default: call is a
     # ToolUseBlock, already unhashable because it holds decoded-JSON
@@ -120,9 +163,16 @@ class Executor:
         )
 
     async def run_batch(
-        self, calls: Sequence[ToolUseBlock], state: LoopState
+        self, calls: Sequence[ToolUseBlock], state: LoopState, *, turn: int | None = None
     ) -> tuple[ToolOutcome, ...]:
+        """Decide, then run, the calls of one model turn; one outcome for each, in order.
+
+        ``turn`` is the number the audit records the batch under. It defaults to the
+        state's own count, which starts again with every prompt: a session that
+        wants its audit numbered across prompts says which turn this is.
+        """
         ctx = self.context(state)
+        audit_turn = state.turn if turn is None else turn
         # Every call's _Plan is built from this one snapshot of self.grants,
         # taken before any of them is confirmed. An ALWAYS answer to call 1
         # updates self.grants in the loop below, but call 2's _Plan was
@@ -132,18 +182,22 @@ class Executor:
         # run_batch, not retroactively within this one; that is what keeps
         # the first phase's promise that no call's outcome in a batch depends
         # on how a *later* one in the same batch turns out.
-        plans = [self._decide(ctx, call, state.turn) for call in calls]
+        plans = [self._decide(ctx, call, audit_turn) for call in calls]
         results: dict[str, ToolOutcome] = {}
 
         for plan in plans:
             if plan.refusal is not None:
                 results[plan.call.id] = plan.refusal
+                if plan.crashed:
+                    # Not a refusal: the call ended in an error, so the front end
+                    # hears of it as it hears of any other, and it is audited as one.
+                    self.ui.on_outcome(plan.call, plan.refusal)
                 self._audit_outcome(
                     plan.call.id,
-                    outcome="refused",
+                    outcome="error" if plan.crashed else "refused",
                     duration_ms=0,
                     bytes_out=len(plan.refusal.content.encode("utf-8")),
-                    error=None,
+                    error=plan.result.reason if plan.crashed else None,
                 )
                 continue
             if plan.result.decision is not Decision.ASK:
@@ -208,8 +262,27 @@ class Executor:
             return self._refused(
                 call, f"bad arguments: {type(exc).__name__}: {exc}", turn, "tool.bad-arguments"
             )
+        except Exception as exc:
+            # The tool broke while being asked what the call would touch. As with a
+            # bug in run(), that is this call's failure and not the batch's: left to
+            # escape it would abort the batch and discard the outcomes of the calls
+            # already decided. It sits after the clauses above, which keep the
+            # failures a tool is allowed to have, and names Exception so that
+            # cancellation and KeyboardInterrupt still propagate.
+            return self._crashed(call, exc, turn)
 
-        result = evaluate(request, self.policy, self.grants)
+        try:
+            result = evaluate(request, self.policy, self.grants)
+        except Exception as exc:
+            # The tool answered its question, and what it answered cannot be judged
+            # (a subject that is not a string, a list of paths that is not a list).
+            # That is the same failure as a tool that cannot answer, and it ends the
+            # call the same way: as an error under tool.internal-error, not run, with
+            # the batch going on.
+            return self._crashed(call, exc, turn)
+        # A reason quotes what the model asked for (the path that is outside the
+        # sandbox, the command that was refused).
+        result = replace(result, reason=sanitize(result.reason))
         self.ui.on_decision(call, request, result)
         self._audit_decision(call, turn, result)
         if result.decision is Decision.DENY:
@@ -226,8 +299,11 @@ class Executor:
         # Reaches here before evaluate() ever runs (an unknown tool name, or
         # arguments bad enough that permission_request() itself raises), so
         # there is no real PermissionRequest to report -- the same placeholder
-        # used below is what on_decision and the audit log both see.
-        request = PermissionRequest(call.name, "")
+        # used below is what on_decision and the audit log both see. The message
+        # quotes the call, and the name may be one the registry never heard of: it
+        # is whatever the model wrote.
+        message = sanitize(message)
+        request = PermissionRequest(sanitize(call.name), "")
         result = PermissionResult(Decision.DENY, rule, message)
         self.ui.on_decision(call, request, result)
         self._audit_decision(call, turn, result)
@@ -239,6 +315,36 @@ class Executor:
             ToolOutcome(call.id, _refusal_text(rule, message), is_error=True),
         )
 
+    def _crashed(self, call: ToolUseBlock, exc: Exception, turn: int) -> _Plan:
+        outcome, detail = self._internal_error(call, exc)
+        # Reaches here before evaluate() ever runs, so, as in _refused, there is no
+        # real PermissionRequest to report.
+        request = PermissionRequest(call.name, "")
+        result = PermissionResult(Decision.DENY, INTERNAL_ERROR_RULE, detail)
+        self.ui.on_decision(call, request, result)
+        self._audit_decision(call, turn, result)
+        return _Plan(call, None, request, result, outcome, crashed=True)
+
+    def _internal_error(self, call: ToolUseBlock, exc: Exception) -> tuple[ToolOutcome, str]:
+        """What a call whose tool raised something it should not have comes to.
+
+        Returns the outcome the model sees and the ``Type: message`` the audit row
+        and the front end keep. The text is treated like any tool output: an
+        exception can quote the value the tool was handling, so it is stripped of
+        terminal control sequences, which would otherwise be played back to the
+        person reading the audit or the screen, and scrubbed of anything shaped like
+        a credential. In that order: a secret split by an escape sequence would
+        otherwise get past the scrubber. The first line is the one the REPL prints.
+        """
+        detail, _ = self.redactor.scrub(sanitize(f"{type(exc).__name__}: {exc}"))
+        outcome = failed(
+            call.id,
+            f"Internal error in {call.name}: {detail}\n"
+            "This is a bug in the tool, not in your arguments. Do not repeat the call; "
+            "try another approach, or tell the user what failed.",
+        )
+        return outcome, detail
+
     def _audit_decision(self, call: ToolUseBlock, turn: int, result: PermissionResult) -> None:
         if self.audit is None:
             return
@@ -246,7 +352,7 @@ class Executor:
             self.session_id,
             turn=turn,
             tool_use_id=call.id,
-            tool=call.name,
+            tool=sanitize(call.name),
             arguments=call.arguments,
             decision=result.decision,
             rule=result.rule,
@@ -282,11 +388,20 @@ class Executor:
         try:
             outcome = await plan.tool.run(ctx, plan.call.id, plan.call.arguments)
         except ToolArgumentError as exc:
-            outcome = ToolOutcome(plan.call.id, f"bad arguments: {exc}", is_error=True)
-            error = str(exc)
+            outcome = failed(plan.call.id, f"bad arguments: {exc}")
+            error = sanitize(str(exc))
         except OSError as exc:
-            outcome = ToolOutcome(plan.call.id, f"{type(exc).__name__}: {exc}", is_error=True)
-            error = str(exc)
+            outcome = failed(plan.call.id, f"{type(exc).__name__}: {exc}")
+            error = sanitize(str(exc))
+        except Exception as exc:
+            # A bug in one tool is that call's failure, not the batch's. Left to
+            # escape, it leaves run_batch, discards the outcomes of the calls that
+            # already finished, and reaches the person as a traceback. It sits
+            # after the two clauses above so the failures a tool is allowed to have
+            # keep their own wording, and it names Exception rather than
+            # BaseException so cancellation and KeyboardInterrupt still stop the
+            # batch instead of being reported to the model as a bug.
+            outcome, error = self._internal_error(plan.call, exc)
         self.ui.on_outcome(plan.call, outcome)
         self._audit_outcome(
             plan.call.id,

@@ -36,6 +36,7 @@ from nanoclaude.providers.base import (
     StopKind,
     ToolSpec,
     Usage,
+    new_call_id,
 )
 from nanoclaude.providers.capabilities import CONSERVATIVE_DEFAULT, Capabilities
 from nanoclaude.providers.retry import classify_status
@@ -158,7 +159,7 @@ class OllamaClient:
                         function = raw.get("function") or {}
                         calls.append(
                             ToolUseBlock(
-                                raw.get("id") or f"call_{len(calls)}",
+                                raw.get("id") or new_call_id("call"),
                                 function.get("name", ""),
                                 parse_arguments(function.get("arguments")),
                             )

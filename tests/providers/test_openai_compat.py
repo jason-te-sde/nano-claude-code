@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import httpx
@@ -12,6 +13,7 @@ from nanoclaude.conversation.transcript import (
     ToolUseBlock,
     Transcript,
     user_text,
+    validate,
 )
 from nanoclaude.providers.base import ModelClient, ModelError, ModelRequest, StopKind, ToolSpec
 from nanoclaude.providers.openai_compat import (
@@ -305,9 +307,9 @@ def test_a_tool_call_that_never_receives_a_name_is_a_usable_error():
 
 
 def test_a_tool_call_with_no_id_falls_back_to_a_generated_one():
-    # The other half of "slot['id'] or f'call_{index}'" -- every other
-    # tool-call test supplies an id in the opening fragment; this one never
-    # does, so the call still needs an id the executor can refer back to.
+    # The other half of "slot['id'] or a minted id" -- every other tool-call test
+    # supplies an id in the opening fragment; this one never does, so the call
+    # still needs an id the executor can refer back to.
     accumulator = ChunkAccumulator(model="m")
     accumulator.handle(
         {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": {"name": "Read"}}]}}]}
@@ -315,7 +317,48 @@ def test_a_tool_call_with_no_id_falls_back_to_a_generated_one():
     accumulator.handle({"choices": [{"finish_reason": "tool_calls", "delta": {}}]})
     call = accumulator.result().blocks[0]
     assert isinstance(call, ToolUseBlock)
-    assert call.id == "call_0"
+    assert re.fullmatch(r"call_[0-9a-f]{12}", call.id)
+
+
+async def test_replies_whose_calls_come_without_ids_get_ids_of_their_own():
+    # A server that sends no id (some compatible ones do not) must not get "call_0"
+    # in every reply: the transcript refuses a tool_use id it already holds, so the
+    # second tool round of a conversation would have ended the session.
+    stream = (
+        b'data: {"choices": [{"delta": {"tool_calls": ['
+        b'{"index": 0, "function": {"name": "Read", "arguments": "{\\"path\\": \\"a.py\\"}"}},'
+        b'{"index": 1, "function": {"name": "Read", "arguments": "{\\"path\\": \\"b.py\\"}"}}'
+        b"]}}]}\n\n"
+        b'data: {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=stream, headers={"content-type": "text/event-stream"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = OpenAICompatClient("test-key", model="m", base_url="https://x/v1", client=http)
+        ask = ModelRequest("s", Transcript((user_text("hi"),)), (), 10)
+        first = await client.complete(ask)
+        second = await client.complete(ask)
+    calls = [b for reply in (first, second) for b in reply.blocks if isinstance(b, ToolUseBlock)]
+    assert len(calls) == 4
+    assert len({call.id for call in calls}) == 4
+    assert all(re.fullmatch(r"call_[0-9a-f]{12}", call.id) for call in calls)
+    # As the loop would build the conversation from them.
+    answered = tuple(
+        ToolResultBlock(b.id, "ok") for b in first.blocks if isinstance(b, ToolUseBlock)
+    )
+    validate(
+        Transcript(
+            (
+                user_text("hi"),
+                Message("assistant", tuple(first.blocks)),
+                Message("user", answered),
+                Message("assistant", tuple(second.blocks)),
+            )
+        )
+    )
 
 
 def test_an_error_chunk_raises_a_model_error():

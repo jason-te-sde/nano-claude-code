@@ -7,8 +7,10 @@ Above this module nothing knows the difference.
 This is the least reliable path in the project and it is documented as such:
 small models emit malformed JSON, forget the closing tag, and wrap everything
 in code fences. Two of those three are tolerated here; the third is reported to
-the model so it can try again, at most :data:`MAX_PARSE_RETRIES` times before
-the session gives up and says this model is not suitable.
+the model so it can try again, at most :data:`MAX_PARSE_RETRIES` times in a row,
+after which the session stops with ``StopReason.MODEL_UNSUITABLE`` and tells the
+person to choose another model. Whether to retry is the session's decision:
+:func:`parse_reply` only says what was wrong.
 
 The grammar is XML-ish rather than JSON because a model that cannot emit a
 well-formed function call reliably also cannot emit a well-formed JSON envelope
@@ -135,20 +137,32 @@ def _clean(fragment: str) -> str:
     return stripped.strip("`").strip() if stripped.startswith("```") else stripped
 
 
-def wrap_reply(reply: ModelReply, *, next_id: Callable[[], str]) -> ModelReply:
-    """Re-parse a plain-text reply as though it had been a native tool call."""
+def parse_reply(
+    reply: ModelReply, *, next_id: Callable[[], str]
+) -> tuple[ModelReply, tuple[str, ...]]:
+    """Re-parse a plain-text reply as though it had been a native tool call.
+
+    Returns the reply as :func:`wrap_reply` builds it and what was wrong with it:
+    one entry for each tool block that could not be used, empty when nothing was.
+    A reply with problems and no call is one the model should be asked to write
+    again. One with problems and a call has already run what it could, and the
+    problems stay in its text so the model learns the rest did not.
+    """
     text = "".join(b.text for b in reply.blocks if isinstance(b, TextBlock))
     if "<tool" not in text:
-        return reply
+        return reply, ()
     blocks, problems = parse_text_tools(text, next_id=next_id)
     calls = [b for b in blocks if isinstance(b, ToolUseBlock)]
     if problems and not calls:
         note = "\n".join(f"- {p}" for p in problems)
-        return ModelReply(
-            (TextBlock(f"{text}\n\n[tool protocol] {note}"),),
-            reply.stop,
-            reply.usage,
-            reply.model,
+        return (
+            ModelReply(
+                (TextBlock(f"{text}\n\n[tool protocol] {note}"),),
+                reply.stop,
+                reply.usage,
+                reply.model,
+            ),
+            tuple(problems),
         )
     if problems:
         # Some calls parsed and some did not. Run the ones that did, but keep the
@@ -157,4 +171,9 @@ def wrap_reply(reply: ModelReply, *, next_id: Callable[[], str]) -> ModelReply:
         note = "\n".join(f"- {p}" for p in problems)
         blocks = [*blocks, TextBlock(f"[tool protocol] {note}")]
     stop = StopKind.TOOL_USE if calls else reply.stop
-    return ModelReply(tuple(blocks), stop, reply.usage, reply.model)
+    return ModelReply(tuple(blocks), stop, reply.usage, reply.model), tuple(problems)
+
+
+def wrap_reply(reply: ModelReply, *, next_id: Callable[[], str]) -> ModelReply:
+    """Re-parse a plain-text reply as though it had been a native tool call."""
+    return parse_reply(reply, next_id=next_id)[0]

@@ -7,12 +7,24 @@ as :class:`~nanoclaude.providers.capabilities.Capabilities` and nothing else.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from nanoclaude.conversation.transcript import Block, Transcript
+
+
+def new_call_id(prefix: str) -> str:
+    """An id for a tool call that arrived without one: ``<prefix>_`` and twelve hex digits.
+
+    Random, because a transcript refuses an id it already holds, and a counter
+    repeats itself: in the next reply (every reply would start again at the same
+    number) and in the next process (a resumed conversation already holds the ids
+    an earlier one made).
+    """
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
 class StopKind(StrEnum):
@@ -98,10 +110,20 @@ class ModelError(RuntimeError):
     401 is not, and the difference must survive the trip up to the session.
     """
 
-    def __init__(self, message: str, *, retryable: bool = False, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status: int | None = None,
+        context_overflow: bool = False,
+    ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.status = status
+        #: True when the provider said the request does not fit the model's context
+        #: window. Spec 7.4: the session answers it with one compaction and one retry.
+        self.context_overflow = context_overflow
 
 
 @runtime_checkable

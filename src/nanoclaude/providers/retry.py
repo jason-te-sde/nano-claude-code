@@ -25,6 +25,18 @@ T = TypeVar("T")
 
 RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
 
+#: What a provider's error body says when the request does not fit the model's
+#: context window, matched case-insensitively. Each is a phrase from the provider's
+#: own error, so a new provider or a reworded error is one more line here and one
+#: more case in the tests.
+OVERFLOW_MARKERS = (
+    "prompt is too long",  # Anthropic
+    "context_length_exceeded",  # OpenAI's error code
+    "maximum context length",  # OpenAI's message, and vLLM's
+    "exceed context limit",  # Anthropic, when the input and max_tokens do not fit together
+    "exceeds the available context size",  # llama.cpp
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
@@ -57,6 +69,16 @@ def _message_from(body: str) -> str:
     return str(error or body)[:500]
 
 
+def _reports_overflow(body: str) -> bool:
+    """Whether the body says the request does not fit the model's window.
+
+    Matched on the whole body, not on the message quoted back to the person: that
+    is cut at 500 characters.
+    """
+    lowered = body.lower()
+    return any(marker in lowered for marker in OVERFLOW_MARKERS)
+
+
 def classify_status(status: int, body: str) -> ModelError:
     detail = _message_from(body)
     if status in (401, 403):
@@ -80,6 +102,9 @@ def classify_status(status: int, body: str) -> ModelError:
         f"the provider rejected the request (HTTP {status}): {detail}",
         retryable=False,
         status=status,
+        # Only a 400: the same words under another status are not an overflow
+        # the session knows how to fix.
+        context_overflow=status == 400 and _reports_overflow(body),
     )
 
 

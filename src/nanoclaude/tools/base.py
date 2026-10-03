@@ -29,9 +29,16 @@ class ToolArgumentError(ValueError):
 
 #: CSI (colour, cursor movement, clear screen) and OSC (window title) sequences.
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
-#: Every C0 control except tab and newline, plus DEL. Carriage returns go too:
-#: a progress bar redrawing itself is noise in a transcript.
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+#: Every C0 control except tab and newline, plus DEL and the C1 controls
+#: (U+0080 to U+009F). Carriage returns go too: a progress bar redrawing itself is
+#: noise in a transcript. The C1 block is the 8-bit form of the escape sequences
+#: above (U+009B is a CSI, U+009D an OSC, U+0090 a DCS, U+009C a string terminator),
+#: which a terminal that honours C1 in UTF-8 acts on as it would on the two-byte
+#: form. The bidirectional controls (U+202A to U+202E, U+2066 to U+2069) are not here
+#: on purpose: they do not act on a terminal, and file contents can hold them, so
+#: stripping them from what Read returns would leave Edit unable to match the lines
+#: that have them.
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
 def sanitize(text: str) -> str:
