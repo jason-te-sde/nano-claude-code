@@ -122,6 +122,11 @@ class Watcher(AutoApprove):
         self.retries.append((attempt, delay_s, reason))
 
 
+def window_of(tokens: int) -> Capabilities:
+    """The capabilities of a model with native tool calling and a window of ``tokens``."""
+    return Capabilities(True, True, "none", context_window=tokens, max_output=2_000)
+
+
 def tool_history(rounds: int, *, result_chars: int) -> Transcript:
     """A conversation that already ran ``rounds`` tool rounds and ended on an answer.
 
@@ -1213,16 +1218,38 @@ async def test_the_store_holds_the_compacted_conversation_when_the_retry_is_sent
     assert all(stored == sent for stored, sent in comparisons)
 
 
+#: The cause of an overflow that is not the conversation's size, and so what to try third.
+WINDOW_SET_TOO_HIGH = (
+    "if context_window for {model} is set above the window the server really has "
+    "(common with llama.cpp and vLLM), lower it"
+)
+
+
+def does_not_fit_after_compacting(model: str) -> str:
+    return (
+        f"the conversation does not fit the context window of {model} even after compacting it "
+        "\u2014 use a model with a larger window (--model), start over with /clear, or, "
+        + WINDOW_SET_TOO_HIGH.format(model=model)
+    )
+
+
+def does_not_fit_with_nothing_to_compact(model: str, recent: str) -> str:
+    return (
+        f"the conversation does not fit the context window of {model} and has nothing older "
+        f"than its {recent} to compact \u2014 use a model with a larger window (--model), "
+        "start over with /clear, or, " + WINDOW_SET_TOO_HIGH.format(model=model)
+    )
+
+
 async def test_a_context_overflow_that_happens_again_after_compacting_fails_by_name(tmp_repo):
     session = build_session(tmp_repo, [overflow(), says("SUMMARY"), overflow(), says("never")])
     session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
     with pytest.raises(ModelError) as caught:
         await session.follow_up("what next")
-    message = str(caught.value)
-    assert "does not fit" in message and "claude-sonnet-5" in message
-    assert "even after compacting" in message
-    # What to do next, in the spec 17.9 form.
-    assert "\u2014 use a model with a larger window (--model), or start over with /clear" in message
+    assert str(caught.value) == does_not_fit_after_compacting("claude-sonnet-5")
+    # The provider's own status, and not something to retry or to answer by compacting.
+    assert caught.value.status == 400
+    assert caught.value.retryable is False
     assert caught.value.context_overflow is False  # the verdict, not another thing to answer
     assert isinstance(caught.value.__cause__, ModelError)
     assert len(session.model.requests) == 3 and not session.model.exhausted  # no second retry
@@ -1233,10 +1260,39 @@ async def test_a_context_overflow_that_happens_again_after_compacting_fails_by_n
 async def test_a_context_overflow_with_nothing_older_to_compact_does_not_ask_again(tmp_repo):
     session = build_session(tmp_repo, [overflow(), says("never")])
     session.state = replace(session.state, transcript=tool_history(1, result_chars=50))
-    with pytest.raises(ModelError, match="does not fit"):
+    with pytest.raises(ModelError) as caught:
         await session.follow_up("what next")
+    # It does not claim to have compacted what it did not: there was nothing to compact.
+    assert str(caught.value) == does_not_fit_with_nothing_to_compact(
+        "claude-sonnet-5", "last 3 turns"
+    )
+    assert caught.value.status == 400 and caught.value.retryable is False
+    assert isinstance(caught.value.__cause__, ModelError)
     # No summary was asked for and nothing was sent again: compacting could not help.
     assert len(session.model.requests) == 1 and not session.model.exhausted
+
+
+@pytest.mark.parametrize(
+    ("options", "recent"),
+    [
+        ({"keep_recent_turns": 1}, "last turn"),
+        ({"keep_recent_turns": 3}, "last 3 turns"),
+        ({"capabilities": window_of(31_999)}, "last 2 turns"),  # a small window keeps two
+    ],
+    ids=["one-turn-kept", "three-turns-kept", "small-window-two-kept"],
+)
+async def test_the_message_for_nothing_to_compact_counts_the_turns_the_model_keeps(
+    tmp_repo, options, recent
+):
+    model = "scripted" if "capabilities" in options else "claude-sonnet-5"
+    session = build_session(tmp_repo, [overflow(), says("never")], **options)
+    session.state = replace(
+        session.state, transcript=Transcript((user_text("a"), assistant_text("b")))
+    )
+    with pytest.raises(ModelError) as caught:
+        await session.follow_up("c")
+    assert str(caught.value) == does_not_fit_with_nothing_to_compact(model, recent)
+    assert len(session.model.requests) == 1
 
 
 async def test_a_400_that_is_not_an_overflow_is_not_answered_by_compacting(tmp_repo):
@@ -1260,6 +1316,16 @@ async def test_another_failure_on_the_retry_is_reported_as_itself(tmp_repo):
     assert "does not fit" not in str(caught.value)
 
 
+def summary_too_long_for(model: str) -> str:
+    return (
+        f"the older conversation is too long for the context window of {model}, the model "
+        "that writes the summary \u2014 route the compact role to a model with a larger "
+        "window (--role compact=<model>), or, if context_window for "
+        f"{model} is set above the window the server really has, lower it so conversations "
+        "are compacted sooner"
+    )
+
+
 async def test_an_overflow_on_the_summary_request_is_the_compact_roles_error_not_a_retry(
     tmp_repo,
 ):
@@ -1269,11 +1335,24 @@ async def test_an_overflow_on_the_summary_request_is_the_compact_roles_error_not
     session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
     with pytest.raises(ModelError) as caught:
         await session.follow_up("what next")
-    assert "compact" in str(caught.value) and "does not fit" not in str(caught.value)
+    assert str(caught.value) == summary_too_long_for("claude-haiku-4-5")  # the compact model's
+    assert caught.value.status == 400 and caught.value.retryable is False
     assert caught.value.context_overflow is False
+    assert isinstance(caught.value.__cause__, ModelError)
     assert session.compact_model is not None
     assert len(session.compact_model.requests) == 1  # asked once, not again
     assert len(session.model.requests) == 1
+
+
+async def test_a_summary_that_overflows_the_main_model_which_writes_it_by_default_says_so(tmp_repo):
+    # The compact role is the main alias unless it is routed elsewhere, so the history
+    # that did not fit the model is sent to the same model to be summarised.
+    session = build_session(tmp_repo, [overflow(), overflow()])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    with pytest.raises(ModelError) as caught:
+        await session.follow_up("what next")
+    assert str(caught.value) == summary_too_long_for("claude-sonnet-5")
+    assert len(session.model.requests) == 2  # the request that overflowed, then the summary's
 
 
 # --------------------------------------------------------------------------
@@ -1289,10 +1368,6 @@ WINDOWS = pytest.mark.parametrize(
     [(31_999, ["h4"]), (32_000, ["h3", "h4"])],
     ids=["31999-tokens-keeps-two-turns", "32000-tokens-keeps-the-configured-three"],
 )
-
-
-def window_of(tokens: int) -> Capabilities:
-    return Capabilities(True, True, "none", context_window=tokens, max_output=2_000)
 
 
 def retained_ids(transcript: Transcript) -> list[str]:

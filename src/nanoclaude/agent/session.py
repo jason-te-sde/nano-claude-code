@@ -370,19 +370,34 @@ class Session:
         before = self.state.transcript
         await self._compact_fully(capabilities)
         if self.state.transcript == before:
-            raise self._does_not_fit(overflow) from overflow
+            raise self._does_not_fit(overflow, self._nothing_to_compact(capabilities)) from overflow
         try:
             return await self._complete("main", self._request(capabilities, system, specs))
         except ModelError as error:
             if error.context_overflow:
-                raise self._does_not_fit(error) from error
+                raise self._does_not_fit(error, "even after compacting it") from error
             raise
 
-    def _does_not_fit(self, cause: ModelError) -> ModelError:
+    def _nothing_to_compact(self, capabilities: Capabilities) -> str:
+        """What a conversation that compaction could not shorten is said to lack."""
+        kept = self._keep_recent(capabilities)
+        last = "last turn" if kept == 1 else f"last {kept} turns"
+        return f"and has nothing older than its {last} to compact"
+
+    def _does_not_fit(self, cause: ModelError, why_not: str) -> ModelError:
+        """The error for a conversation the main model's window cannot hold.
+
+        ``why_not`` finishes the first half: compacting did not help, or there was
+        nothing to compact. The second half says what to do, including the cause that
+        is not the conversation's size at all: a ``context_window`` set above what the
+        server really has, which compaction never catches because the budget believes it.
+        """
         model = self._adapter_and_model("main")[1]
         return ModelError(
-            f"the conversation does not fit the context window of {model} even after compacting "
-            "it \u2014 use a model with a larger window (--model), or start over with /clear",
+            f"the conversation does not fit the context window of {model} {why_not} "
+            "\u2014 use a model with a larger window (--model), start over with /clear, or, "
+            f"if context_window for {model} is set above the window the server really has "
+            "(common with llama.cpp and vLLM), lower it",
             retryable=False,
             status=cause.status,
         )
@@ -482,6 +497,21 @@ class Session:
         try:
             reply = await self._complete("compact", request)
         except ModelError as error:
+            if error.context_overflow:
+                # The older history is what is being summarised, all of it in one
+                # request, and it does not fit that model's window either. With the
+                # compact role left at the main alias it is the same model that has
+                # just refused it.
+                model = self._adapter_and_model("compact")[1]
+                raise ModelError(
+                    f"the older conversation is too long for the context window of {model}, "
+                    "the model that writes the summary \u2014 route the compact role to a model "
+                    "with a larger window (--role compact=<model>), or, if context_window for "
+                    f"{model} is set above the window the server really has, lower it so "
+                    "conversations are compacted sooner",
+                    retryable=False,
+                    status=error.status,
+                ) from error
             raise ModelError(
                 f"the compact role's model could not summarise the conversation: {error} "
                 "— fix that model, or route the compact role elsewhere with --role compact=<model>",
