@@ -4,6 +4,13 @@ The schema is spec 17.8 verbatim and the column names are a contract: the audit
 CLI reads them, and a database written by one version is opened by the next.
 Migrations are additive only.
 
+``total_cost_usd`` is NULL when the cost is not known: a model with no price, or
+a session that has not finished. It is never 0 in those cases, because a zero
+reads as free and that is the one answer known to be wrong. The column was
+``NOT NULL DEFAULT 0`` before v0.1 shipped; relaxing a constraint is not an
+additive change, but no build that created such a database was ever released, so
+there is nothing to migrate and the schema below is simply the schema.
+
 Blocks are stored as JSON with an explicit ``type`` discriminator rather than
 pickled, so a session written today is still readable when the dataclasses gain
 a field.
@@ -37,7 +44,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at REAL,
     cwd TEXT NOT NULL,
     roles_json TEXT NOT NULL,
-    total_cost_usd REAL NOT NULL DEFAULT 0,
+    total_cost_usd REAL,
     total_input_tokens INTEGER NOT NULL DEFAULT 0,
     total_output_tokens INTEGER NOT NULL DEFAULT 0
 );
@@ -121,7 +128,7 @@ class SessionRow:
     started_at: float
     ended_at: float | None
     cwd: str
-    total_cost_usd: float
+    total_cost_usd: float | None
     total_input_tokens: int
     total_output_tokens: int
 
@@ -174,7 +181,30 @@ class Store:
             tuple(Message(row["role"], decode_blocks(row["blocks_json"])) for row in rows)
         )
 
-    def finish_session(self, session_id: str, usage: Usage, cost_usd: float) -> None:
+    def replace_transcript(self, session_id: str, transcript: Transcript) -> None:
+        """Make the stored messages exactly ``transcript``.
+
+        Compaction and ``/clear`` replace a transcript instead of extending it.
+        Inserting the new rows over the old ones would leave the old tail behind,
+        and the session would reload as a summary followed by the messages it
+        replaced. The delete and the inserts are one transaction, so a failure
+        part-way (a message that cannot be encoded, a full disk) leaves the old
+        transcript in place, not an empty or half-replaced one.
+        """
+        now = time.time()
+        with self.db:
+            self.db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            self.db.executemany(
+                "INSERT INTO messages (session_id, seq, role, blocks_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    (session_id, seq, message.role, encode_blocks(message.blocks), now)
+                    for seq, message in enumerate(transcript.messages)
+                ),
+            )
+
+    def finish_session(self, session_id: str, usage: Usage, cost_usd: float | None) -> None:
+        """Record what a session used. ``None`` is stored as NULL: cost not known."""
         self.db.execute(
             "UPDATE sessions SET ended_at = ?, total_cost_usd = ?, "
             "total_input_tokens = ?, total_output_tokens = ? WHERE id = ?",

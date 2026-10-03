@@ -13,10 +13,12 @@ import pytest
 from nanoclaude.conversation.store import SessionRow, Store, decode_blocks, encode_blocks
 from nanoclaude.conversation.transcript import (
     Message,
+    Role,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
+    Transcript,
     user_text,
     validate,
 )
@@ -136,6 +138,123 @@ def test_finishing_a_session_records_usage_and_cost(tmp_path):
     store.finish_session("s1", Usage(input_tokens=100, output_tokens=20), cost_usd=0.0031)
     row = store.recent_sessions(1)[0]
     assert (row.total_input_tokens, row.total_cost_usd) == (100, 0.0031)
+
+
+def _stored_cost(store: Store, session_id: str) -> object:
+    """The raw column, so a NULL is seen as NULL and not as whatever the row type makes of it."""
+    return store.db.execute(
+        "SELECT total_cost_usd FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()[0]
+
+
+def test_a_session_whose_cost_is_unknown_is_stored_as_null_not_zero(tmp_path):
+    # Router.total_cost() is None when any model used has no price. Stored as 0
+    # it would read as "free", which is the one answer that is known to be wrong.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.finish_session("s1", Usage(input_tokens=100, output_tokens=20), cost_usd=None)
+    row = store.recent_sessions(1)[0]
+    assert row.total_cost_usd is None
+    assert _stored_cost(store, "s1") is None
+    # Everything else about the session is still recorded.
+    assert (row.total_input_tokens, row.total_output_tokens) == (100, 20)
+    assert row.ended_at is not None
+
+
+def test_a_known_zero_cost_is_stored_as_zero_and_stays_distinct_from_unknown(tmp_path):
+    # A local model is priced at exactly zero. That is a known cost and must not
+    # collapse into the unknown one, whichever way the fix for it is written.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.finish_session("s1", Usage(), cost_usd=0.0)
+    assert _stored_cost(store, "s1") == 0.0
+    assert store.recent_sessions(1)[0].total_cost_usd == 0.0
+
+
+def test_a_session_that_has_not_finished_has_no_cost_yet(tmp_path):
+    # The column has no default: a row created and never finished says "not
+    # known", where the old DEFAULT 0 said "free".
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    assert _stored_cost(store, "s1") is None
+    assert store.recent_sessions(1)[0].total_cost_usd is None
+
+
+def test_a_cost_that_becomes_unknown_replaces_the_one_that_was_known(tmp_path):
+    # A session can start on a priced model and switch to an unpriced one. The
+    # later total is unknown, and a stale partial figure must not outlive it.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.finish_session("s1", Usage(input_tokens=10), cost_usd=0.5)
+    store.finish_session("s1", Usage(input_tokens=20), cost_usd=None)
+    assert _stored_cost(store, "s1") is None
+
+
+def _transcript(*texts: str) -> Transcript:
+    """Alternating user and assistant text messages, starting with the user."""
+    roles: tuple[Role, ...] = ("user", "assistant")
+    return Transcript(tuple(Message(roles[i % 2], (TextBlock(t),)) for i, t in enumerate(texts)))
+
+
+def test_replacing_a_transcript_with_a_shorter_one_leaves_none_of_the_old_tail(tmp_path):
+    # Compaction swaps a long history for a short one. Writing the short one over
+    # the first rows would leave the old tail after it, and the session would
+    # reload as the summary followed by messages it was meant to replace.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    for seq, message in enumerate(_transcript("a", "b", "c", "d", "e", "f").messages):
+        store.append_message("s1", seq, message)
+
+    shorter = _transcript("summary", "kept")
+    store.replace_transcript("s1", shorter)
+
+    assert store.load_transcript("s1") == shorter
+
+
+def test_replacing_a_transcript_with_an_empty_one_clears_it(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.replace_transcript("s1", _transcript("a", "b"))
+    store.replace_transcript("s1", Transcript())
+    assert store.load_transcript("s1") == Transcript()
+
+
+def test_replacing_one_sessions_transcript_leaves_every_other_session_alone(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.create_session("s2", cwd="/p", roles={})
+    keep = _transcript("x", "y", "z")
+    store.replace_transcript("s2", keep)
+    store.replace_transcript("s1", _transcript("only"))
+    assert store.load_transcript("s2") == keep
+    assert store.load_transcript("s1") == _transcript("only")
+
+
+def test_a_replacement_that_cannot_be_stored_changes_nothing(tmp_path):
+    # The delete and the inserts are one transaction: a failure part-way must
+    # leave the old transcript, not an empty one and not half of each.
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    original = _transcript("a", "b", "c")
+    store.replace_transcript("s1", original)
+
+    # The first message encodes fine and the second cannot, so by the time it
+    # fails the old rows are already deleted and the first new one inserted.
+    unstorable = Transcript(
+        (original.messages[0], Message("assistant", (TextBlock(object()),)))  # type: ignore[arg-type]
+    )
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        store.replace_transcript("s1", unstorable)
+
+    assert store.load_transcript("s1") == original
 
 
 def test_opening_an_existing_database_does_not_lose_data(tmp_path):
