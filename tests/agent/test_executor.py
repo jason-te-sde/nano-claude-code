@@ -733,7 +733,8 @@ class _Abort(BaseException):
 
 def _audit_row(store: Store, call_id: str) -> Any:
     return store.db.execute(
-        "SELECT outcome, duration_ms, error, decision, rule FROM tool_calls WHERE tool_use_id = ?",
+        "SELECT outcome, duration_ms, bytes_out, error, decision, rule "
+        "FROM tool_calls WHERE tool_use_id = ?",
         (call_id,),
     ).fetchone()
 
@@ -787,6 +788,7 @@ async def test_a_tool_raising_an_unexpected_exception_costs_one_call_not_the_bat
     row = _audit_row(store, "t2")
     assert row["outcome"] == "error", dict(row)
     assert row["error"] == "RuntimeError: list index out of range", dict(row)
+    assert row["bytes_out"] == len(bug.encode("utf-8")), dict(row)  # what the model was sent
     assert _audit_row(store, "t1")["outcome"] == "ok"
     assert _audit_row(store, "t3")["outcome"] == "ok"
 
@@ -945,12 +947,14 @@ async def test_a_tool_whose_permission_request_raises_costs_one_call_not_the_bat
     class Seen(SilentUI):
         def __init__(self) -> None:
             self.decisions: list[tuple[str, str]] = []
+            self.tools: list[str] = []
             self.outcomes: list[str] = []
 
         def on_decision(
-            self, call: ToolUseBlock, _request: PermissionRequest, result: PermissionResult
+            self, call: ToolUseBlock, request: PermissionRequest, result: PermissionResult
         ) -> None:
             self.decisions.append((call.id, result.rule))
+            self.tools.append(request.tool)
 
         def on_outcome(self, call: ToolUseBlock, _outcome: ToolOutcome) -> None:
             self.outcomes.append(call.id)
@@ -985,6 +989,7 @@ async def test_a_tool_whose_permission_request_raises_costs_one_call_not_the_bat
     assert row["error"] == "RuntimeError: path table is corrupt", dict(row)
     assert (row["decision"], row["rule"]) == ("deny", "tool.internal-error"), dict(row)
     assert row["duration_ms"] == 0, dict(row)
+    assert row["bytes_out"] == len(bug.encode("utf-8")), dict(row)  # what the model was sent
     assert _audit_row(store, "t1")["outcome"] == "ok"
     assert _audit_row(store, "t3")["outcome"] == "ok"
 
@@ -995,6 +1000,9 @@ async def test_a_tool_whose_permission_request_raises_costs_one_call_not_the_bat
         ("t2", "tool.internal-error"),
         ("t3", "rule.allow"),
     ]
+    # The request it is told about for the call that crashed names the tool, as the
+    # others do: there is no real request, and the placeholder says which call it is.
+    assert ui.tools == ["Read", "Read", "Read"]
     assert ui.outcomes.count("t2") == 1 and sorted(ui.outcomes) == ["t1", "t2", "t3"]
 
 
@@ -1060,11 +1068,13 @@ async def test_a_request_the_policy_cannot_evaluate_costs_one_call_not_the_batch
         "error",
     )
     assert re.match(r"(AttributeError|TypeError): ", row["error"]), dict(row)
+    assert row["bytes_out"] == len(outcomes[1].content.encode("utf-8")), dict(row)
     assert [result.rule for _, result in ui.decisions] == [
         "rule.allow",
         "tool.internal-error",
         "rule.allow",
     ]
+    assert [request.tool for request, _ in ui.decisions] == ["Read", "Read", "Read"]
 
 
 async def test_an_exception_that_is_not_an_exception_still_propagates_from_the_policy(
