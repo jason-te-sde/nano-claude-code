@@ -95,6 +95,7 @@ def build_session(
     capabilities: Capabilities | None = None,
     compact_capabilities: Capabilities | None = None,
     context_window: int | None = None,
+    native_tools: bool | None = None,
     max_turns: int = 40,
     compact_soft: float = 0.70,
     compact_hard: float = 0.85,
@@ -121,8 +122,10 @@ def build_session(
     capability table says for it: they are read through the capability cache,
     which the table outranks, so they only take effect for a model the table has
     no row for. When they are given and ``model`` is not, the id is
-    ``SCRIPTED_MODEL``. ``context_window`` is the config override of the same name,
-    applied the way the loader's value is, with the output bound it implies.
+    ``SCRIPTED_MODEL``. ``context_window`` and ``native_tools`` are the config
+    overrides of the same names, applied the way the loader's values are: the first
+    with the output bound it implies, the second to put a model the table knows, and
+    prices, on the text protocol.
 
     Retries wait no time unless a ``retry`` policy says otherwise, and global
     instructions are looked for under ``home`` (a directory that does not exist,
@@ -139,7 +142,11 @@ def build_session(
         cache.put("anthropic", model_id, capabilities)
 
     main_client = ScriptedClient(script)
-    models = {"m": ModelConfig("anthropic", model_id, context_window=context_window)}
+    models = {
+        "m": ModelConfig(
+            "anthropic", model_id, context_window=context_window, native_tools=native_tools
+        )
+    }
     clients: dict[str, ModelClient] = {"m": main_client}
     compact_client: ScriptedClient | None = None
     compact_alias = "m"

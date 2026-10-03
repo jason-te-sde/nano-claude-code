@@ -512,6 +512,26 @@ async def test_a_model_that_never_writes_a_valid_call_is_given_up_on_by_name(tmp
     assert session.store.load_transcript(session.session_id) == done.state.transcript
 
 
+async def test_giving_up_on_a_model_still_records_what_every_attempt_cost(tmp_repo):
+    # The stop is a verdict on the model, not a way out of the bookkeeping: the attempts
+    # were paid for, and the row says so without anyone closing the session.
+    script = [
+        says(f"{BAD_CALL} attempt {n}", input_tokens=1_000, output_tokens=100)
+        for n in range(MAX_PARSE_RETRIES + 1)
+    ]
+    session = build_session(tmp_repo, script, native_tools=False)
+    done = await session.run("go")
+    assert done.reason is StopReason.MODEL_UNSUITABLE
+    row = stored_row(session)
+    attempts = MAX_PARSE_RETRIES + 1
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (
+        1_000 * attempts,
+        100 * attempts,
+    )
+    assert row["total_cost_usd"] == pytest.approx(0.003 * attempts)
+    assert row["ended_at"] is not None
+
+
 @pytest.mark.parametrize(
     ("last_reply", "text"),
     [
