@@ -2640,6 +2640,138 @@ async def test_a_session_can_be_closed_twice(tmp_repo):
     await session.aclose()
 
 
+async def test_a_conversation_cleared_and_then_closed_does_not_come_back_when_resumed(tmp_repo):
+    # What /clear did: replace the state and carry on. The store was only brought up to
+    # date by the next prompt, so a session that was cleared and closed kept the old one.
+    first = build_session(tmp_repo, [says("first answer")])
+    await first.run("first question")
+    first.state = replace(first.state, transcript=Transcript(), turn=0)
+    await first.aclose()
+
+    session = resumed(tmp_repo, first, [])
+    assert session.state.transcript == Transcript()
+    assert [m.text() for m in archived_messages(session)] == ["first question", "first answer"]
+
+
+async def test_closing_stores_the_conversation_as_it_is_even_when_the_row_cannot_be_written(
+    tmp_repo, monkeypatch
+):
+    session = build_session(tmp_repo, [says("an answer")])
+    await session.run("a question")
+    session.state = replace(session.state, transcript=Transcript(), turn=0)
+    assert session.store is not None
+
+    def refuse(*_args: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(session.store, "finish_session", refuse)
+    with pytest.raises(RuntimeError, match="disk full"):
+        await session.aclose()
+    assert session.model.closed  # the clients were closed after all
+    reader = Store(session.store.path)
+    reader.open()
+    assert reader.load_transcript(session.session_id) == Transcript()  # and the store was written
+    reader.close()
+
+
+async def test_the_row_is_finished_and_the_clients_closed_when_the_conversation_will_not_store(
+    tmp_repo, monkeypatch
+):
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=1_000, output_tokens=100)],
+    )
+    with pytest.raises(ModelError):  # the script runs out: a failed prompt, nothing recorded yet
+        await session.run("read it")
+
+    def refuse() -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(session, "_persist", refuse)
+    with pytest.raises(RuntimeError, match="disk full"):
+        await session.aclose()
+    row = row_after_closing(session)
+    assert (row["total_input_tokens"], row["total_output_tokens"]) == (1_000, 100)
+    assert row["ended_at"] is not None
+    assert session.model.closed
+    assert session.store is not None
+    with pytest.raises(RuntimeError, match="store is not open"):
+        _ = session.store.db
+
+
+# --------------------------------------------------------------------------
+# /clear
+# --------------------------------------------------------------------------
+
+
+async def test_clearing_empties_the_conversation_and_the_store_at_once(tmp_repo):
+    session = build_session(tmp_repo, [says("first answer")])
+    await session.run("first question")
+    session.clear()
+    assert session.state.transcript == Transcript()
+    assert session.store is not None
+    assert (
+        session.store.load_transcript(session.session_id) == Transcript()
+    )  # not at the next prompt
+    assert [m.text() for m in archived_messages(session)] == ["first question", "first answer"]
+
+
+async def test_a_cleared_session_that_is_closed_and_resumed_starts_from_nothing(tmp_repo):
+    first = build_session(tmp_repo, [says("first answer")])
+    await first.run("first question")
+    first.clear()
+    await first.aclose()
+    assert resumed(tmp_repo, first, []).state.transcript == Transcript()
+
+
+async def test_a_prompt_after_clearing_starts_the_conversation_again(tmp_repo):
+    session = build_session(tmp_repo, [says("first answer"), says("second answer")])
+    await session.run("first question")
+    session.clear()
+    done = await session.follow_up("second question")
+    assert [m.text() for m in session.model.requests[1].transcript.messages] == ["second question"]
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == done.state.transcript
+    assert len(done.state.transcript.messages) == 2
+
+
+async def test_clearing_forgets_what_the_conversation_had_read_and_used(tmp_repo):
+    (tmp_repo / "a.py").write_text("x\n")
+    session = build_session(
+        tmp_repo,
+        [calls("Read", {"path": "a.py"}, call_id="t1", input_tokens=7), says("done")],
+        max_turns=9,
+    )
+    done = await session.run("read it")
+    assert done.state.read_state and done.state.usage != Usage()
+    session.clear()
+    assert dict(session.state.read_state) == {}  # the model must read a file again to edit it
+    assert session.state.usage == Usage()
+    assert (session.state.turn, session.state.max_turns) == (0, 9)
+
+
+async def test_clearing_uses_the_turn_limit_the_config_has_now(tmp_repo):
+    session = build_session(tmp_repo, [], max_turns=40)
+    session.config = replace(session.config, limits=replace(session.config.limits, max_turns=3))
+    session.clear()
+    assert session.state.max_turns == 3
+
+
+async def test_a_session_with_no_store_can_be_cleared(tmp_repo):
+    built = build_session(tmp_repo, [says("done")])
+    bare = Session(
+        root=built.root,
+        config=built.config,
+        router=built.router,
+        registry=built.registry,
+        policy=built.policy,
+    )
+    await bare.run("hello")
+    bare.clear()
+    assert bare.state.transcript == Transcript()
+
+
 async def test_the_store_is_closed_even_when_a_client_fails_to_close(tmp_repo, monkeypatch):
     session = build_session(tmp_repo, [])
 

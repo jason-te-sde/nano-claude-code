@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -561,26 +562,44 @@ class Session:
         used = budget.used(self.state.transcript, system, _tools_text(specs))
         return used, budget.available()
 
-    async def aclose(self) -> None:
-        """Record what the session spent, then close every client and the store.
+    def clear(self) -> None:
+        """Forget the conversation, as ``/clear`` does, and store that at once.
 
-        A prompt that stops normally records it as it goes. One that failed or was
-        cancelled never reached that, so closing does it: the money for the rounds
-        that were paid for is spent either way. Whatever fails along the way, the
-        rest still happens. Closing twice is harmless: a front end may close from its
-        normal exit and from its cleanup.
+        The next prompt starts from nothing: no messages, no record of what was read
+        (the model must read a file again before it edits it), no usage, and the turn
+        limit the config has now. The store follows now, not at the next prompt, so a
+        session that is closed or resumed next does not bring the conversation back.
+        What was there stays in the archive.
+        """
+        self.state = LoopState(Transcript(), turn=0, max_turns=self.config.limits.max_turns)
+        self._persist()
+
+    async def aclose(self) -> None:
+        """Store the conversation, record what the session spent, then close everything.
+
+        The conversation is stored as it is, because a front end can change it between
+        prompts (``/clear``) and the store otherwise learns of that only at the next
+        one. A prompt that stops normally records what was spent as it goes; one that
+        failed or was cancelled never reached that, so closing does it: the money for
+        the rounds that were paid for is spent either way. Then every client is closed,
+        then the store, and a step that fails does not stop the ones after it. Closing
+        twice is harmless: a front end may close from its normal exit and from its
+        cleanup.
         """
         if self._closed:
             return
         self._closed = True
-        try:
-            try:
-                self._finish()
-            finally:
-                await self.router.aclose()
-        finally:
-            if self.store is not None:
-                self.store.close()
+        async with AsyncExitStack() as steps:
+            # Registered in reverse, because they run last to first: the conversation is
+            # stored, the spend recorded, the clients closed, and the store closed.
+            steps.callback(self._close_store)
+            steps.push_async_callback(self.router.aclose)
+            steps.callback(self._finish)
+            steps.callback(self._persist)
+
+    def _close_store(self) -> None:
+        if self.store is not None:
+            self.store.close()
 
 
 def _has_calls(reply: ModelReply) -> bool:
