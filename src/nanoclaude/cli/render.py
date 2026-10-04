@@ -1,0 +1,362 @@
+# src/nanoclaude/cli/render.py
+"""Turning what the agent does into something readable.
+
+The confirmation prompt is the one piece of UI that has to be right. Somebody
+approving a write needs to see what will change, in the two seconds they will
+actually spend on it, so an Edit shows its diff before it is applied, a command is
+shown whole and not summarised, and every refusal names the rule that fired:
+"refused" on its own teaches people to stop reading.
+
+Almost everything printed here was not written by this code: tool names, arguments
+and paths, tool output, what the model said, a provider's error, a model name from a
+config file. It is data, and two things can go wrong when data is printed.
+
+* **Markup.** Rich reads ``[...]`` in every string it prints and every table cell, so a
+  route segment such as ``src/app/[id]/page.tsx`` loses its ``[id]`` and a ``[/]`` raises.
+  Outside text therefore goes in as a :class:`~rich.text.Text`, which is never parsed,
+  and is never put inside a markup template.
+* **Control sequences.** A terminal acts on what it is sent: an escape sequence can clear
+  the screen, retitle the window or rewrite the line above. Rich removes a few controls
+  and passes the escape through. Text that only informs (model prose, tool output, an
+  error) goes through :func:`~nanoclaude.tools.base.sanitize`. Text a person is deciding
+  about (the request a confirmation is for, the call's name and arguments) is not
+  stripped, because a prompt that quietly shows less than will run is no better than one
+  that obeys it: each control character is shown by name, ``\\x1b`` and ``\\r``, by
+  :func:`visible`.
+
+Colour is whatever the console allows. This module never writes an escape sequence of
+its own, so ``NO_COLOR`` and a console that is not a terminal both give plain text.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+
+from rich.console import Console, RenderableType
+from rich.markdown import Markdown
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
+
+from nanoclaude.agent.router import Router
+from nanoclaude.agent.session import Session
+from nanoclaude.agent.ui import Approval
+from nanoclaude.cli.prompt import Prompter, new_prompter
+from nanoclaude.config.schema import ROLES
+from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock
+from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
+from nanoclaude.providers.base import ModelReply
+from nanoclaude.providers.pricing import PriceBook
+from nanoclaude.tools.base import ToolArgumentError, ToolOutcome, sanitize
+from nanoclaude.tools.edit import EditError, preview_edit
+
+MAX_SUMMARY_CHARS = 100
+
+#: The width of the bar ``/status`` draws for how much of the context window is in use.
+BAR_WIDTH = 20
+
+#: What a call is summarised by, most informative first.
+_SUMMARY_KEYS = ("path", "command", "pattern", "subcommand")
+
+#: Every character that can change what a person believes they are reading: the C0
+#: controls, DEL and the C1 controls, which a terminal acts on, and the bidirectional
+#: embeddings, overrides and isolates, which it does not act on but which reorder the
+#: text around them.
+_UNSAFE = re.compile(
+    "[\x00-\x1f\x7f-\x9f"
+    "\N{LEFT-TO-RIGHT EMBEDDING}-\N{RIGHT-TO-LEFT OVERRIDE}"
+    "\N{LEFT-TO-RIGHT ISOLATE}-\N{POP DIRECTIONAL ISOLATE}]"
+)
+
+_NAMED = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _spelled(char: str) -> str:
+    """The escape that names ``char``: ``\\n``, ``\\r``, ``\\t``, ``\\x1b``, ``\\u202e``."""
+    named = _NAMED.get(char)
+    if named is not None:
+        return named
+    code = ord(char)
+    return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}"
+
+
+def visible_text(raw: str, *, keep_newlines: bool = False) -> Text:
+    """``raw`` with every control character shown as the escape that names it.
+
+    The escapes are styled apart from the text around them, so that a real escape
+    character can be told from the four characters ``\\x1b`` written out. With
+    ``keep_newlines`` line breaks and tabs stay what they are, for text that is laid
+    out over several lines (a diff) and not for one line (a path, a command): in a
+    single line a newline would let one subject pose as two.
+    """
+    shown = Text()
+    start = 0
+    for match in _UNSAFE.finditer(raw):
+        char = match.group()
+        if keep_newlines and char in "\n\t":
+            continue
+        shown.append(raw[start : match.start()])
+        shown.append(_spelled(char), style="reverse")
+        start = match.end()
+    shown.append(raw[start:])
+    return shown
+
+
+def visible(raw: str, *, keep_newlines: bool = False) -> str:
+    """:func:`visible_text`, as a plain string."""
+    return visible_text(raw, keep_newlines=keep_newlines).plain
+
+
+def plain(text: str, style: str = "") -> Text:
+    """Outside text, stripped of terminal control sequences and never parsed as markup."""
+    return Text(sanitize(text), style=style)
+
+
+def show_notice(console: Console, message: str) -> None:
+    """A line of information, dimmed. ``message`` is data: never read as markup."""
+    console.print(plain(message, "dim"))
+
+
+def show_error(console: Console, message: str) -> None:
+    """``error: <what happened> — <what to do>``: spec 17.9's form for a person.
+
+    ``message`` is what follows ``error: ``, and is data: never read as markup.
+    """
+    console.print(Text.assemble(("error: ", "red"), sanitize(message)))
+
+
+def _shorten(text: str) -> str:
+    if len(text) <= MAX_SUMMARY_CHARS:
+        return text
+    return text[: MAX_SUMMARY_CHARS - 3] + "..."
+
+
+def _primary_argument(call: ToolUseBlock) -> str | None:
+    """The argument that says most about the call, as the model wrote it."""
+    for key in _SUMMARY_KEYS:
+        if key in call.arguments:
+            return str(call.arguments[key])
+    return None
+
+
+def summarise_call(call: ToolUseBlock) -> str:
+    """One short line about what a call is for, with its control characters shown."""
+    primary = _primary_argument(call)
+    if primary is None:
+        primary = ", ".join(sorted(call.arguments))
+    return _shorten(visible(primary))
+
+
+def render_diff(diff: str) -> RenderableType:
+    return Syntax(sanitize(diff), "diff", theme="ansi_dark", word_wrap=True)
+
+
+def render_markdown(text: str) -> RenderableType:
+    # Hyperlinks off: a terminal link shows its label and hides where it goes, and the
+    # label is the model's to choose. Without them the address is printed beside it.
+    return Markdown(sanitize(text), hyperlinks=False)
+
+
+def _call_line(call: ToolUseBlock) -> Text:
+    """A call as one collapsed line: its name, and what it is about."""
+    parts: list[str | tuple[str, str]] = [(visible(call.name), "dim")]
+    summary = summarise_call(call)
+    if summary:
+        parts.extend([" ", summary])
+    return Text.assemble(*parts)
+
+
+def _refusal_line(result: PermissionResult) -> Text:
+    """Spec 17.9's form, built from the decision: ``refused (<rule>): <reason>``.
+
+    Not the string the model is told, which is capitalised and written for it.
+    """
+    return Text.assemble((f"refused ({sanitize(result.rule)}): ", "red"), sanitize(result.reason))
+
+
+class ConsoleUI:
+    """The interactive implementation of the UI protocol."""
+
+    def __init__(
+        self,
+        console: Console,
+        *,
+        auto_approve: bool = False,
+        prompter: Prompter | None = None,
+    ) -> None:
+        self._console = console
+        self._auto = auto_approve
+        # Built when the first question is asked: a UI that is never asked anything has
+        # no reason to take hold of the terminal.
+        self._prompter = prompter
+        # Edits whose diff was shown at the confirmation, so that it is not shown again.
+        self._previewed: set[str] = set()
+
+    async def confirm(
+        self, call: ToolUseBlock, request: PermissionRequest, _result: PermissionResult
+    ) -> Approval:
+        if self._auto:
+            self._console.print(_call_line(call))
+            return Approval.ONCE
+        self._console.print()
+        self._console.print(
+            Text.assemble((visible(call.name), "bold yellow"), "  ", visible_text(request.subject))
+        )
+        called_with = _primary_argument(call)
+        if called_with is not None and visible(called_with) != visible(request.subject):
+            # The policy judged the resolved path, and that is what is shown above. What
+            # the model wrote may differ from it, and a person is owed both.
+            self._console.print(Text.assemble(("  called with ", "dim"), visible_text(called_with)))
+        if call.name == "Edit":
+            await self._preview(call, request)
+        question = (
+            f"  allow? [y]es / [n]o / [a]lways (every {visible(call.name)} call this session) "
+        )
+        while True:
+            try:
+                answer = await self._prompt().prompt_async(question)
+            except EOFError:
+                return Approval.NO
+            except KeyboardInterrupt:
+                # Ctrl+C means stop, not no: a no goes back to the model, which answers it
+                # and costs another round. And a KeyboardInterrupt raised inside the turn's
+                # task would take the whole event loop with it, so it becomes the
+                # cancellation that the REPL already knows how to take.
+                raise asyncio.CancelledError from None
+            choice = answer.strip().lower()
+            if choice in ("y", "yes"):
+                return Approval.ONCE
+            if choice in ("a", "always"):
+                return Approval.ALWAYS
+            if choice in ("", "n", "no"):
+                return Approval.NO
+            self._console.print(plain("answer y, n or a", "dim"))
+
+    def _prompt(self) -> Prompter:
+        if self._prompter is None:
+            self._prompter = new_prompter()
+        return self._prompter
+
+    async def _preview(self, call: ToolUseBlock, request: PermissionRequest) -> None:
+        """Show what an Edit would change, before anything is written."""
+        if not request.resolved_paths:
+            return
+        path = request.resolved_paths[0]
+        label = _primary_argument(call) or path
+        try:
+            diff = await asyncio.to_thread(preview_edit, path, label, call.arguments)
+        except (ToolArgumentError, EditError, OSError) as exc:
+            self._console.print(Text.assemble(("  no preview: ", "dim"), visible_text(str(exc))))
+            return
+        # The new text is the model's and is going into a file: its controls are shown, not
+        # removed, so that nobody approves a cleaner edit than the one that is written.
+        self._console.print(render_diff(visible(diff, keep_newlines=True)))
+        self._previewed.add(call.id)
+
+    def on_reply(self, reply: ModelReply) -> None:
+        for block in reply.blocks:
+            if isinstance(block, TextBlock) and block.text.strip():
+                self._console.print(render_markdown(block.text.strip()))
+
+    def on_decision(
+        self, call: ToolUseBlock, _request: PermissionRequest, result: PermissionResult
+    ) -> None:
+        if result.decision is Decision.DENY:
+            # A refused call never reaches on_outcome, so this line is everything the
+            # person learns about it.
+            self._console.print(_refusal_line(result))
+        elif result.decision is Decision.ALLOW or self._auto:
+            self._console.print(_call_line(call))
+        # A call that is to be asked about is announced by the confirmation, in full.
+
+    def on_outcome(self, call: ToolUseBlock, outcome: ToolOutcome) -> None:
+        previewed = call.id in self._previewed
+        self._previewed.discard(call.id)
+        if outcome.is_error:
+            lines = sanitize(outcome.content).splitlines()
+            self._console.print(Text.assemble(("  ! ", "red"), lines[0] if lines else ""))
+        elif call.name == "TodoWrite":
+            # The tool's own output is the list, written for the person to read: it is how
+            # they see what the model thinks it is doing without reading the calls.
+            self._console.print(plain(outcome.content))
+        elif call.name == "Edit" and not previewed:
+            # No confirmation showed it (accept-edits mode), so this is the one place the
+            # person sees what changed. The tool reports "Edited <file>" and then the diff.
+            _, _, diff = outcome.content.partition("\n")
+            if diff.strip():
+                self._console.print(render_diff(diff))
+
+    def on_output(self, text: str) -> None:
+        self._console.print(plain(text))
+
+    def on_retry(self, attempt: int, delay_s: float, reason: str) -> None:
+        self._console.print(
+            Text.assemble(
+                (f"provider busy, retry {attempt} in {delay_s:.1f}s ", "yellow"),
+                (sanitize(reason)[:80], "dim"),
+            )
+        )
+
+
+def context_bar(used: int, available: int) -> str:
+    """How full the context window is, as ``[####....]``. Empty when the size is not known."""
+    filled = int(BAR_WIDTH * min(1.0, used / available)) if available > 0 else 0
+    return f"[{'#' * filled}{'.' * (BAR_WIDTH - filled)}]"
+
+
+def status_panel(session: Session, used: int, available: int) -> RenderableType:
+    """Where the session stands, on one screen.
+
+    ``used`` and ``available`` are what ``Session.context_usage()`` returns. That is a
+    coroutine, so the caller awaits it and this stays a function of its arguments. Which
+    model plays each role is read from the router, which is what decides.
+    """
+    config = session.router.config
+    table = Table(title="status", show_header=False)
+    table.add_column(style="bold")
+    table.add_column()
+    for role in ROLES:
+        alias = config.roles.alias_for(role)
+        table.add_row(role, plain(f"{config.models[alias].model} ({alias})"))
+    table.add_row("", "")
+    table.add_row("mode", plain(str(session.policy.mode)))
+    table.add_row("sandbox", plain(", ".join(session.policy.sandbox.roots)))
+    table.add_row("tools", str(len(session.registry)))
+    table.add_row("session", plain(session.session_id))
+    table.add_row("turns", f"{session.state.turn}/{session.config.limits.max_turns}")
+    table.add_row("context", Text(f"{context_bar(used, available)} {used}/{available} tokens"))
+    return table
+
+
+def _dollars(cost: float | None) -> str:
+    """A cost, or a dash for one that is not known: zero would say the model is free."""
+    return "-" if cost is None else f"${cost:.4f}"
+
+
+def cost_panel(router: Router, prices: PriceBook) -> RenderableType:
+    """What this run has used and spent, by role.
+
+    "This run": a resumed session's stored row holds the running total, but the router
+    only knows what was spent since this process started.
+    """
+    table = Table(title="cost (this run)", show_header=True, header_style="bold")
+    # In a narrow terminal the model name gives way first: a role and its numbers say
+    # what was spent, and a cost of "$4.…" reads as a different amount.
+    table.add_column("role", no_wrap=True)
+    table.add_column("model")
+    for column in ("in", "out", "cached", "cost"):
+        table.add_column(column, justify="right", no_wrap=True)
+    for role, entry in router.by_role().items():
+        table.add_row(
+            role,
+            plain(entry.model),
+            str(entry.usage.input_tokens),
+            str(entry.usage.output_tokens),
+            str(entry.usage.cache_read_tokens),
+            _dollars(entry.cost),
+        )
+    table.add_row("total", "", "", "", "", _dollars(router.total_cost()), style="bold")
+    if prices.is_stale():
+        table.caption = f"price table last checked {prices.last_updated}; it may be out of date"
+    return table
