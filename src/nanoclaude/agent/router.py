@@ -23,7 +23,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from nanoclaude.config.load import check_model, check_roles
 from nanoclaude.config.schema import ROLES, Config, ModelConfig, check_role
@@ -77,6 +77,35 @@ class Router:
         if alias not in self._clients:
             self._clients[alias] = self._build(role, alias, self.config.models[alias])
         return self._clients[alias]
+
+    async def route(self, role: str, alias: str) -> None:
+        """Send ``role`` to the model defined as ``alias``, from the next request on.
+
+        What ``/model`` does. The router, not the session, decides which client answers a
+        role and which model a call is billed to, so a front end that changed only its own
+        copy of the config would show one model and talk to another. The one this changes
+        is ``self.config``; a caller holding another copy of the config keeps its roles in
+        step with it.
+
+        The client is built here and not when the next request needs it: a model that
+        cannot be used (its key is not set) is refused now, to whoever asked for it, with
+        the old route still in force, and not on the next prompt in the middle of a
+        conversation. Nothing changes when it raises.
+
+        Raises :class:`~nanoclaude.config.load.ConfigError` for an alias nobody defined,
+        ``ValueError`` for a role that is not one of the six, and
+        :class:`~nanoclaude.providers.base.ModelError` for a model that cannot be built.
+        """
+        check_role(role)
+        roles = replace(self.config.roles, **{role: alias})
+        check_roles(roles, self.config.models)
+        previous = self.config
+        self.config = replace(previous, roles=roles)
+        try:
+            await self.client_for(role)
+        except BaseException:
+            self.config = previous
+            raise
 
     def _build(self, role: str, alias: str, entry: ModelConfig) -> ModelClient:
         # Also catches a ModelConfig made by hand, which the loader never saw: an
