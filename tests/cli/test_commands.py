@@ -529,14 +529,9 @@ async def test_an_exported_file_cannot_act_on_the_terminal_of_whoever_prints_it(
     # on, in any place the export writes it: the id, both sides' text, a call's name, the
     # key and the value of its arguments, and a result. DEL and C1 are the ones JSON does not
     # escape.
-    pieces: dict[str, object] = {
-        "session_id": HOSTILE,
-        "user": HOSTILE,
-        "text": HOSTILE,
-        "name": HOSTILE,
-        "arguments": {"path": "p"},
-        "result": HOSTILE,
-    }
+    # Only the piece under test holds the hostile text, so that each case fails for its own
+    # place and not for another's.
+    pieces: dict[str, object] = {}
     if piece == "key":
         pieces["arguments"] = {HOSTILE: "p"}
     elif piece == "value":
@@ -545,7 +540,12 @@ async def test_an_exported_file_cannot_act_on_the_terminal_of_whoever_prints_it(
         pieces[piece] = HOSTILE
     written = await exported(tmp_repo, **pieces)  # type: ignore[arg-type]
     assert not CONTROLS.search(written), repr(CONTROLS.findall(written))
-    assert "a" in written and "b" in written  # the rest of the text is still there
+    if piece in ("key", "value"):
+        # Escaped, not stripped: JSON keeps what was sent.
+        assert "\\u009b2J\\u009d0;T\\u009c\\u007f" in written
+    else:
+        # Stripped: what is left of the text is still there.
+        assert "a2J0;T b" in written
 
 
 async def test_the_arguments_of_a_call_are_exported_as_json_that_reads_back_unchanged(tmp_repo):
