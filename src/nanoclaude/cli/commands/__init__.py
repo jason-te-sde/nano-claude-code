@@ -14,11 +14,12 @@ without ending the session.
 from __future__ import annotations
 
 import json
+import os
 import re
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import assert_never
+from typing import Any, assert_never
 
 from rich.console import Console
 from rich.text import Text
@@ -75,6 +76,22 @@ def _clipped(content: str) -> str:
     return f"{content[:MAX_EXPORTED_RESULT_CHARS]}\n[{hidden} more characters not exported]"
 
 
+#: What JSON leaves as it is and a terminal acts on: DEL and the C1 controls, the 8-bit forms
+#: of the escape sequences (U+009B is a CSI, U+009D an OSC). JSON escapes the C0 controls
+#: itself, and does not escape these.
+_DEL_AND_C1 = re.compile(r"[\x7f-\x9f]")
+
+
+def _arguments_json(arguments: Mapping[str, Any]) -> str:
+    """A call's arguments as JSON that no terminal acts on and that reads back unchanged.
+
+    DEL and C1 are written as ``\\u00XX``, which JSON allows anywhere in a string, keys and
+    values alike, so the text is still valid JSON and loses nothing.
+    """
+    dumped = json.dumps(dict(arguments), ensure_ascii=False, default=str)
+    return _DEL_AND_C1.sub(lambda match: f"\\u{ord(match.group()):04x}", dumped)
+
+
 def export_markdown(session_id: str, messages: Sequence[Message]) -> str:
     """The conversation as a markdown document.
 
@@ -95,9 +112,8 @@ def export_markdown(session_id: str, messages: Sequence[Message]) -> str:
             elif isinstance(block, ThinkingBlock):
                 continue
             elif isinstance(block, ToolUseBlock):
-                arguments = json.dumps(dict(block.arguments), ensure_ascii=False, default=str)
                 parts.append(f"**tool call** `{sanitize(block.name)}`")
-                parts.append(_fenced(arguments, "json"))
+                parts.append(_fenced(_arguments_json(block.arguments), "json"))
             elif isinstance(block, ToolResultBlock):
                 parts.append("**tool result** (error)" if block.is_error else "**tool result**")
                 parts.append(_fenced(_clipped(sanitize(block.content))))
@@ -117,9 +133,24 @@ def _export_target(root: str, name: str) -> Path:
 
 
 def _write_new(target: Path, document: str) -> None:
-    """Write ``document`` to a file that does not exist yet: never over one that does."""
-    with target.open("x", encoding="utf-8") as handle:
-        handle.write(document)
+    """Write ``document`` to a file that does not exist yet: never over one that does, and
+    never leave half of one.
+
+    The document is encoded before anything is created, so that text which cannot be encoded
+    cannot leave an empty file behind. Text that is not valid Unicode (a lone surrogate) is
+    spelled out, ``\\ud800``, and not refused. The file is created with ``O_EXCL``, readable
+    by its owner alone because it holds the whole conversation, tool output included, and is
+    removed again if the write fails, so that a full disk does not leave a file that makes
+    the next export say it already exists.
+    """
+    data = document.encode("utf-8", errors="backslashreplace")
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(data)
+    except BaseException:
+        target.unlink(missing_ok=True)
+        raise
 
 
 async def _help(_args: list[str], _session: Session, console: Console) -> None:
@@ -220,14 +251,24 @@ async def _resume(_args: list[str], _session: Session, console: Console) -> None
 
 async def _export(args: list[str], session: Session, console: Console) -> None:
     name = " ".join(args) or f"session-{session.session_id}.md"
-    target = _export_target(session.root, name)
+    try:
+        target = _export_target(session.root, name)
+    except RuntimeError:
+        # Path.expanduser: a ~name with no such user has no home directory to expand to.
+        show_error(
+            console,
+            f"cannot expand {name!r} — it starts with ~ but no home directory is known for "
+            "it; write the full path",
+        )
+        return
     document = export_markdown(session.session_id, session.state.transcript.messages)
     try:
         _write_new(target, document)
     except FileExistsError:
         show_error(console, f"{target} already exists — give another name, or remove it first")
-    except OSError as exc:
-        show_error(console, f"could not write {target} — {exc.strerror or exc}")
+    except (OSError, ValueError) as exc:
+        reason = getattr(exc, "strerror", None) or exc
+        show_error(console, f"could not write {target} — {reason}")
     else:
         show_notice(console, f"written to {target}")
 

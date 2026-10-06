@@ -8,7 +8,11 @@ the others later does not break it.
 
 from __future__ import annotations
 
+import errno
+import json
+import os
 import re
+import stat
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -479,12 +483,86 @@ async def test_export_marks_a_failed_call_and_shortens_a_very_long_result(tmp_re
     assert "[3000 more characters not exported]" in exported
 
 
-async def test_an_exported_file_cannot_act_on_the_terminal_of_whoever_prints_it(tmp_repo):
-    session = build_session(tmp_repo, [says("before \x1b[2J\x1b]0;TITLE\x07 after")])
-    await session.run("hi")
+#: A clear, a title, the 8-bit forms of both, DEL, the two ends of the C1 block, a bell and a
+#: carriage return.
+HOSTILE = "a\x1b[2J\x1b]0;T\x07\x9b2J\x9d0;T\x9c\x7f\x80\x85\x9f\r b"
+
+#: Every control a terminal acts on, except tab and newline.
+CONTROLS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+async def exported(
+    tmp_repo: Path,
+    *,
+    session_id: str = "s1",
+    user: str = "u",
+    text: str = "t",
+    name: str = "Read",
+    arguments: dict[str, object] | None = None,
+    result: str = "r",
+) -> str:
+    """What ``/export`` writes for a conversation made of exactly these pieces."""
+    session = build_session(tmp_repo, [], session_id=session_id)
+    call = ToolUseBlock("t1", name, arguments if arguments is not None else {"path": "p"})
+    session.state = replace(
+        session.state,
+        transcript=Transcript(
+            (
+                user_text(user),
+                Message("assistant", (TextBlock(text), call)),
+                Message("user", (ToolResultBlock("t1", result),)),
+            )
+        ),
+    )
     target = tmp_repo / "out.md"
     await run_command(session, "export", str(target))
-    assert "\x1b" not in target.read_text() and "\x07" not in target.read_text()
+    return target.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "piece",
+    ["session_id", "user", "text", "name", "key", "value", "result"],
+)
+async def test_an_exported_file_cannot_act_on_the_terminal_of_whoever_prints_it(tmp_repo, piece):
+    # The file is read by something that prints it, "cat" in a terminal included. Whatever the
+    # model or a tool put in a conversation must not reach it as a character the terminal acts
+    # on, in any place the export writes it: the id, both sides' text, a call's name, the
+    # key and the value of its arguments, and a result. DEL and C1 are the ones JSON does not
+    # escape.
+    pieces: dict[str, object] = {
+        "session_id": HOSTILE,
+        "user": HOSTILE,
+        "text": HOSTILE,
+        "name": HOSTILE,
+        "arguments": {"path": "p"},
+        "result": HOSTILE,
+    }
+    if piece == "key":
+        pieces["arguments"] = {HOSTILE: "p"}
+    elif piece == "value":
+        pieces["arguments"] = {"path": HOSTILE}
+    else:
+        pieces[piece] = HOSTILE
+    written = await exported(tmp_repo, **pieces)  # type: ignore[arg-type]
+    assert not CONTROLS.search(written), repr(CONTROLS.findall(written))
+    assert "a" in written and "b" in written  # the rest of the text is still there
+
+
+async def test_the_arguments_of_a_call_are_exported_as_json_that_reads_back_unchanged(tmp_repo):
+    # DEL and C1 are escaped as \u00XX, which JSON allows anywhere in a string: the file stays
+    # valid, and nothing is lost.
+    arguments: dict[str, object] = {
+        "path": "a.py",
+        HOSTILE: HOSTILE,
+        "n": 3,
+        "nested": {"k": ["\x7f", "\x9b", "\x9f", "caf\N{LATIN SMALL LETTER E WITH ACUTE}"]},
+    }
+    written = await exported(tmp_repo, arguments=arguments)
+    block = re.search(r"```json\n(.*?)\n```", written, re.S)
+    assert block is not None and json.loads(block.group(1)) == arguments
+    assert "\\u007f" in written and "\\u009b" in written
+    # Only what a terminal acts on is escaped: ordinary text, and letters beyond ASCII, are not.
+    assert "caf\N{LATIN SMALL LETTER E WITH ACUTE}" in written and "a.py" in written
 
 
 async def test_export_will_not_overwrite_a_file_that_is_there(tmp_repo):
@@ -503,6 +581,82 @@ async def test_export_to_a_directory_that_is_not_there_is_an_error_line_not_a_tr
     target = tmp_repo / "missing" / "out.md"
     _, text = await run_command(session, "export", str(target), width=300)
     assert text.startswith(f"error: could not write {target} — ") and text.endswith("\n")
+
+
+async def test_a_tilde_names_the_home_directory(tmp_repo, tmp_path_factory, monkeypatch):
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hi")
+    _, text = await run_command(session, "export", "~/out.md", width=300)
+    assert (home / "out.md").is_file() and text == f"written to {home / 'out.md'}\n"
+    assert not (tmp_repo / "~").exists()
+
+
+async def test_a_home_directory_nobody_has_is_an_error_line_and_not_a_bug(tmp_repo):
+    # Path.expanduser raises RuntimeError for ~name when there is no such user.
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hi")
+    _, text = await run_command(session, "export", "~no_such_user_zz9/out.md", width=300)
+    assert text == (
+        "error: cannot expand '~no_such_user_zz9/out.md' \u2014 it starts with ~ but no home "
+        "directory is known for it; write the full path\n"
+    )
+
+
+async def test_an_exported_file_is_private_to_whoever_made_it(tmp_repo):
+    # It holds the whole conversation, tool output included.
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hi")
+    target = tmp_repo / "out.md"
+    await run_command(session, "export", str(target))
+    assert stat.S_IMODE(target.stat().st_mode) & 0o077 == 0
+
+
+async def test_text_that_is_not_valid_unicode_is_exported_with_it_spelled_out(tmp_repo):
+    # A lone surrogate cannot be encoded as UTF-8. It used to be found out after the file
+    # had been created, which left an empty file and made the next export say it was there.
+    session = build_session(tmp_repo, [says("a" + chr(0xD800) + "b")])
+    await session.run("hi")
+    target = tmp_repo / "out.md"
+    _, text = await run_command(session, "export", str(target), width=300)
+    assert text == f"written to {target}\n"
+    assert "a\\ud800b" in target.read_text(encoding="utf-8")
+
+
+async def test_a_write_that_fails_leaves_no_file_to_block_the_next_export(tmp_repo, monkeypatch):
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hi")
+    target = tmp_repo / "out.md"
+    real_fdopen = os.fdopen
+
+    class FullDisk:
+        def __init__(self, handle: object) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> FullDisk:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            self._handle.close()  # type: ignore[attr-defined]
+
+        def write(self, _data: bytes) -> int:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "fdopen", lambda fd, *a, **k: FullDisk(real_fdopen(fd, *a, **k)))
+        _, text = await run_command(session, "export", str(target), width=300)
+    assert text == f"error: could not write {target} \u2014 No space left on device\n"
+    assert not target.exists()
+    _, text = await run_command(session, "export", str(target), width=300)
+    assert text == f"written to {target}\n" and target.is_file()
+
+
+async def test_a_name_with_a_null_byte_in_it_is_an_error_line_and_not_a_bug(tmp_repo):
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hi")
+    _, text = await run_command(session, "export", "a\x00b", width=300)
+    assert text.startswith("error: could not write ") and text.endswith("embedded null byte\n")
 
 
 async def test_export_takes_the_rest_of_the_line_as_the_name(tmp_repo):
