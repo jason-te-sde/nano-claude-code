@@ -656,7 +656,10 @@ async def test_a_name_with_a_null_byte_in_it_is_an_error_line_and_not_a_bug(tmp_
     session = build_session(tmp_repo, [says("done")])
     await session.run("hi")
     _, text = await run_command(session, "export", "a\x00b", width=300)
-    assert text.startswith("error: could not write ") and text.endswith("embedded null byte\n")
+    # The reason is the interpreter's own: 3.11 says "embedded null byte", 3.13 says
+    # "open: embedded null character in path". "embedded null" is what both say.
+    assert text.startswith("error: could not write ") and "embedded null" in text
+    assert text.count("\n") == 1
 
 
 async def test_export_takes_the_rest_of_the_line_as_the_name(tmp_repo):
