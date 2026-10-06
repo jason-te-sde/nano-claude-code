@@ -17,11 +17,14 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
+from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
 from nanoclaude.agent.router import Router
 from nanoclaude.agent.ui import UI, Approval
 from nanoclaude.cli import render
+from nanoclaude.cli.prompt import new_prompter
 from nanoclaude.cli.render import (
     ConsoleUI,
     cost_panel,
@@ -502,6 +505,29 @@ async def test_ctrl_c_at_a_confirmation_cancels_the_turn_it_belongs_to():
     call = ToolUseBlock("t1", "Bash", {"command": "make"})
     with pytest.raises(asyncio.CancelledError):
         await screen.ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
+
+
+@pytest.mark.parametrize(
+    ("keys", "outcome"),
+    [("\x03", "cancelled"), ("\x04", "no"), ("y\r", "once"), ("a\r", "always"), ("\r", "no")],
+)
+async def test_the_confirmation_at_a_real_prompt_reads_each_key_as_it_should(keys, outcome):
+    # The prompt is prompt_toolkit's, fed through a pipe: what the keys do is its doing and
+    # what the confirmation makes of them is ours. Ctrl+C is the cancellation of the turn.
+    with create_pipe_input() as keyboard:
+        console, _ = plain_console()
+        ui = ConsoleUI(console, prompter=new_prompter(input=keyboard, output=DummyOutput()))
+        call = ToolUseBlock("t1", "Bash", {"command": "make"})
+        keyboard.send_text(keys)
+        if outcome == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
+            return
+        approval = await ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
+        assert (
+            approval
+            is {"once": Approval.ONCE, "always": Approval.ALWAYS, "no": Approval.NO}[outcome]
+        )
 
 
 async def test_nothing_is_asked_when_everything_is_approved():

@@ -129,9 +129,16 @@ async def _cancellable(work: Coroutine[Any, Any, _T], taps: _DoubleTap) -> _T:
     Raises :class:`_Cancelled` when the person cancelled it. A cancellation that is not
     theirs, the REPL task's own, is not turned into one: it passes through, because
     swallowing it would leave a loop that nothing can stop.
+
+    The handler is installed before the work is started. Installing it can fail (off the
+    main thread, or where the loop has no signal handlers), and work that had been started
+    by then would be left running with nobody awaiting it. And what an earlier press left
+    in ``taps.leave`` is not this work's: a press that arrives after its own turn has ended
+    must not turn the next single Ctrl+C into an exit.
     """
     loop = asyncio.get_running_loop()
-    task = asyncio.create_task(work)
+    taps.leave = False
+    task: asyncio.Task[_T] | None = None
     by_signal = False
 
     def interrupt() -> None:
@@ -139,9 +146,15 @@ async def _cancellable(work: Coroutine[Any, Any, _T], taps: _DoubleTap) -> _T:
         by_signal = True
         if taps.pressed():
             taps.leave = True
-        task.cancel()
+        if task is not None:
+            task.cancel()
 
-    loop.add_signal_handler(signal.SIGINT, interrupt)
+    try:
+        loop.add_signal_handler(signal.SIGINT, interrupt)
+    except BaseException:
+        work.close()  # it never started, and must not be reported as never awaited
+        raise
+    task = asyncio.create_task(work)
     try:
         return await task
     except asyncio.CancelledError:

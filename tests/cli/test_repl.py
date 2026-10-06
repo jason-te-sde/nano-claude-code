@@ -85,13 +85,14 @@ class Sigint:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         loop = asyncio.get_running_loop()
         self._handler: Callable[[], None] | None = None
+        self._last: Callable[[], None] | None = None
         self.installed = 0
         self.removed = 0
         add, remove = loop.add_signal_handler, loop.remove_signal_handler
 
         def spy_add(sig: int, callback: Callable[..., Any], *args: Any) -> None:
             if sig == signal.SIGINT:
-                self._handler = functools.partial(callback, *args)
+                self._handler = self._last = functools.partial(callback, *args)
                 self.installed += 1
             add(sig, callback, *args)
 
@@ -107,6 +108,15 @@ class Sigint:
     def press(self) -> None:
         assert self._handler is not None, "the REPL has no SIGINT handler installed right now"
         self._handler()
+
+    def press_late(self) -> None:
+        """Deliver a press to the handler of the turn that has just ended.
+
+        The loop schedules the handler when the signal arrives, and removing it does not
+        take back a call that is already scheduled: it can run after the turn is over.
+        """
+        assert self._last is not None, "no handler was ever installed"
+        self._last()
 
 
 def block_the_answer(
@@ -526,6 +536,57 @@ async def test_ctrl_c_during_a_turn_cancels_the_turn_and_the_next_prompt_is_answ
     assert (sigint.installed, sigint.removed) == (2, 2)
 
 
+async def test_a_turn_is_not_left_running_when_the_sigint_handler_cannot_be_installed(
+    tmp_repo, monkeypatch
+):
+    # Off the main thread, or where the loop has no signal handlers, installing one raises.
+    # The turn must not be started and forgotten: a task nobody awaits goes on talking to
+    # the model behind the REPL's back.
+    loop = asyncio.get_running_loop()
+
+    def refuse(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("set_wakeup_fd only works in main thread of the main interpreter")
+
+    monkeypatch.setattr(loop, "add_signal_handler", refuse)
+    harness = Harness(tmp_repo, [says("the turn ran")], "hello", "again", width=300)
+    assert await harness.run() == 0
+    await asyncio.sleep(0)  # give anything left running a turn of the loop
+    await asyncio.sleep(0)
+    assert harness.session.model.requests == []
+    assert "the turn ran" not in harness.text
+    assert asyncio.all_tasks() == {asyncio.current_task()}
+    reported = [ln for ln in harness.text.splitlines() if ln.startswith("error:")]
+    assert len(reported) == 2 and all("set_wakeup_fd" in ln for ln in reported)
+
+
+async def test_a_press_that_arrives_after_its_turn_cannot_turn_the_next_cancel_into_an_exit(
+    tmp_repo, monkeypatch
+):
+    sigint = Sigint(monkeypatch)
+    harness = Harness(
+        tmp_repo, [says("first answer"), says("third answer")], "first", "second", "third"
+    )
+    started = block_the_answer(harness.session, monkeypatch, nth=2)
+    asked_for_second = 0
+
+    def two_presses_straggle_in(_message: str) -> None:
+        # The question for the second prompt: the first turn is over. Two presses that were
+        # scheduled before its handler was removed arrive now, within a second of each other.
+        nonlocal asked_for_second
+        asked_for_second += 1
+        if asked_for_second == 2:
+            sigint.press_late()
+            sigint.press_late()
+
+    harness.prompter.on_ask = two_presses_straggle_in
+    repl_task = harness.start()
+    await reached(started)
+    sigint.press()  # one press, during the second turn: it is cancelled, and nothing more
+    assert await asyncio.wait_for(repl_task, timeout=5) == 0
+    assert "cancelled" in harness.text and "third answer" in harness.text
+    assert len(harness.prompter.asked) == 4  # the third prompt was read, and then Ctrl+D
+
+
 async def test_the_sigint_handler_is_removed_after_a_turn_that_finished_and_one_that_failed(
     tmp_repo, monkeypatch
 ):
@@ -558,6 +619,29 @@ async def test_ctrl_c_still_cancels_a_turn_after_a_confirmation_was_answered_at_
         assert await asyncio.wait_for(repl_task, timeout=5) == 0
     assert "cancelled" in buffer.getvalue()
     assert typed.asked == [PROMPT, PROMPT, PROMPT]  # and the next prompt was read
+
+
+async def test_a_real_sigint_cancels_the_turn_and_the_next_prompt_is_answered(
+    tmp_repo, monkeypatch
+):
+    # The signal itself, through the loop's own plumbing and not a call to the handler. If
+    # the REPL had installed none, the signal would reach this test, and the stand-in below
+    # turns that into a failure of this test and not an interruption of the whole run.
+    def nobody_handles_this(_signum: int, _frame: object) -> None:
+        raise AssertionError("a SIGINT reached the process: the REPL's handler was not installed")
+
+    previous = signal.signal(signal.SIGINT, nobody_handles_this)
+    try:
+        harness = Harness(tmp_repo, [says("an answer, this time")], "first", "second")
+        started = block_the_answer(harness.session, monkeypatch)
+        repl_task = harness.start()
+        await reached(started)
+        asyncio.get_running_loop().call_later(0.1, signal.raise_signal, signal.SIGINT)
+        assert await asyncio.wait_for(repl_task, timeout=5) == 0
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    assert "cancelled" in harness.text and "an answer, this time" in harness.text
+    assert harness.text.splitlines()[-1] == "bye"
 
 
 async def test_ctrl_c_at_a_confirmation_cancels_the_turn_and_writes_nothing(tmp_repo):

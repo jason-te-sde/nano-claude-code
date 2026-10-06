@@ -92,6 +92,20 @@ async def test_a_bare_prompt_returns_the_line_that_was_typed(keyboard):
     assert await prompter.prompt_async("allow? ") == "yes"
 
 
+async def test_ctrl_c_at_a_bare_prompt_raises_keyboard_interrupt(keyboard):
+    keyboard.send_text("half an answer\x03")
+    prompter = new_prompter(input=keyboard, output=DummyOutput())
+    with pytest.raises(KeyboardInterrupt):
+        await prompter.prompt_async("allow? ")
+
+
+async def test_ctrl_d_at_a_bare_prompt_raises_end_of_file(keyboard):
+    keyboard.send_text("\x04")
+    prompter = new_prompter(input=keyboard, output=DummyOutput())
+    with pytest.raises(EOFError):
+        await prompter.prompt_async("allow? ")
+
+
 async def test_a_bare_prompt_leaves_the_sigint_handler_of_the_turn_it_is_asked_in_alone(keyboard):
     # prompt_toolkit installs a SIGINT handler of its own while a prompt is up and removes
     # whatever is there when it is done, which would take the REPL's handler for the turn
