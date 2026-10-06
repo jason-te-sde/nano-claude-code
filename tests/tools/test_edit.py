@@ -3,8 +3,8 @@ from dataclasses import replace as dc_replace
 import pytest
 
 from nanoclaude.tools.base import ToolArgumentError
-from nanoclaude.tools.edit import EditTool
-from nanoclaude.tools.fs import stamp_of
+from nanoclaude.tools.edit import EditError, EditTool, preview_edit, unified_diff
+from nanoclaude.tools.fs import BinaryFileError, stamp_of
 
 
 def having_read(ctx, path):
@@ -207,3 +207,120 @@ def test_the_description_is_the_one_from_the_brief():
     assert description.startswith("Make one or more exact string replacements in a single file.")
     assert "Never include the line-number prefix" in description
     assert "Preserve the file's existing indentation and line endings" in description
+
+
+# --------------------------------------------------------------------------
+# Previewing: the diff a confirmation shows before anything is written
+# --------------------------------------------------------------------------
+
+
+def test_a_preview_shows_the_change_and_writes_nothing(tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1\ny = 2\n")
+    diff = preview_edit(
+        str(target), "a.py", {"edits": [{"old_string": "x = 1", "new_string": "x = 9"}]}
+    )
+    assert "--- a/a.py" in diff and "-x = 1" in diff and "+x = 9" in diff
+    assert target.read_text() == "x = 1\ny = 2\n"
+
+
+async def test_the_preview_is_the_diff_the_edit_then_makes(ctx, tmp_repo):
+    # Two code paths, one answer: what a person approves is what gets written, so the
+    # preview cannot be allowed to drift from the tool.
+    target = tmp_repo / "a.py"
+    target.write_text("def f():\n    return 1\n\n\ndef g():\n    return 1\n")
+    arguments = {
+        "path": "a.py",
+        "edits": [
+            {"old_string": "def f():\n    return 1", "new_string": "def f():\n    return 2"},
+            {"old_string": "g", "new_string": "h"},
+        ],
+    }
+    preview = preview_edit(str(target), "a.py", arguments)
+    outcome = await EditTool().run(having_read(ctx, target), "t1", arguments)
+    assert not outcome.is_error
+    assert outcome.content == f"Edited a.py\n{preview}"
+
+
+def test_a_preview_of_an_edit_that_cannot_apply_says_why_as_the_edit_would(tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x\nx\n")
+    with pytest.raises(EditError, match="appears 2 times"):
+        preview_edit(str(target), "a.py", {"edits": [{"old_string": "x", "new_string": "y"}]})
+    with pytest.raises(EditError, match="was not found"):
+        preview_edit(str(target), "a.py", {"edits": [{"old_string": "z", "new_string": "y"}]})
+
+
+def test_a_preview_of_an_edit_that_changes_nothing_is_refused_like_the_edit(tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x\n")
+    with pytest.raises(EditError, match="produced no change"):
+        preview_edit(str(target), "a.py", {"edits": [{"old_string": "x", "new_string": "x"}]})
+
+
+def test_a_preview_of_malformed_arguments_is_an_argument_error(tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x\n")
+    with pytest.raises(ToolArgumentError, match="edits must be a list"):
+        preview_edit(str(target), "a.py", {"edits": "x"})
+
+
+def test_a_preview_of_a_file_that_cannot_be_read_is_an_os_error(tmp_repo):
+    edits = {"edits": [{"old_string": "x", "new_string": "y"}]}
+    with pytest.raises(FileNotFoundError):
+        preview_edit(str(tmp_repo / "missing.py"), "missing.py", edits)
+    binary = tmp_repo / "blob.bin"
+    binary.write_bytes(b"\0\1\2")
+    with pytest.raises(BinaryFileError):
+        preview_edit(str(binary), "blob.bin", edits)
+
+
+# --------------------------------------------------------------------------
+# The diff of a file whose last line has no newline
+# --------------------------------------------------------------------------
+
+
+def test_a_last_line_without_a_newline_is_marked_and_not_run_into_the_next_line():
+    # difflib leaves the line as it is, so "-x = 1" and "+x = 2" came out as one line:
+    # "-x = 1+x = 2", which a person reads as one removed line.
+    assert unified_diff("x = 1", "x = 2", "a.py") == (
+        "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n"
+        "-x = 1\n\\ No newline at end of file\n"
+        "+x = 2\n\\ No newline at end of file\n"
+    )
+
+
+def test_adding_a_final_newline_is_a_change_the_diff_shows():
+    assert unified_diff("a\nb", "a\nb\n", "f") == (
+        "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+b\n"
+    )
+
+
+def test_removing_a_final_newline_is_a_change_the_diff_shows():
+    assert unified_diff("a\nb\n", "a\nb", "f") == (
+        "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n+b\n\\ No newline at end of file\n"
+    )
+
+
+def test_only_a_newline_ends_a_line_in_a_diff():
+    # A lone carriage return or a form feed is a character in a line, not the end of one.
+    diff = unified_diff("a\rb\n\x0c\n", "a\rc\n\x0c\n", "f")
+    assert diff == "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\rb\n+a\rc\n \x0c\n"
+
+
+def test_an_empty_file_has_no_lines_to_diff():
+    assert unified_diff("", "", "f") == ""
+    assert unified_diff("", "new\n", "f") == "--- a/f\n+++ b/f\n@@ -0,0 +1 @@\n+new\n"
+
+
+async def test_the_diff_an_edit_reports_marks_a_last_line_without_a_newline(ctx, tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1")
+    outcome = await EditTool().run(
+        having_read(ctx, target),
+        "t1",
+        {"path": "a.py", "edits": [{"old_string": "1", "new_string": "2"}]},
+    )
+    assert (
+        not outcome.is_error and "-x = 1\n\\ No newline at end of file\n+x = 2\n" in outcome.content
+    )

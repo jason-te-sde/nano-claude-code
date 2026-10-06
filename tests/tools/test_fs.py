@@ -7,11 +7,13 @@ from nanoclaude.tools.fs import (
     BinaryFileError,
     FileSnapshot,
     FileStamp,
+    FileSystemError,
     FileTooLargeError,
     read_text,
     stamp_of,
     write_atomic,
 )
+from tests.fifo import call_without_blocking, make_fifo
 
 
 def test_reading_returns_content_and_a_stamp(tmp_path):
@@ -28,6 +30,16 @@ def test_a_file_over_the_limit_is_refused_with_a_usable_message(tmp_path):
     target.write_bytes(b"x" * 1_000_001)
     with pytest.raises(FileTooLargeError, match="Grep"):
         read_text(str(target))
+
+
+def test_a_file_over_the_limit_has_a_reason_without_the_advice_to_the_model(tmp_path):
+    target = tmp_path / "big.txt"
+    target.write_bytes(b"x" * 1_000_001)
+    with pytest.raises(FileTooLargeError) as refused:
+        read_text(str(target))
+    assert refused.value.reason == f"{target} is 1000001 bytes, over the 1000000-byte read limit"
+    assert "Grep" not in refused.value.reason
+    assert str(refused.value).startswith(refused.value.reason) and "Grep" in str(refused.value)
 
 
 def test_a_binary_file_is_refused_rather_than_mangled(tmp_path):
@@ -118,3 +130,45 @@ def test_stamp_of_an_unreadable_file_is_none(tmp_path):
         assert stamp_of(str(target)) is None
     finally:
         target.chmod(0o600)
+
+
+# --------------------------------------------------------------------------
+# Only a regular file is opened: opening a FIFO waits for a writer that may never come
+# --------------------------------------------------------------------------
+
+
+def test_a_fifo_is_refused_before_it_is_opened(tmp_path):
+    fifo = make_fifo(tmp_path / "pipe.fifo")
+    with pytest.raises(FileSystemError, match=r"pipe\.fifo is not a regular file"):
+        call_without_blocking(fifo, read_text, str(fifo))
+
+
+def test_stamp_of_a_fifo_is_refused_before_it_is_opened(tmp_path):
+    fifo = make_fifo(tmp_path / "pipe.fifo")
+    with pytest.raises(FileSystemError, match=r"pipe\.fifo is not a regular file"):
+        call_without_blocking(fifo, stamp_of, str(fifo))
+
+
+def test_a_link_to_a_fifo_is_refused_as_the_fifo_is(tmp_path):
+    fifo = make_fifo(tmp_path / "pipe.fifo")
+    link = tmp_path / "link"
+    link.symlink_to(fifo)
+    with pytest.raises(FileSystemError, match="is not a regular file"):
+        call_without_blocking(fifo, read_text, str(link))
+
+
+def test_a_device_is_refused_as_well_as_a_fifo():
+    # What is refused is whatever is not a regular file, not only the one kind that blocks.
+    with pytest.raises(FileSystemError, match="/dev/null is not a regular file"):
+        read_text("/dev/null")
+    with pytest.raises(FileSystemError, match="/dev/null is not a regular file"):
+        stamp_of("/dev/null")
+
+
+def test_a_link_to_a_regular_file_is_read_as_the_file_is(tmp_path):
+    target = tmp_path / "real.txt"
+    target.write_text("hello\n")
+    link = tmp_path / "link.txt"
+    link.symlink_to(target)
+    assert read_text(str(link)).content == "hello\n"
+    assert stamp_of(str(link)) is not None

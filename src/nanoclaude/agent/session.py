@@ -367,9 +367,7 @@ class Session:
             if not error.context_overflow:
                 raise
             overflow = error
-        before = self.state.transcript
-        await self._compact_fully(capabilities)
-        if self.state.transcript == before:
+        if not await self._compact_fully(capabilities):
             raise self._does_not_fit(overflow, self._nothing_to_compact(capabilities)) from overflow
         try:
             return await self._complete("main", self._request(capabilities, system, specs))
@@ -449,36 +447,44 @@ class Session:
             return min(configured, SMALL_WINDOW_KEEP_RECENT)
         return configured
 
-    async def compact(self, instructions: str | None = None) -> None:
-        """Summarise the older part of the conversation now: the ``/compact`` command."""
+    async def compact(self, instructions: str | None = None) -> bool:
+        """Summarise the older part of the conversation now: the ``/compact`` command.
+
+        True when a summary replaced older messages, False when there was nothing older than
+        the recent turns to summarise. Not "whether the conversation changed": closing what an
+        interrupted turn left open comes first and adds a note, so a conversation can change
+        and have nothing compacted.
+        """
         self._mend()
         # The summary may never arrive, and the store holds what the model is shown.
         self._persist()
         capabilities = await self.router.capabilities_for("main")
-        await self._compact_fully(capabilities, instructions)
+        return await self._compact_fully(capabilities, instructions)
 
     async def _compact_fully(
         self, capabilities: Capabilities, instructions: str | None = None
-    ) -> None:
+    ) -> bool:
         """Replace the older part of the conversation with a summary, and store it.
 
         The one place a full compaction happens: the budget calls it at the hard
         threshold, ``/compact`` calls it, and so does the answer to a provider that
         says the conversation does not fit. They differ in why, not in how.
-        ``capabilities`` are the main model's.
+        ``capabilities`` are the main model's. Returns whether anything was replaced.
         """
         extra = f"\n\nPay particular attention to: {instructions}" if instructions else ""
 
         async def summarise(text: str) -> str:
             return await self._summarise(text + extra)
 
+        before = self.state.transcript
         compacted = await full_compact(
-            self.state.transcript,
+            before,
             keep_recent=self._keep_recent(capabilities),
             summarise=summarise,
         )
         self.state = replace(self.state, transcript=compacted)
         self._persist()
+        return compacted != before
 
     async def _summarise(self, text: str) -> str:
         """Ask the compact role's model for a summary of ``text``.

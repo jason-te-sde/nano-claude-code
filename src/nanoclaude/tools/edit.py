@@ -99,16 +99,37 @@ def apply_edits(content: str, edits: Sequence[EditSpec]) -> str:
     return result
 
 
+def _lines_with_endings(text: str) -> list[str]:
+    """``text`` as lines that keep their newline; only a newline ends one.
+
+    Not ``str.splitlines``, which also ends a line at a carriage return, a form feed and
+    several characters a text file may hold: those are characters of a line, and cutting
+    there makes a diff that does not match the file.
+    """
+    parts = text.split("\n")
+    last = parts.pop()
+    lines = [f"{part}\n" for part in parts]
+    return [*lines, last] if last else lines
+
+
 def unified_diff(before: str, after: str, path: str) -> str:
-    return "".join(
-        difflib.unified_diff(
-            before.splitlines(keepends=True),
-            after.splitlines(keepends=True),
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-            n=3,
-        )
-    )
+    """The unified diff from ``before`` to ``after``, as git writes it.
+
+    A last line that has no newline is followed by ``\\ No newline at end of file``.
+    difflib leaves such a line as it is, so the removed line and the added line after it
+    ran together as ``-x = 1+x = 2``, and adding or removing the final newline showed as no
+    change at all.
+    """
+    diff: list[str] = []
+    for line in difflib.unified_diff(
+        _lines_with_endings(before),
+        _lines_with_endings(after),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        n=3,
+    ):
+        diff.append(line if line.endswith("\n") else f"{line}\n\\ No newline at end of file\n")
+    return "".join(diff)
 
 
 DESCRIPTION = """\
@@ -160,6 +181,27 @@ def _parse_edits(arguments: Mapping[str, Any]) -> list[EditSpec]:
             raise ToolArgumentError(f"edit {index}: old_string and new_string must be strings")
         specs.append(EditSpec(old, new, bool(item.get("replace_all", False))))
     return specs
+
+
+def preview_edit(path: str, shown: str, arguments: Mapping[str, Any]) -> str:
+    """The diff :meth:`EditTool.run` would write for ``arguments``, without writing it.
+
+    What a confirmation shows before a person says yes: the file as it is now, with the
+    call's edits applied by the same algorithm, as the unified diff the tool reports
+    afterwards. ``path`` is the resolved file and ``shown`` is the name the diff carries.
+
+    It raises what the edit itself would fail with, so that the front end can say the
+    edit cannot be applied instead of showing nothing: ``ToolArgumentError`` for arguments
+    that are not edits, ``EditError`` for an edit that does not apply or changes nothing,
+    and ``OSError`` for a file that cannot be read. It does not know what the session has
+    read, so it cannot say that ``run`` will refuse the file for not having been read.
+    """
+    specs = _parse_edits(arguments)
+    snapshot = read_text(path)
+    updated = apply_edits(snapshot.content, specs)
+    if updated == snapshot.content:
+        raise EditError("the edit produced no change")
+    return unified_diff(snapshot.content, updated, shown)
 
 
 class EditTool:

@@ -634,6 +634,62 @@ async def test_a_model_the_table_does_not_know_is_not_probed_unless_it_is_an_oll
 
 
 # --------------------------------------------------------------------------
+# Re-routing a role: what /model does, from the next request on
+# --------------------------------------------------------------------------
+
+
+async def test_a_rerouted_role_is_answered_by_the_new_models_client(make):
+    router = make(config_with())
+    assert (await router.client_for("main")).model_id == "claude-sonnet-5"
+    await router.route("main", "small")
+    assert (await router.client_for("main")).model_id == "qwen3-coder"
+
+
+async def test_rerouting_one_role_leaves_the_others_where_they_were(make):
+    router = make(config_with())
+    await router.route("main", "small")
+    assert {role: router.config.roles.alias_for(role) for role in ROLES} == {
+        "main": "small",
+        "explore": "big",
+        "plan": "big",
+        "verify": "big",
+        "compact": "big",
+        "title": "big",
+    }
+
+
+async def test_rerouting_to_an_alias_nobody_defined_names_the_ones_that_exist(make):
+    router = make(config_with())
+    before = router.config
+    with pytest.raises(ConfigError, match="'nope'") as caught:
+        await router.route("main", "nope")
+    assert "big" in str(caught.value) and "small" in str(caught.value)
+    assert router.config is before
+
+
+async def test_rerouting_a_role_that_does_not_exist_is_a_programming_error(make):
+    router = make(config_with())
+    before = router.config
+    with pytest.raises(ValueError, match="unknown role 'mian'"):
+        await router.route("mian", "small")
+    assert router.config is before
+
+
+async def test_a_model_that_cannot_be_used_is_refused_at_once_and_the_old_route_stays(make):
+    # The client is built by the command that asked for it, so a missing key is
+    # reported there, with the model that was answering still answering, and not
+    # on the next prompt.
+    config = config_with()
+    config.models["keyless"] = ModelConfig("anthropic", "claude-opus-5", api_key_env="OTHER_KEY")
+    router = make(config)
+    before = router.config
+    with pytest.raises(ModelError, match="OTHER_KEY"):
+        await router.route("main", "keyless")
+    assert router.config is before
+    assert (await router.client_for("main")).model_id == "claude-sonnet-5"
+
+
+# --------------------------------------------------------------------------
 # Closing
 # --------------------------------------------------------------------------
 

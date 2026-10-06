@@ -9,7 +9,9 @@ which is not.
 **Refusal to read what it cannot handle.** Files above the size limit, and
 files that are not valid UTF-8, are rejected with an error the model can act on
 rather than decoded into replacement characters that burn context and say
-nothing.
+nothing. So is anything that is not a regular file, before it is opened: opening
+a FIFO waits for someone to write to it, and a call that waits for that holds up
+the whole session.
 
 **A stamp on everything read.** Read-before-edit and stale-file detection both
 key off the hash.
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +37,17 @@ class FileSystemError(OSError):
 
 
 class FileTooLargeError(FileSystemError):
-    pass
+    """A file over ``MAX_READ_BYTES``.
+
+    ``reason`` says so, to anybody. The message goes on to say what the model can do about
+    it, which is not for a person deciding about a write.
+    """
+
+    def __init__(self, path: str, size: int) -> None:
+        self.reason = f"{path} is {size} bytes, over the {MAX_READ_BYTES}-byte read limit"
+        super().__init__(
+            f"{self.reason}. Use Grep to search it, or Bash to slice out the part you need."
+        )
 
 
 class BinaryFileError(FileSystemError):
@@ -58,9 +71,25 @@ def _stamp(path: Path, data: bytes) -> FileStamp:
     return FileStamp(hashlib.sha256(data).hexdigest(), len(data), path.stat().st_mtime_ns)
 
 
+def _size_of_what_can_be_read(path: str) -> int:
+    """How large ``path`` is, once it is known to be a file that can be opened and read to its end.
+
+    Anything but a regular file is refused here, before it is opened. A FIFO is not read
+    until somebody writes to it, and a device or a socket has no end: neither is a file the
+    agent could mean to read or replace. A directory is left to the read that follows, which
+    refuses it in its own way. What the path names is looked at through links, as it is
+    opened through them.
+    """
+    status = Path(path).stat()
+    if not (stat.S_ISREG(status.st_mode) or stat.S_ISDIR(status.st_mode)):
+        raise FileSystemError(f"{path} is not a regular file")
+    return status.st_size
+
+
 def stamp_of(path: str) -> FileStamp | None:
     target = Path(path)
     try:
+        _size_of_what_can_be_read(path)
         return _stamp(target, target.read_bytes())
     except (FileNotFoundError, IsADirectoryError, PermissionError):
         return None
@@ -68,12 +97,9 @@ def stamp_of(path: str) -> FileStamp | None:
 
 def read_text(path: str) -> FileSnapshot:
     target = Path(path)
-    size = target.stat().st_size
+    size = _size_of_what_can_be_read(path)
     if size > MAX_READ_BYTES:
-        raise FileTooLargeError(
-            f"{path} is {size} bytes, over the {MAX_READ_BYTES}-byte read limit. "
-            "Use Grep to search it, or Bash to slice out the part you need."
-        )
+        raise FileTooLargeError(path, size)
     data = target.read_bytes()
     if b"\0" in data[:BINARY_SNIFF_BYTES]:
         raise BinaryFileError(f"{path} looks binary (NUL byte near the start)")

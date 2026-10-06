@@ -1496,6 +1496,46 @@ async def test_compacting_a_conversation_with_nothing_older_than_the_recent_turn
     assert session.model.requests == [] and session.state.transcript == before
 
 
+async def test_compacting_says_that_it_summarised_something(tmp_repo):
+    session = build_session(tmp_repo, [says("SUMMARY")])
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    assert await session.compact() is True
+
+
+async def test_compacting_says_that_it_did_not_when_nothing_was_older_than_the_recent_turns(
+    tmp_repo,
+):
+    session = build_session(tmp_repo, [says("never asked")])
+    session.state = replace(session.state, transcript=tool_history(1, result_chars=50))
+    assert await session.compact() is False
+    assert session.model.requests == []
+
+
+async def test_compacting_after_an_interrupted_turn_says_it_did_not_though_it_added_a_note(
+    tmp_repo, monkeypatch
+):
+    # compact() first closes what the interruption left open, which adds a note and so
+    # changes the conversation. Nothing was summarised, and it must not say that something was.
+    started = asyncio.Event()
+    session = build_session(tmp_repo, [])
+
+    async def never_answers(request: ModelRequest) -> ModelReply:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the model was allowed to answer")
+
+    monkeypatch.setattr(session.model, "complete", never_answers)
+    task = asyncio.create_task(session.run("a question"))
+    await reached(started)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    before = session.state.transcript
+    assert await session.compact() is False
+    assert session.state.transcript != before  # the note of the interruption was added
+    assert "interrupted" in session.state.transcript.messages[-1].text().lower()
+
+
 # --------------------------------------------------------------------------
 # Persistence: the store mirrors the transcript the model is shown
 # --------------------------------------------------------------------------
