@@ -217,6 +217,31 @@ def test_a_diff_is_coloured_by_the_kind_of_each_line():
     assert colour_of["--- a removed line"] == "red" and colour_of["+++ an added line"] == "green"
 
 
+def test_a_diff_line_wider_than_two_hundred_characters_is_cut_and_says_how_much_is_left():
+    diff = f"--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+{'y' * 200_000}\n"
+    shown = capture(render_diff(diff), width=1000).splitlines()
+    assert shown[-2:] == ["-old", "+" + "y" * 199 + "... (199801 more characters)"]
+
+
+def test_a_diff_line_is_cut_only_where_it_is_wider_than_two_hundred_characters():
+    exact = "+" + "y" * 199
+    one_over = "+" + "y" * 200
+    diff = f"--- a/f\n+++ b/f\n@@ -1 +1,2 @@\n{exact}\n{one_over}\n"
+    assert capture(render_diff(diff), width=1000).splitlines()[-2:] == [
+        exact,
+        exact + "... (1 more character)",
+    ]
+
+
+def test_the_note_on_a_cut_diff_line_is_drawn_dim_apart_from_the_line_it_ends():
+    diff = f"--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+{'y' * 300}\n"
+    pieces = styled_pieces(render_diff(diff), width=1000)
+    note = [style for text, style in pieces if text == "... (101 more characters)"]
+    assert [style.dim for style in note] == [True]
+    colour_of = {text: style.color.name for text, style in pieces if style.color}
+    assert colour_of["+" + "y" * 199] == "green"
+
+
 def test_the_mark_for_a_missing_final_newline_is_drawn_dim():
     diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n\\ No newline at end of file\n+y\n"
     pieces = styled_pieces(render_diff(diff))
@@ -888,6 +913,64 @@ async def test_a_long_new_file_is_cut_at_twenty_lines_and_says_how_many_more(tmp
     assert lines[21:] == ["  ... 5 more lines (showing the first 20)"]
 
 
+async def test_a_line_of_a_new_file_wider_than_two_hundred_characters_is_cut(tmp_repo):
+    screen = Screen("n", width=300)
+    content = "x" * 200_000 + "\nnext\n"
+    await screen.ui.confirm(
+        write_call("new.py", content), write_request("Write", str(tmp_repo / "new.py")), ASK
+    )
+    assert screen.text.splitlines()[3:] == [
+        "  new file: 2 lines, 200006 bytes",
+        "    1  " + "x" * 200 + "... (199800 more characters)",
+        "    2  next",
+    ]
+
+
+async def test_one_enormous_line_does_not_push_the_subject_line_off_the_screen(tmp_repo):
+    # The cut at twenty lines bounds how many lines are listed and not how wide they are:
+    # a single line of two hundred thousand characters was two thousand rows at this width.
+    screen = Screen("n", width=100)
+    await screen.ui.confirm(
+        write_call("new.py", "x" * 200_000), write_request("Write", str(tmp_repo / "new.py")), ASK
+    )
+    rows = screen.text.splitlines()
+    assert rows[1].startswith("Write  ") and len(rows) < 12
+
+
+async def test_a_long_line_in_the_diff_of_a_replaced_file_is_cut_too(tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1\n")
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(
+        write_call("a.py", "y" * 5_000 + "\n"), write_request("Write", str(target)), ASK
+    )
+    assert screen.text.splitlines()[-1] == "+" + "y" * 199 + "... (4801 more characters)"
+
+
+async def test_a_new_file_without_a_final_newline_says_so_after_its_last_line(tmp_repo):
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(
+        write_call("new.py", "first\nlast"), write_request("Write", str(tmp_repo / "new.py")), ASK
+    )
+    assert screen.text.splitlines()[3:] == [
+        "  new file: 2 lines, 10 bytes",
+        "    1  first",
+        "    2  last",
+        "  \\ No newline at end of file",
+    ]
+
+
+async def test_a_cut_listing_does_not_claim_to_know_how_the_file_ends(tmp_repo):
+    # The end of the file is not shown, and the line that would carry the mark is not either.
+    content = "".join(f"line {n}\n" for n in range(1, 26)) + "last"
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(
+        write_call("new.py", content), write_request("Write", str(tmp_repo / "new.py")), ASK
+    )
+    assert "No newline" not in screen.text
+    assert screen.text.splitlines()[-1] == "  ... 6 more lines (showing the first 20)"
+
+
 async def test_a_write_that_replaces_a_file_shows_the_diff_before_the_question_and_writes_nothing(
     tmp_repo,
 ):
@@ -966,6 +1049,28 @@ async def test_the_reason_a_write_cannot_be_compared_shows_its_controls_by_name(
     await screen.ui.confirm(write_call("x.dat", "text\n"), write_request("Write", str(binary)), ASK)
     [reason] = [line for line in screen.text.splitlines() if line.startswith("  no diff: ")]
     assert reason == f"  no diff: {tmp_repo}/bin\\x1b[2K.dat looks binary (NUL byte near the start)"
+
+
+async def test_a_write_over_a_file_too_large_to_read_says_so_in_words_for_a_person(tmp_repo):
+    # What the tool tells the model ends with advice for the model: Grep it, or slice it with
+    # Bash. A person deciding about a write is not helped by it.
+    big = tmp_repo / "big.txt"
+    big.write_bytes(b"x" * 1_000_001)
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(write_call("big.txt", "small\n"), write_request("Write", str(big)), ASK)
+    reason = f"  no diff: {big} is 1000001 bytes, over the 1000000-byte read limit"
+    assert reason in screen.text.splitlines()
+    assert "Grep" not in screen.text and "slice" not in screen.text
+
+
+async def test_an_edit_of_a_file_too_large_to_read_says_so_in_words_for_a_person(tmp_repo):
+    big = tmp_repo / "big.txt"
+    big.write_bytes(b"x" * 1_000_001)
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(edit_call("big.txt", "x", "y"), write_request("Edit", str(big)), ASK)
+    reason = f"  no preview: {big} is 1000001 bytes, over the 1000000-byte read limit"
+    assert reason in screen.text.splitlines()
+    assert "Grep" not in screen.text and "slice" not in screen.text
 
 
 async def test_a_write_over_a_directory_says_why_it_cannot_be_compared(tmp_repo):

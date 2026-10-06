@@ -32,6 +32,16 @@ def test_a_file_over_the_limit_is_refused_with_a_usable_message(tmp_path):
         read_text(str(target))
 
 
+def test_a_file_over_the_limit_has_a_reason_without_the_advice_to_the_model(tmp_path):
+    target = tmp_path / "big.txt"
+    target.write_bytes(b"x" * 1_000_001)
+    with pytest.raises(FileTooLargeError) as refused:
+        read_text(str(target))
+    assert refused.value.reason == f"{target} is 1000001 bytes, over the 1000000-byte read limit"
+    assert "Grep" not in refused.value.reason
+    assert str(refused.value).startswith(refused.value.reason) and "Grep" in str(refused.value)
+
+
 def test_a_binary_file_is_refused_rather_than_mangled(tmp_path):
     target = tmp_path / "a.bin"
     target.write_bytes(b"\x89PNG\x00\x00binary")

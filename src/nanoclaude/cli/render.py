@@ -53,6 +53,7 @@ from nanoclaude.providers.base import ModelReply
 from nanoclaude.providers.pricing import PriceBook
 from nanoclaude.tools.base import ToolArgumentError, ToolOutcome, sanitize
 from nanoclaude.tools.edit import EditError, preview_edit
+from nanoclaude.tools.fs import FileTooLargeError
 from nanoclaude.tools.write import preview_write
 
 MAX_SUMMARY_CHARS = 100
@@ -62,6 +63,11 @@ MAX_SUMMARY_CHARS = 100
 #: left out without a word.
 WRITE_PREVIEW_NEW_LINES = 20
 WRITE_PREVIEW_DIFF_LINES = 40
+
+#: How much of one line a preview shows. The cuts above bound how many lines there are and
+#: not how wide: a file that is one line of two hundred thousand characters is one line of
+#: the listing, two thousand rows on the screen, and the subject line is somewhere above them.
+MAX_PREVIEW_LINE_CHARS = 200
 
 #: The width of the bar ``/status`` draws for how much of the context window is in use.
 BAR_WIDTH = 20
@@ -173,6 +179,22 @@ def summarise_call(call: ToolUseBlock) -> str:
     return _shorten(visible(primary))
 
 
+def _shown_line(line: str, style: str = "") -> Text:
+    """One line of a preview, with its controls shown by name and cut where it is too wide.
+
+    What was cut off is counted in a dim note after the line, so that nobody takes a line
+    that goes on for what it shows. Tabs stay what they are. The cut is made on the line as it
+    is in the file, before its controls are spelled out, so that no spelling is cut in two.
+    """
+    shown = visible_text(line[:MAX_PREVIEW_LINE_CHARS], keep_newlines=True)
+    if style:
+        shown.stylize(style)
+    if len(line) > MAX_PREVIEW_LINE_CHARS:
+        more = _plural(len(line) - MAX_PREVIEW_LINE_CHARS, "more character")
+        shown.append(f"... ({more})", style="dim")
+    return shown
+
+
 def _diff_line_style(line: str, in_hunk: bool) -> str:
     """How a line of a unified diff is drawn, from what kind of line it is."""
     if line.startswith("@@"):
@@ -195,7 +217,8 @@ def render_diff(diff: str) -> RenderableType:
     to the terminal as plain text: in a diff that is about to be approved, ``\\x1b`` the
     escape character and ``\\x1b`` the four characters must not look alike, so the first is
     styled apart, as it is on a confirmation's subject line. A line that begins with ``--``
-    inside a hunk is a removed line and not a file header, and is drawn as one.
+    inside a hunk is a removed line and not a file header, and is drawn as one. A line wider
+    than ``MAX_PREVIEW_LINE_CHARS`` is cut, and says how much of it is not shown.
     """
     lines = diff.split("\n")
     if lines and lines[-1] == "":
@@ -203,12 +226,8 @@ def render_diff(diff: str) -> RenderableType:
     drawn: list[Text] = []
     in_hunk = False
     for line in lines:
-        text = visible_text(line, keep_newlines=True)
-        style = _diff_line_style(line, in_hunk)
-        if style:
-            text.stylize(style)
+        drawn.append(_shown_line(line, _diff_line_style(line, in_hunk)))
         in_hunk = in_hunk or line.startswith("@@")
-        drawn.append(text)
     return Text("\n").join(drawn)
 
 
@@ -421,13 +440,13 @@ class ConsoleUI:
             lines = _lines_of(preview.content)
             for number, line in enumerate(lines[:WRITE_PREVIEW_NEW_LINES], start=1):
                 # The file's own text: shown by name where it holds a control, with its tabs
-                # as they are.
-                self._console.print(
-                    Text.assemble(
-                        (f"  {number:>3}  ", "dim"), visible_text(line, keep_newlines=True)
-                    )
-                )
+                # as they are, and cut where it is very wide.
+                self._console.print(Text.assemble((f"  {number:>3}  ", "dim"), _shown_line(line)))
             self._say_how_many_more(len(lines) - WRITE_PREVIEW_NEW_LINES, WRITE_PREVIEW_NEW_LINES)
+            # As a diff says it, and only where the end of the file is on the screen.
+            ends_bare = preview.content != "" and not preview.content.endswith("\n")
+            if ends_bare and len(lines) <= WRITE_PREVIEW_NEW_LINES:
+                self._console.print(plain("  \\ No newline at end of file", "dim"))
 
     def _say_how_many_more(self, more: int, shown: int) -> None:
         if more > 0:
@@ -444,7 +463,9 @@ class ConsoleUI:
         try:
             diff = await asyncio.to_thread(preview_edit, path, label, call.arguments)
         except (ToolArgumentError, EditError, OSError) as exc:
-            self._console.print(Text.assemble(("  no preview: ", "dim"), visible_text(str(exc))))
+            # A file that is too large has a reason for a person, and a message for the model.
+            why = exc.reason if isinstance(exc, FileTooLargeError) else str(exc)
+            self._console.print(Text.assemble(("  no preview: ", "dim"), visible_text(why)))
             return
         # The new text is the model's and is going into a file: its controls are shown, not
         # removed, so that nobody approves a cleaner edit than the one that is written.

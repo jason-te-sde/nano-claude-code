@@ -18,7 +18,13 @@ from nanoclaude.tools.base import (
     require_str,
 )
 from nanoclaude.tools.edit import unified_diff
-from nanoclaude.tools.fs import FileSystemError, read_text, stamp_of, write_atomic
+from nanoclaude.tools.fs import (
+    FileSystemError,
+    FileTooLargeError,
+    read_text,
+    stamp_of,
+    write_atomic,
+)
 
 DESCRIPTION = """Write a UTF-8 text file, creating it or replacing it entirely.
 
@@ -78,6 +84,9 @@ def preview_write(path: str, shown: str, arguments: Mapping[str, Any]) -> WriteP
         current = read_text(path)
     except FileNotFoundError:
         return WritePreview("create", content, lines, size)
+    except FileTooLargeError as exc:
+        # Not str(exc): that goes on to tell the model what to do about it.
+        return WritePreview("overwrite", content, lines, size, why=exc.reason)
     except OSError as exc:
         return WritePreview("overwrite", content, lines, size, why=str(exc))
     if current.content == content:

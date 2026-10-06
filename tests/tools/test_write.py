@@ -158,6 +158,14 @@ async def test_the_preview_counts_lines_the_way_the_tool_reports_them(ctx, tmp_r
     assert f"({preview.size} bytes, {preview.lines} lines)" in outcome.content
 
 
+def test_a_preview_over_a_file_too_large_to_read_gives_the_reason_without_the_advice(tmp_repo):
+    big = tmp_repo / "big.txt"
+    big.write_bytes(b"x" * 1_000_001)
+    preview = preview_write(str(big), "big.txt", {"path": "big.txt", "content": "small\n"})
+    assert preview.kind == "overwrite"
+    assert preview.why == f"{big} is 1000001 bytes, over the 1000000-byte read limit"
+
+
 def test_a_preview_over_a_fifo_says_why_it_cannot_be_compared_and_does_not_wait(tmp_repo):
     fifo = make_fifo(tmp_repo / "pipe.fifo")
     preview = call_without_blocking(

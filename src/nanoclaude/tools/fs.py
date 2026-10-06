@@ -37,7 +37,17 @@ class FileSystemError(OSError):
 
 
 class FileTooLargeError(FileSystemError):
-    pass
+    """A file over ``MAX_READ_BYTES``.
+
+    ``reason`` says so, to anybody. The message goes on to say what the model can do about
+    it, which is not for a person deciding about a write.
+    """
+
+    def __init__(self, path: str, size: int) -> None:
+        self.reason = f"{path} is {size} bytes, over the {MAX_READ_BYTES}-byte read limit"
+        super().__init__(
+            f"{self.reason}. Use Grep to search it, or Bash to slice out the part you need."
+        )
 
 
 class BinaryFileError(FileSystemError):
@@ -89,10 +99,7 @@ def read_text(path: str) -> FileSnapshot:
     target = Path(path)
     size = _size_of_what_can_be_read(path)
     if size > MAX_READ_BYTES:
-        raise FileTooLargeError(
-            f"{path} is {size} bytes, over the {MAX_READ_BYTES}-byte read limit. "
-            "Use Grep to search it, or Bash to slice out the part you need."
-        )
+        raise FileTooLargeError(path, size)
     data = target.read_bytes()
     if b"\0" in data[:BINARY_SNIFF_BYTES]:
         raise BinaryFileError(f"{path} looks binary (NUL byte near the start)")
