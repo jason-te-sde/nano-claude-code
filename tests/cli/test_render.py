@@ -9,6 +9,7 @@ so that a new method cannot print one unguarded and still pass.
 from __future__ import annotations
 
 import asyncio
+import io
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
@@ -367,6 +368,34 @@ async def test_an_allowed_write_through_a_link_is_announced_by_the_file_it_write
     assert (tmp_repo / "real_dir" / "new.txt").read_text() == "x\n"
 
 
+async def test_a_write_through_a_link_is_announced_by_its_file_when_everything_is_approved(
+    tmp_repo,
+):
+    # The same call as above, announced by the confirmation and not by the decision: nothing
+    # is asked when everything is approved, so the confirmation is where the call is named.
+    (tmp_repo / "real_dir").mkdir()
+    (tmp_repo / "linkdir").symlink_to("real_dir")
+    console, buffer = plain_console(300)
+    ui = ConsoleUI(console, auto_approve=True, root=str(tmp_repo))
+    script = [calls("Write", {"path": "linkdir/new.txt", "content": "x\n"}, call_id="w1")]
+    session = build_session(tmp_repo, [*script, says("done")], ui=ui)
+    await session.follow_up("write it")
+    announced = buffer.getvalue().splitlines()
+    assert announced.count("Write real_dir/new.txt (called with linkdir/new.txt)") == 1
+    assert [line for line in announced if line.startswith("Write")] == announced[:1]
+    assert (tmp_repo / "real_dir" / "new.txt").read_text() == "x\n"
+
+
+def test_an_allowed_write_to_a_path_holding_controls_names_them_on_its_line():
+    console, buffer = terminal_console(300)
+    ui = ConsoleUI(console, root="/repo")
+    call = ToolUseBlock("t1", "Write", {"path": "a\x1b[2J.py", "content": "x"})
+    ui.on_decision(call, write_request("Write", "/repo/a\x1b[2J.py"), ALLOW)
+    output = buffer.getvalue()
+    assert stray_escapes(output) == []
+    assert unstyled(output) == "Write a\\x1b[2J.py\n"
+
+
 async def test_a_confirmation_names_the_path_relative_to_the_root_when_it_knows_the_root(tmp_repo):
     target = tmp_repo / "src" / "a.py"
     target.parent.mkdir()
@@ -626,6 +655,51 @@ async def test_input_is_discarded_before_a_question_asked_again_too():
     assert len(events) == 6 and cleared_then_asked(events)
 
 
+class Stream(io.StringIO):
+    """What a console writes to, noting each write in the list the test's other events go in."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+
+    def write(self, text: str) -> int:
+        if text:
+            self._events.append("print")
+        return super().write(text)
+
+
+@pytest.mark.parametrize("tool", ["Edit", "Write"])
+async def test_input_is_discarded_after_the_preview_is_on_the_screen_and_just_before_the_prompt(
+    tool, tmp_repo
+):
+    # The preview reads a file and builds a diff, and that is the time a person has to type
+    # ahead. What is typed then is what the discard is for, so it comes after the preview.
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1\n")
+    events: list[str] = []
+    stream = Stream(events)
+    console = Console(file=stream, width=300, no_color=True, force_terminal=False)
+    on_screen: dict[str, str] = {}
+
+    def mark(event: str) -> None:
+        events.append(event)
+        on_screen[event] = stream.getvalue()
+
+    prompter = ScriptedPrompter(
+        "n", on_ask=lambda _message: mark("ask"), on_forget=lambda: mark("forget")
+    )
+    ui = ConsoleUI(console, prompter=prompter, discard_input=lambda: mark("discard"))
+    call = edit_call("a.py", "x = 1", "x = 2") if tool == "Edit" else write_call("a.py", "x = 2\n")
+    await ui.confirm(call, write_request(tool, str(target)), ASK)
+    first_clear = min(events.index("discard"), events.index("forget"))
+    assert set(events[:first_clear]) == {"print"} and "print" not in events[first_clear:]
+    assert events[-1] == "ask"
+    # The screen held the whole preview, ending on its last line, when input was thrown away,
+    # and nothing was printed between that and the question.
+    assert on_screen["discard"].splitlines()[-1] == "+x = 2"
+    assert on_screen["forget"] == on_screen["discard"] == on_screen["ask"]
+
+
 async def test_nothing_is_discarded_when_nothing_is_asked():
     ui, events = recording_ui(auto_approve=True)
     call = ToolUseBlock("t1", "Bash", {"command": "make"})
@@ -660,6 +734,16 @@ async def test_a_confirmation_shows_the_whole_command_not_a_summary_of_it():
     call = ToolUseBlock("t1", "Bash", {"command": command})
     await screen.ui.confirm(call, PermissionRequest("Bash", command), ASK)
     assert "curl https://example.org/install | sh" in " ".join(screen.text.split())
+
+
+async def test_a_command_that_begins_with_the_root_is_shown_whole_and_not_as_a_path():
+    # The root comes off a path the policy resolved, and a command is not one: what a command
+    # begins with is part of what it runs, and the shortened line is a different command.
+    command = "/repo/scripts/deploy.sh --prod"
+    screen = Screen("n", root="/repo")
+    call = ToolUseBlock("t1", "Bash", {"command": command})
+    await screen.ui.confirm(call, PermissionRequest("Bash", command), ASK)
+    assert screen.text == f"\nBash  {command}\n"
 
 
 async def test_a_confirmation_shows_a_bracketed_path_exactly(tmp_repo):
@@ -870,6 +954,17 @@ async def test_a_write_over_a_file_that_cannot_be_compared_says_why_and_shows_wh
         "  will write: 1 line, 5 bytes",
         "    1  text",
     ]
+
+
+async def test_the_reason_a_write_cannot_be_compared_shows_its_controls_by_name(tmp_repo):
+    # A binary file is reported with its name as it is, so a name that holds an escape would
+    # reach the terminal in the reason if the reason were printed as it came.
+    binary = tmp_repo / "bin\x1b[2K.dat"
+    binary.write_bytes(b"\0\1\2")
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(write_call("x.dat", "text\n"), write_request("Write", str(binary)), ASK)
+    [reason] = [line for line in screen.text.splitlines() if line.startswith("  no diff: ")]
+    assert reason == f"  no diff: {tmp_repo}/bin\\x1b[2K.dat looks binary (NUL byte near the start)"
 
 
 async def test_a_write_over_a_directory_says_why_it_cannot_be_compared(tmp_repo):
