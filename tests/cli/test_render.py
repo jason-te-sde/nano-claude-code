@@ -12,6 +12,7 @@ import asyncio
 import re
 import unicodedata
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -33,10 +34,16 @@ from nanoclaude.cli.render import (
 )
 from nanoclaude.config.schema import Config, ModelConfig, RolesConfig
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock
-from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
+from nanoclaude.permissions.policy import (
+    Decision,
+    PermissionMode,
+    PermissionRequest,
+    PermissionResult,
+)
 from nanoclaude.providers.base import ModelReply, StopKind, Usage
 from nanoclaude.providers.capabilities import CapabilityCache
 from nanoclaude.providers.pricing import Price, PriceBook
+from nanoclaude.testing.scripted import calls, says
 from nanoclaude.testing.session import build_session
 from nanoclaude.tools.base import ToolOutcome
 from tests.cli.helpers import (
@@ -61,11 +68,17 @@ class Screen:
     """A ConsoleUI on a plain console, with the text it has written so far."""
 
     def __init__(
-        self, *answers: str | BaseException, auto_approve: bool = False, width: int = 100
+        self,
+        *answers: str | BaseException,
+        auto_approve: bool = False,
+        width: int = 100,
+        root: str | None = None,
     ) -> None:
         self.console, self._buffer = plain_console(width)
         self.prompter = ScriptedPrompter(*answers)
-        self.ui = ConsoleUI(self.console, auto_approve=auto_approve, prompter=self.prompter)
+        self.ui = ConsoleUI(
+            self.console, auto_approve=auto_approve, prompter=self.prompter, root=root
+        )
 
     @property
     def text(self) -> str:
@@ -199,6 +212,27 @@ def test_a_diff_is_coloured_by_the_kind_of_each_line():
     assert colour_of["--- a removed line"] == "red" and colour_of["+++ an added line"] == "green"
 
 
+def test_the_mark_for_a_missing_final_newline_is_drawn_dim():
+    diff = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-x\n\\ No newline at end of file\n+y\n"
+    pieces = styled_pieces(render_diff(diff))
+    assert [s.dim for t, s in pieces if t == "\\ No newline at end of file"] == [True]
+
+
+async def test_the_preview_of_a_file_without_a_final_newline_does_not_run_two_lines_together(
+    tmp_repo,
+):
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1")
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(edit_call("a.py", "1", "2"), write_request("Edit", str(target)), ASK)
+    assert screen.text.splitlines()[-4:] == [
+        "-x = 1",
+        "\\ No newline at end of file",
+        "+x = 2",
+        "\\ No newline at end of file",
+    ]
+
+
 async def test_the_preview_sets_a_real_escape_apart_from_the_text_that_spells_one(tmp_repo):
     target = tmp_repo / "a.py"
     target.write_text("x = 1\n")
@@ -257,6 +291,77 @@ def test_a_call_that_is_about_to_be_asked_about_is_not_announced_first():
     call = ToolUseBlock("t1", "Bash", {"command": "make"})
     screen.ui.on_decision(call, PermissionRequest("Bash", "make"), ASK)
     assert screen.text == ""
+
+
+def test_an_allowed_write_is_announced_by_the_path_it_will_write_relative_to_the_root():
+    screen = Screen(root="/repo")
+    call = ToolUseBlock("t1", "Write", {"path": "src/a.py", "content": "x"})
+    screen.ui.on_decision(call, write_request("Write", "/repo/src/a.py"), ALLOW)
+    assert screen.text == "Write src/a.py\n"
+
+
+def test_an_allowed_write_says_what_the_model_called_the_path_when_that_is_not_the_path():
+    screen = Screen(root="/repo")
+    call = ToolUseBlock("t1", "Write", {"path": "link/../src/a.py\r", "content": "x"})
+    screen.ui.on_decision(call, write_request("Write", "/repo/src/a.py"), ALLOW)
+    assert screen.text == "Write src/a.py (called with link/../src/a.py\\r)\n"
+
+
+def test_an_allowed_write_outside_the_root_is_announced_whole():
+    screen = Screen(root="/repo")
+    call = ToolUseBlock("t1", "Write", {"path": "/shared/lib/b.py", "content": "x"})
+    screen.ui.on_decision(call, write_request("Write", "/shared/lib/b.py"), ALLOW)
+    assert screen.text == "Write /shared/lib/b.py\n"
+
+
+def test_a_root_is_not_a_prefix_of_a_sibling_directory():
+    # /repo is not the root of /repo-old/a.py, whatever the strings share.
+    screen = Screen(root="/repo")
+    call = ToolUseBlock("t1", "Write", {"path": "/repo-old/a.py", "content": "x"})
+    screen.ui.on_decision(call, write_request("Write", "/repo-old/a.py"), ALLOW)
+    assert screen.text == "Write /repo-old/a.py\n"
+
+
+def test_without_a_root_an_allowed_write_is_announced_by_its_resolved_path():
+    screen = Screen()
+    call = ToolUseBlock("t1", "Write", {"path": "src/a.py", "content": "x"})
+    screen.ui.on_decision(call, write_request("Write", "/repo/src/a.py"), ALLOW)
+    assert screen.text == "Write /repo/src/a.py (called with src/a.py)\n"
+
+
+def test_an_allowed_read_is_still_announced_by_what_the_model_asked_for():
+    screen = Screen(root="/repo")
+    call = ToolUseBlock("t1", "Read", {"path": "link/a.py"})
+    screen.ui.on_decision(
+        call, PermissionRequest("Read", "/repo/real/a.py", ("/repo/real/a.py",)), ALLOW
+    )
+    assert screen.text == "Read link/a.py\n"
+
+
+async def test_an_allowed_write_through_a_link_is_announced_by_the_file_it_writes(tmp_repo):
+    (tmp_repo / "real_dir").mkdir()
+    (tmp_repo / "linkdir").symlink_to("real_dir")
+    console, buffer = plain_console(300)
+    ui = ConsoleUI(console, root=str(tmp_repo))
+    script = [calls("Write", {"path": "linkdir/new.txt", "content": "x\n"}, call_id="w1")]
+    session = build_session(tmp_repo, [*script, says("done")], ui=ui)
+    session.policy = replace(session.policy, mode=PermissionMode.ACCEPT_EDITS)
+    session.executor.policy = session.policy
+    await session.follow_up("write it")
+    assert "Write real_dir/new.txt (called with linkdir/new.txt)\n" in buffer.getvalue()
+    assert (tmp_repo / "real_dir" / "new.txt").read_text() == "x\n"
+
+
+async def test_a_confirmation_names_the_path_relative_to_the_root_when_it_knows_the_root(tmp_repo):
+    target = tmp_repo / "src" / "a.py"
+    target.parent.mkdir()
+    target.write_text("x = 1\n")
+    screen = Screen("n", width=300, root=str(tmp_repo))
+    await screen.ui.confirm(
+        edit_call("src/a.py", "x = 1", "x = 2"), write_request("Edit", str(target)), ASK
+    )
+    assert screen.text.splitlines()[1] == "Edit  src/a.py"
+    assert "called with" not in screen.text
 
 
 def test_a_failed_call_shows_the_first_line_of_what_went_wrong():
@@ -392,8 +497,21 @@ async def test_nothing_is_asked_when_everything_is_approved():
     call = ToolUseBlock("t1", "Bash", {"command": "make"})
     assert await screen.ui.confirm(call, PermissionRequest("Bash", "make"), ASK) is Approval.ONCE
     assert screen.prompter.asked == []
-    # The call is still announced: nothing else will say what is running.
+    # The confirmation is the one place a call that was asked about is named: on_decision
+    # stays quiet for it, because the question names it. Under auto-approve the question is
+    # not asked, so the confirmation names the call itself, and does not say it twice.
     assert screen.text == "Bash make\n"
+
+
+async def test_a_call_that_is_asked_about_is_announced_once_when_everything_is_approved(tmp_repo):
+    # Through the real executor, which tells the UI of the decision and then asks.
+    console, buffer = plain_console(300)
+    ui = ConsoleUI(console, auto_approve=True, root=str(tmp_repo))
+    script = [calls("Write", {"path": "new.txt", "content": "x\n"}, call_id="w1"), says("done")]
+    session = build_session(tmp_repo, script, ui=ui)
+    await session.follow_up("write it")
+    assert buffer.getvalue().count("Write new.txt") == 1
+    assert (tmp_repo / "new.txt").read_text() == "x\n"
 
 
 async def test_the_question_says_what_always_would_grant():
@@ -449,6 +567,13 @@ async def test_a_path_with_controls_in_it_is_named_on_the_subject_line_of_its_ow
     assert lines[1] == f"Edit  {tmp_repo}/a\\x1b[2K\\r.py"
     assert lines[2] == "  called with a.py"
     assert "no preview" not in screen.text and "-x = 1" in screen.text
+
+
+async def test_a_confirmation_for_a_call_with_no_path_or_command_has_no_called_with_line():
+    screen = Screen("n")
+    call = ToolUseBlock("t1", "Odd", {"flag": True})
+    await screen.ui.confirm(call, PermissionRequest("Odd", "something"), ASK)
+    assert screen.text == "\nOdd  something\n"
 
 
 async def test_the_models_own_spelling_is_shown_by_name_beside_the_path_it_resolved_to(tmp_repo):
@@ -517,6 +642,151 @@ async def test_an_edit_is_previewed_before_the_question_and_nothing_is_written(t
     assert approval is Approval.NO
     assert "-x = 1" in seen["screen"] and "+x = 2" in seen["screen"]
     assert seen["file"] == "x = 1\n"
+
+
+def write_call(path: str, content: str) -> ToolUseBlock:
+    return ToolUseBlock("w1", "Write", {"path": path, "content": content})
+
+
+async def test_a_write_that_creates_a_file_shows_its_first_lines_and_its_size(tmp_repo):
+    target = tmp_repo / "new.py"
+    screen = Screen("n", width=300)
+    call = write_call("new.py", "first\nsecond\nthird\n")
+    await screen.ui.confirm(call, write_request("Write", str(target)), ASK)
+    assert screen.text.splitlines()[3:] == [
+        "  new file: 3 lines, 19 bytes",
+        "    1  first",
+        "    2  second",
+        "    3  third",
+    ]
+    assert not target.exists()
+
+
+async def test_a_long_new_file_is_cut_at_twenty_lines_and_says_how_many_more(tmp_repo):
+    content = "".join(f"line {n}\n" for n in range(1, 26))
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(
+        write_call("new.py", content), write_request("Write", str(tmp_repo / "new.py")), ASK
+    )
+    lines = screen.text.splitlines()[3:]
+    assert lines[0] == "  new file: 25 lines, 191 bytes"
+    assert lines[1] == "    1  line 1" and lines[20] == "   20  line 20"
+    assert lines[21:] == ["  ... 5 more lines (showing the first 20)"]
+
+
+async def test_a_write_that_replaces_a_file_shows_the_diff_before_the_question_and_writes_nothing(
+    tmp_repo,
+):
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1\ny = 2\n")
+    seen: dict[str, str] = {}
+    screen = Screen("n", width=300)
+
+    def at_the_question(_message: str) -> None:
+        seen["screen"] = screen.text
+        seen["file"] = target.read_text()
+
+    screen.prompter.on_ask = at_the_question
+    await screen.ui.confirm(
+        write_call("a.py", "x = 1\ny = 3\n"), write_request("Write", str(target)), ASK
+    )
+    assert seen["screen"].splitlines()[3:] == [
+        "  replaces the file: 2 lines, 12 bytes after the write (+1 -1)",
+        "--- a/a.py",
+        "+++ b/a.py",
+        "@@ -1,2 +1,2 @@",
+        " x = 1",
+        "-y = 2",
+        "+y = 3",
+    ]
+    assert seen["file"] == "x = 1\ny = 2\n"
+
+
+async def test_a_long_diff_is_cut_at_forty_lines_and_says_how_many_more(tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("".join(f"old {n}\n" for n in range(100)))
+    screen = Screen("n", width=300)
+    content = "".join(f"new {n}\n" for n in range(100))
+    await screen.ui.confirm(write_call("a.py", content), write_request("Write", str(target)), ASK)
+    header = screen.text.splitlines()[3]
+    assert header == "  replaces the file: 100 lines, 690 bytes after the write (+100 -100)"
+    shown = screen.text.splitlines()[4:]  # past the blank line, the subject, called-with, header
+    # 2 file header lines, 1 hunk header and 200 changed lines: 40 of the 203 are shown.
+    assert shown[0] == "--- a/a.py" and len(shown) == 41
+    assert shown[40] == "  ... 163 more lines (showing the first 40)"
+
+
+async def test_a_write_that_changes_nothing_says_so(tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1\n")
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(write_call("a.py", "x = 1\n"), write_request("Write", str(target)), ASK)
+    assert screen.text.splitlines()[3:] == [
+        "  the file already holds this content: nothing will change"
+    ]
+
+
+async def test_a_write_over_a_file_that_cannot_be_compared_says_why_and_shows_what_it_writes(
+    tmp_repo,
+):
+    binary = tmp_repo / "blob.bin"
+    binary.write_bytes(b"\0\1\2")
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(
+        write_call("blob.bin", "text\n"), write_request("Write", str(binary)), ASK
+    )
+    lines = screen.text.splitlines()[3:]
+    assert lines == [
+        f"  no diff: {binary} looks binary (NUL byte near the start)",
+        "  will write: 1 line, 5 bytes",
+        "    1  text",
+    ]
+
+
+async def test_a_write_over_a_directory_says_why_it_cannot_be_compared(tmp_repo):
+    folder = tmp_repo / "folder"
+    folder.mkdir()
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(
+        write_call("folder", "text\n"), write_request("Write", str(folder)), ASK
+    )
+    assert screen.text.splitlines()[3].startswith("  no diff: ")
+    assert "Is a directory" in screen.text and "    1  text" in screen.text
+
+
+async def test_what_a_write_would_write_is_shown_with_its_controls_by_name(tmp_repo):
+    screen = Screen("n", width=300)
+    call = write_call("new.py", "a\x1b[2J\u200b\n")
+    await screen.ui.confirm(call, write_request("Write", str(tmp_repo / "new.py")), ASK)
+    assert "    1  a\\x1b[2J\\u200b" in screen.text.splitlines()
+
+
+async def test_a_write_preview_sets_a_real_escape_apart_from_the_text_that_spells_one(tmp_repo):
+    shown = {}
+    for label, content in (("real", "x = '\x1b'\n"), ("spelled", "x = '\\x1b'\n")):
+        console, buffer = terminal_console(300)
+        ui = ConsoleUI(console, prompter=ScriptedPrompter("n"))
+        await ui.confirm(
+            write_call("n.py", content), write_request("Write", str(tmp_repo / "n.py")), ASK
+        )
+        shown[label] = buffer.getvalue()
+    assert "7" in sgr_parameters(shown["real"])
+    assert "7" not in sgr_parameters(shown["spelled"])
+
+
+async def test_a_write_whose_content_cannot_be_written_is_said_not_to_be_previewable(tmp_repo):
+    screen = Screen("n", width=300)
+    call = ToolUseBlock("w1", "Write", {"path": "n.py"})
+    await screen.ui.confirm(call, write_request("Write", str(tmp_repo / "n.py")), ASK)
+    assert "  no preview: content must be a string, got NoneType" in screen.text
+
+
+async def test_a_write_whose_request_names_no_file_is_asked_about_without_a_preview():
+    screen = Screen("y", width=300)
+    approval = await screen.ui.confirm(
+        write_call("n.py", "x"), PermissionRequest("Write", "n.py"), ASK
+    )
+    assert approval is Approval.ONCE and "new file" not in screen.text
 
 
 async def test_an_edit_that_has_been_previewed_is_not_shown_again_when_it_is_applied(tmp_repo):

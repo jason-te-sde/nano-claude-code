@@ -56,7 +56,10 @@ class Harness:
         self.prompter = ScriptedPrompter(*lines)
         self.clock = FakeClock()
         self.session: ScriptedSession = build_session(
-            root, script, ui=ConsoleUI(self.console, prompter=self.prompter), **options
+            root,
+            script,
+            ui=ConsoleUI(self.console, prompter=self.prompter, root=str(root)),
+            **options,
         )
 
     @property
@@ -719,6 +722,31 @@ async def test_an_edit_is_previewed_asked_about_and_applied(tmp_repo):
     assert harness.text.count("-x = 1") == 1  # shown once, at the confirmation, and not again
     assert "Read a.py" in harness.text and "changed it" in harness.text
     assert len(harness.prompter.asked) == 3  # the prompt, the confirmation, the next prompt
+
+
+async def test_a_write_is_previewed_asked_about_and_written(tmp_repo):
+    harness = Harness(
+        tmp_repo,
+        [
+            calls("Write", {"path": "new.txt", "content": "hello\nworld\n"}, call_id="w1"),
+            says("written"),
+        ],
+        "write it",
+        "y",
+        width=300,
+    )
+    await harness.run()
+    assert (tmp_repo / "new.txt").read_text() == "hello\nworld\n"
+    lines = harness.text.splitlines()
+    # The path inside the project is relative to it, and what will be written comes before
+    # the question, which is the third thing the keyboard was asked for.
+    assert "Write  new.txt" in lines
+    assert lines[lines.index("Write  new.txt") + 1 : lines.index("Write  new.txt") + 4] == [
+        "  new file: 2 lines, 12 bytes",
+        "    1  hello",
+        "    2  world",
+    ]
+    assert len(harness.prompter.asked) == 3
 
 
 async def test_a_declined_edit_is_not_applied_and_the_model_is_told(tmp_repo):

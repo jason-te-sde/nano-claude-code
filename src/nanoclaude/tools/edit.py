@@ -99,16 +99,37 @@ def apply_edits(content: str, edits: Sequence[EditSpec]) -> str:
     return result
 
 
+def _lines_with_endings(text: str) -> list[str]:
+    """``text`` as lines that keep their newline; only a newline ends one.
+
+    Not ``str.splitlines``, which also ends a line at a carriage return, a form feed and
+    several characters a text file may hold: those are characters of a line, and cutting
+    there makes a diff that does not match the file.
+    """
+    parts = text.split("\n")
+    last = parts.pop()
+    lines = [f"{part}\n" for part in parts]
+    return [*lines, last] if last else lines
+
+
 def unified_diff(before: str, after: str, path: str) -> str:
-    return "".join(
-        difflib.unified_diff(
-            before.splitlines(keepends=True),
-            after.splitlines(keepends=True),
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-            n=3,
-        )
-    )
+    """The unified diff from ``before`` to ``after``, as git writes it.
+
+    A last line that has no newline is followed by ``\\ No newline at end of file``.
+    difflib leaves such a line as it is, so the removed line and the added line after it
+    ran together as ``-x = 1+x = 2``, and adding or removing the final newline showed as no
+    change at all.
+    """
+    diff: list[str] = []
+    for line in difflib.unified_diff(
+        _lines_with_endings(before),
+        _lines_with_endings(after),
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        n=3,
+    ):
+        diff.append(line if line.endswith("\n") else f"{line}\n\\ No newline at end of file\n")
+    return "".join(diff)
 
 
 DESCRIPTION = """\

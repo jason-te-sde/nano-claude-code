@@ -3,7 +3,7 @@ from dataclasses import replace as dc_replace
 import pytest
 
 from nanoclaude.tools.base import ToolArgumentError
-from nanoclaude.tools.edit import EditError, EditTool, preview_edit
+from nanoclaude.tools.edit import EditError, EditTool, preview_edit, unified_diff
 from nanoclaude.tools.fs import BinaryFileError, stamp_of
 
 
@@ -273,3 +273,54 @@ def test_a_preview_of_a_file_that_cannot_be_read_is_an_os_error(tmp_repo):
     binary.write_bytes(b"\0\1\2")
     with pytest.raises(BinaryFileError):
         preview_edit(str(binary), "blob.bin", edits)
+
+
+# --------------------------------------------------------------------------
+# The diff of a file whose last line has no newline
+# --------------------------------------------------------------------------
+
+
+def test_a_last_line_without_a_newline_is_marked_and_not_run_into_the_next_line():
+    # difflib leaves the line as it is, so "-x = 1" and "+x = 2" came out as one line:
+    # "-x = 1+x = 2", which a person reads as one removed line.
+    assert unified_diff("x = 1", "x = 2", "a.py") == (
+        "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n"
+        "-x = 1\n\\ No newline at end of file\n"
+        "+x = 2\n\\ No newline at end of file\n"
+    )
+
+
+def test_adding_a_final_newline_is_a_change_the_diff_shows():
+    assert unified_diff("a\nb", "a\nb\n", "f") == (
+        "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n\\ No newline at end of file\n+b\n"
+    )
+
+
+def test_removing_a_final_newline_is_a_change_the_diff_shows():
+    assert unified_diff("a\nb\n", "a\nb", "f") == (
+        "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n a\n-b\n+b\n\\ No newline at end of file\n"
+    )
+
+
+def test_only_a_newline_ends_a_line_in_a_diff():
+    # A lone carriage return or a form feed is a character in a line, not the end of one.
+    diff = unified_diff("a\rb\n\x0c\n", "a\rc\n\x0c\n", "f")
+    assert diff == "--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n-a\rb\n+a\rc\n \x0c\n"
+
+
+def test_an_empty_file_has_no_lines_to_diff():
+    assert unified_diff("", "", "f") == ""
+    assert unified_diff("", "new\n", "f") == "--- a/f\n+++ b/f\n@@ -0,0 +1 @@\n+new\n"
+
+
+async def test_the_diff_an_edit_reports_marks_a_last_line_without_a_newline(ctx, tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1")
+    outcome = await EditTool().run(
+        having_read(ctx, target),
+        "t1",
+        {"path": "a.py", "edits": [{"old_string": "1", "new_string": "2"}]},
+    )
+    assert (
+        not outcome.is_error and "-x = 1\n\\ No newline at end of file\n+x = 2\n" in outcome.content
+    )

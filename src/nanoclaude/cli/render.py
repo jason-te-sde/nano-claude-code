@@ -31,8 +31,10 @@ its own, so ``NO_COLOR`` and a console that is not a terminal both give plain te
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import unicodedata
+from pathlib import PurePosixPath
 
 from rich.console import Console, RenderableType
 from rich.markdown import Markdown
@@ -50,8 +52,15 @@ from nanoclaude.providers.base import ModelReply
 from nanoclaude.providers.pricing import PriceBook
 from nanoclaude.tools.base import ToolArgumentError, ToolOutcome, sanitize
 from nanoclaude.tools.edit import EditError, preview_edit
+from nanoclaude.tools.write import preview_write
 
 MAX_SUMMARY_CHARS = 100
+
+#: How much of what a Write would write a confirmation shows: the first lines of a file it
+#: creates, and the first lines of the diff when it replaces one. The rest is counted, not
+#: left out without a word.
+WRITE_PREVIEW_NEW_LINES = 20
+WRITE_PREVIEW_DIFF_LINES = 40
 
 #: The width of the bar ``/status`` draws for how much of the context window is in use.
 BAR_WIDTH = 20
@@ -217,6 +226,26 @@ def _call_line(call: ToolUseBlock) -> Text:
     return Text.assemble(*parts)
 
 
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
+
+
+def _inside(root: str, path: str) -> str | None:
+    """``path`` relative to ``root``, or None when it is not inside it."""
+    try:
+        return str(PurePosixPath(path).relative_to(root))
+    except ValueError:
+        return None
+
+
+def _lines_of(content: str) -> list[str]:
+    """``content`` as its lines: a final newline ends the last line and does not start another."""
+    lines = content.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    return lines
+
+
 def _refusal_line(result: PermissionResult) -> Text:
     """Spec 17.9's form, built from the decision: ``refused (<rule>): <reason>``.
 
@@ -234,9 +263,14 @@ class ConsoleUI:
         *,
         auto_approve: bool = False,
         prompter: Prompter | None = None,
+        root: str | None = None,
     ) -> None:
         self._console = console
         self._auto = auto_approve
+        # The project, so that a path inside it can be shown relative to it: "src/a.py" is
+        # shorter than the resolved path and says the same. Resolved, like the paths of a
+        # request are. Without it a path is shown whole.
+        self._root = os.path.realpath(root) if root else None
         # Built when the first question is asked: a UI that is never asked anything has
         # no reason to take hold of the terminal.
         self._prompter = prompter
@@ -247,19 +281,27 @@ class ConsoleUI:
         self, call: ToolUseBlock, request: PermissionRequest, _result: PermissionResult
     ) -> Approval:
         if self._auto:
-            self._console.print(_call_line(call))
+            # The question is not asked, so the confirmation names the call: on_decision
+            # stays quiet for a call that is asked about, and it would be named twice.
+            self._console.print(self._announcement(call, request))
             return Approval.ONCE
         self._console.print()
         self._console.print(
-            Text.assemble((visible(call.name), "bold yellow"), "  ", visible_text(request.subject))
+            Text.assemble(
+                (visible(call.name), "bold yellow"),
+                "  ",
+                visible_text(self._subject_shown(request)),
+            )
         )
-        called_with = _primary_argument(call)
-        if called_with is not None and visible(called_with) != visible(request.subject):
+        called_with = self._spelling_beside(call, request)
+        if called_with is not None:
             # The policy judged the resolved path, and that is what is shown above. What
             # the model wrote may differ from it, and a person is owed both.
             self._console.print(Text.assemble(("  called with ", "dim"), visible_text(called_with)))
         if call.name == "Edit":
-            await self._preview(call, request)
+            await self._preview_edit(call, request)
+        elif call.name == "Write":
+            await self._preview_write(call, request)
         question = (
             f"  allow? [y]es / [n]o / [a]lways (every {visible(call.name)} call this session) "
         )
@@ -288,7 +330,103 @@ class ConsoleUI:
             self._prompter = new_prompter()
         return self._prompter
 
-    async def _preview(self, call: ToolUseBlock, request: PermissionRequest) -> None:
+    def _subject_shown(self, request: PermissionRequest) -> str:
+        """What the request is about, as it is shown: a resolved path inside the root is
+        shown relative to it, anything else, a command or a path outside it, as it is."""
+        subject = request.subject
+        if self._root is not None and subject in request.resolved_paths:
+            relative = _inside(self._root, subject)
+            if relative is not None:
+                return relative
+        return subject
+
+    def _spelling_beside(self, call: ToolUseBlock, request: PermissionRequest) -> str | None:
+        """What the model called the subject, when that is not what is shown for it."""
+        called_with = _primary_argument(call)
+        if called_with is None:
+            return None
+        shown = (visible(self._subject_shown(request)), visible(request.subject))
+        return None if visible(called_with) in shown else called_with
+
+    def _announcement(self, call: ToolUseBlock, request: PermissionRequest) -> Text:
+        """A call as one collapsed line: its name, and what it is about.
+
+        For a write that is the path the policy judged and the tool will write, with what
+        the model called it beside it when that differs: the model's own spelling can name
+        a link, or a path with ``..`` in it, for a file somewhere else. Anything else is
+        named by its most informative argument.
+        """
+        if not (request.is_write and request.subject in request.resolved_paths):
+            return _call_line(call)
+        parts: list[str | tuple[str, str] | Text] = [
+            (visible(call.name), "dim"),
+            " ",
+            visible_text(self._subject_shown(request)),
+        ]
+        called_with = self._spelling_beside(call, request)
+        if called_with is not None:
+            parts.extend([(" (called with ", "dim"), visible_text(called_with), (")", "dim")])
+        return Text.assemble(*parts)
+
+    async def _preview_write(self, call: ToolUseBlock, request: PermissionRequest) -> None:
+        """Show what a Write would write, before anything is written.
+
+        The diff, when it replaces a file it can compare with. The first lines, when it
+        creates one, or replaces one that cannot be compared (and why not). How much more
+        there is is said, so that nobody approves what they have not been told is there.
+        """
+        if not request.resolved_paths:
+            return
+        path = request.resolved_paths[0]
+        label = _primary_argument(call) or path
+        try:
+            preview = await asyncio.to_thread(preview_write, path, label, call.arguments)
+        except (ToolArgumentError, OSError) as exc:
+            self._console.print(Text.assemble(("  no preview: ", "dim"), visible_text(str(exc))))
+            return
+        totals = f"{_plural(preview.lines, 'line')}, {_plural(preview.size, 'byte')}"
+        if preview.kind == "unchanged":
+            self._console.print(
+                plain("  the file already holds this content: nothing will change", "dim")
+            )
+        elif preview.kind == "replace":
+            diff = _lines_of(preview.diff)
+            # What the cut below leaves out is counted by its size too: a rewrite shows its
+            # removed lines first, and the person should know how many are added.
+            hunks = diff[2:]  # past the two file header lines
+            added = sum(line.startswith("+") for line in hunks)
+            removed = sum(line.startswith("-") for line in hunks)
+            self._console.print(
+                plain(f"  replaces the file: {totals} after the write (+{added} -{removed})", "dim")
+            )
+            self._console.print(render_diff("\n".join(diff[:WRITE_PREVIEW_DIFF_LINES])))
+            self._say_how_many_more(len(diff) - WRITE_PREVIEW_DIFF_LINES, WRITE_PREVIEW_DIFF_LINES)
+        else:
+            if preview.kind == "create":
+                self._console.print(plain(f"  new file: {totals}", "dim"))
+            else:
+                self._console.print(
+                    Text.assemble(("  no diff: ", "dim"), visible_text(preview.why))
+                )
+                self._console.print(plain(f"  will write: {totals}", "dim"))
+            lines = _lines_of(preview.content)
+            for number, line in enumerate(lines[:WRITE_PREVIEW_NEW_LINES], start=1):
+                # The file's own text: shown by name where it holds a control, with its tabs
+                # as they are.
+                self._console.print(
+                    Text.assemble(
+                        (f"  {number:>3}  ", "dim"), visible_text(line, keep_newlines=True)
+                    )
+                )
+            self._say_how_many_more(len(lines) - WRITE_PREVIEW_NEW_LINES, WRITE_PREVIEW_NEW_LINES)
+
+    def _say_how_many_more(self, more: int, shown: int) -> None:
+        if more > 0:
+            self._console.print(
+                plain(f"  ... {_plural(more, 'more line')} (showing the first {shown})", "dim")
+            )
+
+    async def _preview_edit(self, call: ToolUseBlock, request: PermissionRequest) -> None:
         """Show what an Edit would change, before anything is written."""
         if not request.resolved_paths:
             return
@@ -310,14 +448,14 @@ class ConsoleUI:
                 self._console.print(render_markdown(block.text.strip()))
 
     def on_decision(
-        self, call: ToolUseBlock, _request: PermissionRequest, result: PermissionResult
+        self, call: ToolUseBlock, request: PermissionRequest, result: PermissionResult
     ) -> None:
         if result.decision is Decision.DENY:
             # A refused call never reaches on_outcome, so this line is everything the
             # person learns about it.
             self._console.print(_refusal_line(result))
-        elif result.decision is Decision.ALLOW or self._auto:
-            self._console.print(_call_line(call))
+        elif result.decision is Decision.ALLOW:
+            self._console.print(self._announcement(call, request))
         # A call that is to be asked about is announced by the confirmation, in full.
 
     def on_outcome(self, call: ToolUseBlock, outcome: ToolOutcome) -> None:
