@@ -7,7 +7,11 @@ so the keys, the completions and the history are the ones a terminal would deliv
 from __future__ import annotations
 
 import asyncio
+import os
+import pty
+import select
 import signal
+import sys
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -24,6 +28,7 @@ from nanoclaude.cli.prompt import (
     CommandCompleter,
     MentionCompleter,
     build_prompt_session,
+    discard_pending_input,
     new_prompter,
     wants_vi_mode,
 )
@@ -278,3 +283,73 @@ async def test_tab_at_the_prompt_takes_the_first_offer(keyboard, project, typing
     await until(lambda: session.default_buffer.text == completed, f"{typing!r} to complete")
     keyboard.send_text("\r")
     assert await prompt == completed
+
+
+# --------------------------------------------------------------------------
+# Discarding what was typed before a question
+# --------------------------------------------------------------------------
+
+
+def readable(fd: int) -> bool:
+    return bool(select.select([fd], [], [], 0)[0])
+
+
+def test_what_was_typed_and_not_yet_read_on_a_terminal_is_thrown_away():
+    master, slave = pty.openpty()
+    stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
+    try:
+        os.write(master, b"y\n")  # typed while nobody was reading
+        assert readable(slave)
+        discard_pending_input(stream)
+        assert not readable(slave)
+        os.write(master, b"n\n")  # and what is typed afterwards is still read
+        assert readable(slave)
+    finally:
+        stream.close()
+        os.close(master)
+        os.close(slave)
+
+
+def test_where_there_is_no_termios_nothing_is_discarded_and_nothing_fails(monkeypatch):
+    # Not every platform has it, and a question is still asked there.
+    monkeypatch.setitem(sys.modules, "termios", None)
+    master, slave = pty.openpty()
+    stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
+    try:
+        os.write(master, b"y\n")
+        discard_pending_input(stream)
+        assert readable(slave)
+    finally:
+        stream.close()
+        os.close(master)
+        os.close(slave)
+
+
+def test_what_is_waiting_on_something_that_is_not_a_terminal_is_left_alone():
+    read_end, write_end = os.pipe()
+    stream = os.fdopen(read_end, "rb", buffering=0, closefd=False)
+    try:
+        os.write(write_end, b"data\n")
+        discard_pending_input(stream)
+        assert readable(read_end)
+    finally:
+        stream.close()
+        os.close(read_end)
+        os.close(write_end)
+
+
+class TerminalThatCannotBeFlushed:
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        raise OSError("not a real descriptor")
+
+
+def test_a_terminal_that_cannot_be_flushed_is_not_an_error():
+    discard_pending_input(TerminalThatCannotBeFlushed())
+
+
+def test_there_is_nothing_to_discard_without_a_standard_input(monkeypatch):
+    monkeypatch.setattr("sys.stdin", None)
+    discard_pending_input()

@@ -526,6 +526,48 @@ async def test_a_call_that_is_asked_about_is_announced_once_when_everything_is_a
     assert (tmp_repo / "new.txt").read_text() == "x\n"
 
 
+async def test_what_was_typed_before_a_question_is_discarded_before_it_is_asked():
+    # A person who types "y" and Enter while the model is still thinking has not answered a
+    # question nobody had asked yet. It would otherwise be read as the answer, and approve a
+    # write they never saw.
+    events: list[str] = []
+    console, _ = plain_console()
+    prompter = ScriptedPrompter("n", on_ask=lambda _message: events.append("ask"))
+    ui = ConsoleUI(console, prompter=prompter, discard_input=lambda: events.append("discard"))
+    call = ToolUseBlock("t1", "Bash", {"command": "make"})
+    await ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
+    assert events == ["discard", "ask"]
+
+
+async def test_input_is_discarded_before_a_question_asked_again_too():
+    events: list[str] = []
+    console, _ = plain_console()
+    prompter = ScriptedPrompter("maybe", "y", on_ask=lambda _message: events.append("ask"))
+    ui = ConsoleUI(console, prompter=prompter, discard_input=lambda: events.append("discard"))
+    call = ToolUseBlock("t1", "Bash", {"command": "make"})
+    await ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
+    assert events == ["discard", "ask", "discard", "ask"]
+
+
+async def test_nothing_is_discarded_when_nothing_is_asked():
+    events: list[str] = []
+    console, _ = plain_console()
+    ui = ConsoleUI(console, auto_approve=True, discard_input=lambda: events.append("discard"))
+    call = ToolUseBlock("t1", "Bash", {"command": "make"})
+    await ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
+    assert events == []
+
+
+async def test_a_confirmation_discards_pending_input_unless_told_otherwise(monkeypatch):
+    discarded: list[int] = []
+    monkeypatch.setattr(render, "discard_pending_input", lambda: discarded.append(1))
+    console, _ = plain_console()
+    ui = ConsoleUI(console, prompter=ScriptedPrompter("n"))
+    call = ToolUseBlock("t1", "Bash", {"command": "make"})
+    await ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
+    assert discarded == [1]
+
+
 async def test_the_question_says_what_always_would_grant():
     screen = Screen("n")
     call = ToolUseBlock("t1", "Edit", {"path": "a.py"})

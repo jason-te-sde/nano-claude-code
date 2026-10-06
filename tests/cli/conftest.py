@@ -12,3 +12,14 @@ def _no_git(monkeypatch: pytest.MonkeyPatch) -> None:
     system prompt from machine to machine. assemble() has its own tests.
     """
     monkeypatch.setattr("nanoclaude.context.assemble.git_state", lambda _root: "")
+
+
+@pytest.fixture(autouse=True)
+def _leave_the_real_terminal_input_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A confirmation discards what was typed before it, and the default does that to stdin.
+
+    Under ``pytest -s`` stdin is the terminal the person is typing into, and a test run
+    must not eat their keystrokes. The tests of the function itself call it directly, on a
+    terminal of their own.
+    """
+    monkeypatch.setattr("nanoclaude.cli.render.discard_pending_input", lambda: None)

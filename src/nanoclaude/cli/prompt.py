@@ -20,6 +20,7 @@ is. What this module adds is what spec 8 asks for on top:
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Protocol
@@ -77,6 +78,36 @@ def new_prompter(*, input: Input | None = None, output: Output | None = None) ->
     ``input`` and ``output`` are the terminal's unless given: a test hands it a pipe.
     """
     return _Question(PromptSession[str](input=input, output=output))
+
+
+class _Descriptor(Protocol):
+    """What ``discard_pending_input`` asks of a stream: whether it is a terminal, and where."""
+
+    def isatty(self) -> bool: ...
+
+    def fileno(self) -> int: ...
+
+
+def discard_pending_input(stream: _Descriptor | None = None) -> None:
+    """Throw away what was typed on the terminal and has not been read.
+
+    Called before a question is asked in the middle of a turn. A person who types ``y`` and
+    Enter while the model is still thinking has not answered a question nobody had asked,
+    and the prompt would read it as the answer to the one that comes: a write approved
+    without being seen. Only a terminal has anything to discard, so on anything else, a
+    pipe, a file, no standard input at all, this does nothing. ``stream`` is standard input
+    unless given.
+    """
+    try:
+        import termios  # not on every platform: only where there is a terminal to flush
+    except ImportError:
+        return
+    stream = sys.stdin if stream is None else stream
+    try:
+        if stream.isatty():
+            termios.tcflush(stream.fileno(), termios.TCIFLUSH)
+    except (AttributeError, OSError, ValueError, termios.error):
+        return
 
 
 def wants_vi_mode(environ: Mapping[str, str]) -> bool:

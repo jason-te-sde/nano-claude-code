@@ -34,6 +34,7 @@ import asyncio
 import os
 import re
 import unicodedata
+from collections.abc import Callable
 from pathlib import PurePosixPath
 
 from rich.console import Console, RenderableType
@@ -44,7 +45,7 @@ from rich.text import Text
 from nanoclaude.agent.router import Router
 from nanoclaude.agent.session import Session
 from nanoclaude.agent.ui import Approval
-from nanoclaude.cli.prompt import Prompter, new_prompter
+from nanoclaude.cli.prompt import Prompter, discard_pending_input, new_prompter
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
@@ -264,6 +265,7 @@ class ConsoleUI:
         auto_approve: bool = False,
         prompter: Prompter | None = None,
         root: str | None = None,
+        discard_input: Callable[[], None] | None = None,
     ) -> None:
         self._console = console
         self._auto = auto_approve
@@ -271,6 +273,8 @@ class ConsoleUI:
         # shorter than the resolved path and says the same. Resolved, like the paths of a
         # request are. Without it a path is shown whole.
         self._root = os.path.realpath(root) if root else None
+        # What clears the terminal's unread input before a question is asked.
+        self._discard_input = discard_input if discard_input is not None else discard_pending_input
         # Built when the first question is asked: a UI that is never asked anything has
         # no reason to take hold of the terminal.
         self._prompter = prompter
@@ -306,6 +310,8 @@ class ConsoleUI:
             f"  allow? [y]es / [n]o / [a]lways (every {visible(call.name)} call this session) "
         )
         while True:
+            # Whatever was typed before now was not typed for this question.
+            self._discard_input()
             try:
                 answer = await self._prompt().prompt_async(question)
             except EOFError:
