@@ -25,6 +25,7 @@ from nanoclaude.cli.render import (
     cost_panel,
     render_diff,
     render_markdown,
+    show_error,
     status_panel,
     summarise_call,
     visible,
@@ -257,10 +258,30 @@ def test_a_reply_that_says_nothing_prints_nothing():
     assert screen.text == ""
 
 
+def test_a_long_retry_reason_is_cut_at_eighty_characters():
+    screen = Screen(width=300)
+    screen.ui.on_retry(1, 2.0, "x" * 200)
+    assert screen.text == "provider busy, retry 1 in 2.0s " + "x" * 80 + "\n"
+
+
+def test_the_retry_reason_is_cleaned_before_it_is_cut_and_not_after():
+    # Cut first and the escape sequence would use up part of the eighty.
+    screen = Screen(width=300)
+    screen.ui.on_retry(1, 2.0, "\x1b[2J" + "y" * 100)
+    assert screen.text == "provider busy, retry 1 in 2.0s " + "y" * 80 + "\n"
+
+
 def test_a_retry_says_how_long_it_will_wait_and_why():
     screen = Screen()
     screen.ui.on_retry(2, 1.5, "overloaded_error")
     assert screen.text == "provider busy, retry 2 in 1.5s overloaded_error\n"
+
+
+def test_an_error_line_carries_the_prefix_once_whether_or_not_it_was_given(tmp_path):
+    console, buffer = plain_console()
+    show_error(console, "no such model \u2014 choose another")
+    show_error(console, "error: no such model \u2014 choose another")
+    assert buffer.getvalue() == "error: no such model \u2014 choose another\n" * 2
 
 
 # --------------------------------------------------------------------------
@@ -557,7 +578,23 @@ async def test_a_tool_output_holding_a_closing_tag_prints_without_raising():
 def test_the_check_for_stray_escapes_sees_one_and_ignores_styling():
     assert stray_escapes("plain \x1b[1;31mred\x1b[0m") == []
     assert stray_escapes("a \x1b[2J b") == ["\x1b[2J b"]
-    assert stray_escapes("a \x1b]0;T\x07") == ["\x1b]0;T\x07"]
+    # An OSC sequence is its escape and its terminator, both of which a terminal acts on.
+    assert stray_escapes("a \x1b]0;T\x07") == ["\x1b]0;T\x07", "\x07"]
+
+
+@pytest.mark.parametrize(
+    "control",
+    ["\x9b", "\x9d", "\x90", "\x85", "\x9f", "\x7f", "\x07", "\x08", "\x00", "\r", "\x0b"],
+    ids=lambda c: f"U+{ord(c):04X}",
+)
+def test_the_check_for_stray_escapes_flags_every_control_a_terminal_acts_on(control):
+    # C1 is the 8-bit form of the escape sequences: U+009B is a CSI, U+009D an OSC. A check
+    # that looks for ESC alone passes output that clears the screen with one character.
+    assert stray_escapes(f"a{control}b") == [f"{control}b"]
+
+
+def test_the_check_for_stray_escapes_leaves_text_alone():
+    assert stray_escapes("a\tb\nc \N{NO-BREAK SPACE} caf\N{LATIN SMALL LETTER E WITH ACUTE}") == []
 
 
 @pytest.mark.parametrize("hook", HOOKS, ids=HOOK_IDS)

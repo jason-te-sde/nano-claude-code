@@ -40,7 +40,7 @@ from nanoclaude.agent.loop import Done, LoopError, StopReason
 from nanoclaude.agent.session import Session
 from nanoclaude.cli.commands import COMMANDS, dispatch
 from nanoclaude.cli.prompt import Prompter, build_prompt_session, wants_vi_mode
-from nanoclaude.cli.render import plain, show_error, show_notice
+from nanoclaude.cli.render import ERROR_PREFIX, plain, show_error, show_notice
 from nanoclaude.conversation.budget import ContextTooSmallError
 from nanoclaude.conversation.transcript import TranscriptError
 from nanoclaude.providers.base import ModelError
@@ -69,12 +69,17 @@ def parse_command(text: str) -> tuple[str, list[str]] | None:
 
 
 def error_message(exc: Exception) -> str:
-    """What a person is told when a command or a turn failed, in the form of spec 17.9.
+    """The line a person is shown when a command or a turn failed, in the form of spec 17.9.
 
-    ``<what happened> — <what to do>``, to follow ``error: ``. A message that already says
-    what to do (the provider and session errors are written that way) is left as it is;
-    the others get the step that fits what failed.
+    ``error: <what happened> — <what to do>``, whatever failed, including what nobody has
+    seen before. A message that already says what to do (the provider and session errors
+    are written that way) is left as it is; the others get the step that fits what failed.
     """
+    return f"{ERROR_PREFIX}{_what_to_say(exc)}"
+
+
+def _what_to_say(exc: Exception) -> str:
+    """``<what happened> — <what to do>`` for ``exc``, without the prefix."""
     detail = str(exc).strip().rstrip(".")
     if " — " in detail:
         return detail

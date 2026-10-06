@@ -37,10 +37,12 @@ def capture(renderable: RenderableType, width: int = 100) -> str:
     return buffer.getvalue()
 
 
-#: Every escape that does not begin a styling (SGR) sequence. A terminal acts on all of
-#: them: a clear, a title change, a cursor move. The styling Rich adds is the only
-#: escape output that should ever contain.
-_STRAY_ESCAPE = re.compile(r"\x1b(?!\[[0-9;]*m)")
+#: Every control a terminal acts on, other than styling: an escape that does not begin a
+#: styling (SGR) sequence, and every other C0 control except tab and newline, DEL, and the
+#: C1 controls (U+0080 to U+009F), which are the 8-bit forms of the escape sequences:
+#: U+009B is a CSI and U+009D an OSC, and either of them clears the screen on its own.
+#: The styling Rich adds, and line breaks, are all that output should ever contain.
+_STRAY_ESCAPE = re.compile(r"\x1b(?!\[[0-9;]*m)|[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f-\x9f]")
 
 #: The colour parameters of every styling sequence in a piece of output.
 _SGR = re.compile(r"\x1b\[([0-9;]*)m")
@@ -48,7 +50,7 @@ _COLOUR_PARAMETER = re.compile(r"3[0-7]|4[0-7]|9[0-7]|10[0-7]|38|48")
 
 
 def stray_escapes(output: str) -> list[str]:
-    """The escape sequences in ``output`` that are not styling, each with what follows it."""
+    """The controls in ``output`` that are not styling, each with what follows it."""
     return [output[m.start() : m.start() + 12] for m in _STRAY_ESCAPE.finditer(output)]
 
 

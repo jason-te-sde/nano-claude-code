@@ -346,50 +346,86 @@ async def test_a_command_that_fails_is_reported_and_the_next_prompt_is_answered(
     [
         (
             ModelError("overloaded"),
-            "overloaded — try again, or switch models with /model",
+            "error: overloaded — try again, or switch models with /model",
         ),
         (
             ModelError("rejected your credentials (HTTP 401): bad key — check the key"),
-            "rejected your credentials (HTTP 401): bad key — check the key",
+            "error: rejected your credentials (HTTP 401): bad key — check the key",
         ),
         (
             ContextTooSmallError("the prompt alone needs 9000 tokens. Use a larger window."),
             (
-                "the prompt alone needs 9000 tokens. Use a larger window"
+                "error: the prompt alone needs 9000 tokens. Use a larger window"
                 " — /model switches to a model with a larger window"
             ),
         ),
         (
             LoopError("model returned an empty reply"),
             (
-                "the conversation is in an unexpected state (model returned an empty reply)"
+                "error: the conversation is in an unexpected state (model returned an empty reply)"
                 " — /clear starts it over"
             ),
         ),
         (
             TranscriptError("message 3 has no blocks"),
             (
-                "the conversation is in an unexpected state (message 3 has no blocks)"
+                "error: the conversation is in an unexpected state (message 3 has no blocks)"
                 " — /clear starts it over"
             ),
         ),
         (
             sqlite3.OperationalError("database is locked"),
             (
-                "the session store failed (database is locked) — check that the disk has room "
-                "and the database file is writable, then try again"
+                "error: the session store failed (database is locked) "
+                "— check that the disk has room and the database file is writable, then try again"
             ),
         ),
         (
             RuntimeError("boom"),
-            "RuntimeError: boom — this is a bug; /clear starts the conversation over",
+            "error: RuntimeError: boom — this is a bug; /clear starts the conversation over",
         ),
-        (RuntimeError(""), "RuntimeError — this is a bug; /clear starts the conversation over"),
-        (ModelError(""), "ModelError — try again, or switch models with /model"),
+        (
+            RuntimeError(""),
+            "error: RuntimeError — this is a bug; /clear starts the conversation over",
+        ),
+        (ModelError(""), "error: ModelError — try again, or switch models with /model"),
     ],
 )
 def test_a_failure_is_described_in_the_form_the_spec_gives_for_a_person(failure, line):
     assert error_message(failure) == line
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        KeyError("missing"),
+        OSError(28, "No space left on device"),
+        UnicodeEncodeError("utf-8", "\ud800", 0, 1, "surrogates not allowed"),
+        TimeoutError(),
+        ValueError(""),
+        AttributeError("'NoneType' object has no attribute 'x'"),
+        *FAILURES,
+    ],
+    ids=lambda e: f"{type(e).__name__}-{str(e)[:12]}",
+)
+def test_every_failure_is_reported_as_one_error_line_that_says_what_to_do(failure):
+    # Spec 17.9: "error: <what happened> \u2014 <what to do>", whatever failed, including
+    # what nobody has seen before.
+    line = error_message(failure)
+    assert line.startswith("error: ") and " \u2014 " in line and "\n" not in line
+    assert line.count("error: ") == 1
+
+
+async def test_a_reported_failure_carries_the_error_prefix_exactly_once(tmp_repo, monkeypatch):
+    harness = Harness(tmp_repo, [], "hello", width=300)
+
+    async def boom(prompt: str) -> Done:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(harness.session, "follow_up", boom)
+    await harness.run()
+    assert "error: RuntimeError: boom \u2014 this is a bug" in harness.text
+    assert "error: error:" not in harness.text
 
 
 async def test_what_a_failure_quotes_is_data_and_cannot_act_on_the_terminal(tmp_repo, monkeypatch):

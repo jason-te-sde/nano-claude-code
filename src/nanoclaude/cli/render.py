@@ -118,12 +118,19 @@ def show_notice(console: Console, message: str) -> None:
     console.print(plain(message, "dim"))
 
 
+#: What every error line for a person begins with (spec 17.9).
+ERROR_PREFIX = "error: "
+
+
 def show_error(console: Console, message: str) -> None:
     """``error: <what happened> — <what to do>``: spec 17.9's form for a person.
 
-    ``message`` is what follows ``error: ``, and is data: never read as markup.
+    ``message`` is what follows the prefix, or the whole line: either way the prefix is on
+    the line exactly once, so no caller can print an error line without it. ``message`` is
+    data: never read as markup.
     """
-    console.print(Text.assemble(("error: ", "red"), sanitize(message)))
+    body = message.removeprefix(ERROR_PREFIX)
+    console.print(Text.assemble((ERROR_PREFIX, "red"), sanitize(body)))
 
 
 def _shorten(text: str) -> str:
