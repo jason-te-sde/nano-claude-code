@@ -64,6 +64,7 @@ from tests.cli.helpers import (
     unstyled,
     write_request,
 )
+from tests.fifo import call_without_blocking, make_fifo
 
 ALLOW = PermissionResult(Decision.ALLOW, "rule.allow", "allowed")
 
@@ -976,6 +977,18 @@ async def test_a_write_over_a_directory_says_why_it_cannot_be_compared(tmp_repo)
     )
     assert screen.text.splitlines()[3].startswith("  no diff: ")
     assert "Is a directory" in screen.text and "    1  text" in screen.text
+
+
+@pytest.mark.parametrize("tool", ["Edit", "Write"])
+def test_a_confirmation_for_a_fifo_says_it_cannot_be_previewed_and_does_not_wait(tool, tmp_repo):
+    # The preview opens the file to read it, and a FIFO is not read until somebody writes to
+    # it: the confirmation would print its header and then stand there, with no question.
+    fifo = make_fifo(tmp_repo / "pipe.fifo")
+    screen = Screen("n", width=300)
+    call = write_call("pipe.fifo", "x\n") if tool == "Write" else edit_call("pipe.fifo", "a", "b")
+    asked = screen.ui.confirm(call, write_request(tool, str(fifo)), ASK)
+    assert call_without_blocking(fifo, asyncio.run, asked) is Approval.NO
+    assert f"{fifo} is not a regular file" in screen.text
 
 
 async def test_what_a_write_would_write_is_shown_with_its_controls_by_name(tmp_repo):

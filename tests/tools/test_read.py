@@ -1,4 +1,7 @@
+import asyncio
+
 from nanoclaude.tools.read import ReadTool
+from tests.fifo import call_without_blocking, make_fifo
 
 
 async def test_output_is_line_numbered_with_a_single_tab(ctx, tmp_repo):
@@ -78,3 +81,12 @@ def test_the_description_is_the_one_from_the_spec():
     assert description.startswith("Read a UTF-8 text file from the working directory.")
     assert "line number and a single tab" in description
     assert "Reading a file records what it contained" in description
+
+
+def test_reading_a_fifo_is_an_error_result_and_does_not_wait_for_a_writer(ctx, tmp_repo):
+    # Not a coroutine: if the tool did open it, the event loop would be what blocked.
+    fifo = make_fifo(tmp_repo / "pipe.fifo")
+    outcome = call_without_blocking(
+        fifo, asyncio.run, ReadTool().run(ctx, "t1", {"path": "pipe.fifo"})
+    )
+    assert outcome.is_error and "pipe.fifo is not a regular file" in outcome.content

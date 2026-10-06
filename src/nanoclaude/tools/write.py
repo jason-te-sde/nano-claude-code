@@ -18,7 +18,7 @@ from nanoclaude.tools.base import (
     require_str,
 )
 from nanoclaude.tools.edit import unified_diff
-from nanoclaude.tools.fs import read_text, stamp_of, write_atomic
+from nanoclaude.tools.fs import FileSystemError, read_text, stamp_of, write_atomic
 
 DESCRIPTION = """Write a UTF-8 text file, creating it or replacing it entirely.
 
@@ -107,7 +107,10 @@ class WriteTool:
         content = require_str(arguments, "content")
         shown = ctx.display(resolved)
 
-        current = stamp_of(resolved)
+        try:
+            current = stamp_of(resolved)
+        except FileSystemError as exc:
+            return failed(call_id, str(exc))
         if current is not None:
             seen = ctx.read_state.get(resolved)
             if seen is None:

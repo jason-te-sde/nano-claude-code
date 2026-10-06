@@ -1,8 +1,11 @@
+import asyncio
+
 import pytest
 
 from nanoclaude.tools.base import ToolArgumentError
 from nanoclaude.tools.fs import stamp_of
 from nanoclaude.tools.write import WriteTool, preview_write
+from tests.fifo import call_without_blocking, make_fifo
 
 
 async def test_creating_a_new_file_needs_no_prior_read(ctx, tmp_repo):
@@ -153,3 +156,19 @@ async def test_the_preview_counts_lines_the_way_the_tool_reports_them(ctx, tmp_r
     preview = preview_write(str(tmp_repo / "n.txt"), "n.txt", {"path": "n.txt", "content": content})
     outcome = await WriteTool().run(ctx, "t1", {"path": "n.txt", "content": content})
     assert f"({preview.size} bytes, {preview.lines} lines)" in outcome.content
+
+
+def test_a_preview_over_a_fifo_says_why_it_cannot_be_compared_and_does_not_wait(tmp_repo):
+    fifo = make_fifo(tmp_repo / "pipe.fifo")
+    preview = call_without_blocking(
+        fifo, preview_write, str(fifo), "pipe.fifo", {"path": "pipe.fifo", "content": "x\n"}
+    )
+    assert preview.kind == "overwrite" and preview.why == f"{fifo} is not a regular file"
+
+
+def test_writing_over_a_fifo_is_an_error_result_and_does_not_wait_for_a_reader(ctx, tmp_repo):
+    fifo = make_fifo(tmp_repo / "pipe.fifo")
+    outcome = call_without_blocking(
+        fifo, asyncio.run, WriteTool().run(ctx, "t1", {"path": "pipe.fifo", "content": "x\n"})
+    )
+    assert outcome.is_error and "pipe.fifo is not a regular file" in outcome.content
