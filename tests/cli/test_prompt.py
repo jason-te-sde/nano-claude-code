@@ -304,8 +304,14 @@ async def test_tab_at_the_prompt_takes_the_first_offer(keyboard, project, typing
 # --------------------------------------------------------------------------
 
 
-def readable(fd: int) -> bool:
-    return bool(select.select([fd], [], [], 0)[0])
+# On Linux what is written to one end of a pseudo-terminal reaches the other end a moment later,
+# handed over by a worker thread; on macOS it is there at once. So a test that says "it has
+# arrived" waits for it, and one that says "it is gone" does not: it has already seen it arrive.
+ARRIVES_WITHIN_S = 2.0
+
+
+def readable(fd: int, wait: float = 0.0) -> bool:
+    return bool(select.select([fd], [], [], wait)[0])
 
 
 def test_what_was_typed_and_not_yet_read_on_a_terminal_is_thrown_away():
@@ -313,11 +319,11 @@ def test_what_was_typed_and_not_yet_read_on_a_terminal_is_thrown_away():
     stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
     try:
         os.write(master, b"y\n")  # typed while nobody was reading
-        assert readable(slave)
+        assert readable(slave, wait=ARRIVES_WITHIN_S)
         discard_pending_input(stream)
         assert not readable(slave)
         os.write(master, b"n\n")  # and what is typed afterwards is still read
-        assert readable(slave)
+        assert readable(slave, wait=ARRIVES_WITHIN_S)
     finally:
         stream.close()
         os.close(master)
@@ -332,7 +338,7 @@ def test_where_there_is_no_termios_nothing_is_discarded_and_nothing_fails(monkey
     try:
         os.write(master, b"y\n")
         discard_pending_input(stream)
-        assert readable(slave)
+        assert readable(slave, wait=ARRIVES_WITHIN_S)
     finally:
         stream.close()
         os.close(master)
