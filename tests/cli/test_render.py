@@ -24,7 +24,7 @@ from rich.console import Console
 from nanoclaude.agent.router import Router
 from nanoclaude.agent.ui import UI, Approval
 from nanoclaude.cli import render
-from nanoclaude.cli.prompt import new_prompter
+from nanoclaude.cli.prompt import build_prompt_session, new_prompter
 from nanoclaude.cli.render import (
     ConsoleUI,
     cost_panel,
@@ -543,6 +543,21 @@ async def test_what_the_prompt_had_already_read_cannot_answer_the_next_question(
         assert await ui.confirm(call, request, ASK) is Approval.ONCE
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(ui.confirm(call, request, ASK), 0.5)
+
+
+async def test_what_the_repl_prompt_left_behind_cannot_answer_a_question(tmp_path):
+    # The case that matters: "go", Enter, "y", Enter arrive in one chunk at the prompt the person
+    # types their request into. The request is taken, the "y" and Enter are not, and the question
+    # the request leads to must not be answered by them. The two prompts share one input.
+    with create_pipe_input() as keyboard:
+        console, _ = plain_console()
+        repl_prompt = build_prompt_session(str(tmp_path), input=keyboard, output=DummyOutput())
+        ui = ConsoleUI(console, prompter=new_prompter(input=keyboard, output=DummyOutput()))
+        keyboard.send_text("go\ry\r")
+        assert await repl_prompt.prompt_async("> ") == "go"
+        call = ToolUseBlock("t1", "Bash", {"command": "make"})
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(ui.confirm(call, PermissionRequest("Bash", "make"), ASK), 0.5)
 
 
 async def test_nothing_is_asked_when_everything_is_approved():
