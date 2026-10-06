@@ -138,13 +138,14 @@ async def _clear(_args: list[str], session: Session, console: Console) -> None:
 
 async def _compact(args: list[str], session: Session, console: Console) -> None:
     before, _ = await session.context_usage()
-    await session.compact(" ".join(args) or None)
-    after, _ = await session.context_usage()
-    if after == before:
-        # Nothing is older than the turns that are always kept, so nobody was asked.
+    # The session says whether it summarised anything. The figures cannot: closing what an
+    # interrupted turn left open adds a note first, which makes the context larger when
+    # nothing at all was compacted.
+    if not await session.compact(" ".join(args) or None):
         show_notice(console, "nothing to compact — the recent turns are kept as they are")
-    else:
-        show_notice(console, f"compacted — context was {before} tokens, now {after}")
+        return
+    after, _ = await session.context_usage()
+    show_notice(console, f"compacted — context was {before} tokens, now {after}")
 
 
 async def _status(_args: list[str], session: Session, console: Console) -> None:

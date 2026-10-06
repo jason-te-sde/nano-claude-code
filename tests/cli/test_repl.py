@@ -587,6 +587,22 @@ async def test_a_press_that_arrives_after_its_turn_cannot_turn_the_next_cancel_i
     assert len(harness.prompter.asked) == 4  # the third prompt was read, and then Ctrl+D
 
 
+async def test_compact_after_a_cancelled_turn_says_there_was_nothing_to_compact(
+    tmp_repo, monkeypatch
+):
+    # /compact closes what the cancelled turn left open before it looks for anything to
+    # summarise. That adds a note and so makes the conversation larger, which is not a
+    # compaction, and must not be reported as one.
+    sigint = Sigint(monkeypatch)
+    harness = Harness(tmp_repo, [], "first", "/compact", width=300)
+    started = block_the_answer(harness.session, monkeypatch)
+    repl_task = harness.start()
+    await reached(started)
+    sigint.press()
+    assert await asyncio.wait_for(repl_task, timeout=5) == 0
+    assert "nothing to compact" in harness.text and "compacted" not in harness.text
+
+
 async def test_the_sigint_handler_is_removed_after_a_turn_that_finished_and_one_that_failed(
     tmp_repo, monkeypatch
 ):
