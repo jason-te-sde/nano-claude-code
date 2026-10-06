@@ -530,6 +530,21 @@ async def test_the_confirmation_at_a_real_prompt_reads_each_key_as_it_should(key
         )
 
 
+async def test_what_the_prompt_had_already_read_cannot_answer_the_next_question():
+    # prompt_toolkit reads what is waiting in one chunk and keeps what the prompt did not use
+    # for the next prompt. A person who types "y", Enter, "y", Enter ahead of two questions
+    # has answered the first, and the second must wait for them: it has not been asked yet.
+    with create_pipe_input() as keyboard:
+        console, _ = plain_console()
+        ui = ConsoleUI(console, prompter=new_prompter(input=keyboard, output=DummyOutput()))
+        call = ToolUseBlock("t1", "Bash", {"command": "make"})
+        request = PermissionRequest("Bash", "make")
+        keyboard.send_text("y\ry\r")
+        assert await ui.confirm(call, request, ASK) is Approval.ONCE
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(ui.confirm(call, request, ASK), 0.5)
+
+
 async def test_nothing_is_asked_when_everything_is_approved():
     screen = Screen(auto_approve=True)
     call = ToolUseBlock("t1", "Bash", {"command": "make"})
@@ -552,33 +567,52 @@ async def test_a_call_that_is_asked_about_is_announced_once_when_everything_is_a
     assert (tmp_repo / "new.txt").read_text() == "x\n"
 
 
+def recording_ui(*answers: str, auto_approve: bool = False) -> tuple[ConsoleUI, list[str]]:
+    """A ConsoleUI that records, in one list, when input is discarded, when the prompt is told
+    to forget what it kept, and when a question is asked."""
+    events: list[str] = []
+    console, _ = plain_console()
+    prompter = ScriptedPrompter(
+        *answers,
+        on_ask=lambda _message: events.append("ask"),
+        on_forget=lambda: events.append("forget"),
+    )
+    ui = ConsoleUI(
+        console,
+        auto_approve=auto_approve,
+        prompter=prompter,
+        discard_input=lambda: events.append("discard"),
+    )
+    return ui, events
+
+
+def cleared_then_asked(events: list[str]) -> bool:
+    """Each ask is preceded by both clears, in either order, and by nothing else."""
+    groups = [events[i : i + 3] for i in range(0, len(events), 3)]
+    return len(events) % 3 == 0 and all(
+        sorted(group[:2]) == ["discard", "forget"] and group[2] == "ask" for group in groups
+    )
+
+
 async def test_what_was_typed_before_a_question_is_discarded_before_it_is_asked():
     # A person who types "y" and Enter while the model is still thinking has not answered a
     # question nobody had asked yet. It would otherwise be read as the answer, and approve a
-    # write they never saw.
-    events: list[str] = []
-    console, _ = plain_console()
-    prompter = ScriptedPrompter("n", on_ask=lambda _message: events.append("ask"))
-    ui = ConsoleUI(console, prompter=prompter, discard_input=lambda: events.append("discard"))
+    # write they never saw. Some of it is still in the terminal and some the prompt has read.
+    ui, events = recording_ui("n")
     call = ToolUseBlock("t1", "Bash", {"command": "make"})
     await ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
-    assert events == ["discard", "ask"]
+    assert len(events) == 3 and cleared_then_asked(events)
 
 
 async def test_input_is_discarded_before_a_question_asked_again_too():
-    events: list[str] = []
-    console, _ = plain_console()
-    prompter = ScriptedPrompter("maybe", "y", on_ask=lambda _message: events.append("ask"))
-    ui = ConsoleUI(console, prompter=prompter, discard_input=lambda: events.append("discard"))
+    ui, events = recording_ui("maybe", "y")
     call = ToolUseBlock("t1", "Bash", {"command": "make"})
     await ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
-    assert events == ["discard", "ask", "discard", "ask"]
+    assert len(events) == 6 and cleared_then_asked(events)
 
 
 async def test_nothing_is_discarded_when_nothing_is_asked():
-    events: list[str] = []
-    console, _ = plain_console()
-    ui = ConsoleUI(console, auto_approve=True, discard_input=lambda: events.append("discard"))
+    ui, events = recording_ui(auto_approve=True)
     call = ToolUseBlock("t1", "Bash", {"command": "make"})
     await ui.confirm(call, PermissionRequest("Bash", "make"), ASK)
     assert events == []

@@ -88,13 +88,22 @@ class ScriptedPrompter:
     """
 
     def __init__(
-        self, *answers: str | BaseException, on_ask: Callable[[str], None] | None = None
+        self,
+        *answers: str | BaseException,
+        on_ask: Callable[[str], None] | None = None,
+        on_forget: Callable[[], None] | None = None,
     ) -> None:
         self._answers = list(answers)
         #: Called with the message of each question as it is asked, before it is answered.
         self.on_ask = on_ask
+        #: Called each time it is told to forget what was typed ahead.
+        self.on_forget = on_forget
         #: The message of every question asked, in order.
         self.asked: list[str] = []
+
+    def forget_typed_ahead(self) -> None:
+        if self.on_forget is not None:
+            self.on_forget()
 
     async def prompt_async(self, message: str = "") -> str:
         self.asked.append(message)

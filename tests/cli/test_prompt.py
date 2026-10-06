@@ -106,6 +106,24 @@ async def test_ctrl_d_at_a_bare_prompt_raises_end_of_file(keyboard):
         await prompter.prompt_async("allow? ")
 
 
+async def test_what_a_bare_prompt_read_and_did_not_use_is_kept_for_the_next_prompt(keyboard):
+    # What prompt_toolkit does, and what the next test is about: a prompt reads what is waiting
+    # in one chunk, and keeps what it did not use for the prompt that follows.
+    keyboard.send_text("one\rtwo\r")
+    prompter = new_prompter(input=keyboard, output=DummyOutput())
+    assert await prompter.prompt_async("? ") == "one"
+    assert await prompter.prompt_async("? ") == "two"
+
+
+async def test_forgetting_typed_ahead_drops_what_was_kept_and_nothing_typed_after(keyboard):
+    keyboard.send_text("one\rtwo\r")
+    prompter = new_prompter(input=keyboard, output=DummyOutput())
+    assert await prompter.prompt_async("? ") == "one"
+    prompter.forget_typed_ahead()
+    keyboard.send_text("three\r")  # typed after: this is wanted
+    assert await prompter.prompt_async("? ") == "three"
+
+
 async def test_a_bare_prompt_leaves_the_sigint_handler_of_the_turn_it_is_asked_in_alone(keyboard):
     # prompt_toolkit installs a SIGINT handler of its own while a prompt is up and removes
     # whatever is there when it is done, which would take the REPL's handler for the turn

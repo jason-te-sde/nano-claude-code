@@ -45,7 +45,7 @@ from rich.text import Text
 from nanoclaude.agent.router import Router
 from nanoclaude.agent.session import Session
 from nanoclaude.agent.ui import Approval
-from nanoclaude.cli.prompt import Prompter, discard_pending_input, new_prompter
+from nanoclaude.cli.prompt import Questioner, discard_pending_input, new_prompter
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
@@ -263,7 +263,7 @@ class ConsoleUI:
         console: Console,
         *,
         auto_approve: bool = False,
-        prompter: Prompter | None = None,
+        prompter: Questioner | None = None,
         root: str | None = None,
         discard_input: Callable[[], None] | None = None,
     ) -> None:
@@ -277,7 +277,7 @@ class ConsoleUI:
         self._discard_input = discard_input if discard_input is not None else discard_pending_input
         # Built when the first question is asked: a UI that is never asked anything has
         # no reason to take hold of the terminal.
-        self._prompter = prompter
+        self._prompter: Questioner | None = prompter
         # Edits whose diff was shown at the confirmation, so that it is not shown again.
         self._previewed: set[str] = set()
 
@@ -310,10 +310,13 @@ class ConsoleUI:
             f"  allow? [y]es / [n]o / [a]lways (every {visible(call.name)} call this session) "
         )
         while True:
-            # Whatever was typed before now was not typed for this question.
+            # Whatever was typed before now was not typed for this question: not what the
+            # terminal has not delivered yet, and not what the prompt has read and kept.
             self._discard_input()
+            prompter = self._prompt()
+            prompter.forget_typed_ahead()
             try:
-                answer = await self._prompt().prompt_async(question)
+                answer = await prompter.prompt_async(question)
             except EOFError:
                 return Approval.NO
             except KeyboardInterrupt:
@@ -331,7 +334,7 @@ class ConsoleUI:
                 return Approval.NO
             self._console.print(plain("answer y, n or a", "dim"))
 
-    def _prompt(self) -> Prompter:
+    def _prompt(self) -> Questioner:
         if self._prompter is None:
             self._prompter = new_prompter()
         return self._prompter

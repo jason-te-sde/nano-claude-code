@@ -32,6 +32,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition, emacs_insert_mode, emacs_mode, vi_insert_mode
 from prompt_toolkit.history import FileHistory, History, InMemoryHistory
 from prompt_toolkit.input import Input
+from prompt_toolkit.input.typeahead import clear_typeahead
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from prompt_toolkit.output import Output
 
@@ -53,6 +54,17 @@ class Prompter(Protocol):
     async def prompt_async(self, message: str = "") -> str: ...
 
 
+class Questioner(Prompter, Protocol):
+    """A :class:`Prompter` for a question asked in the middle of a turn.
+
+    What a person typed before a question was asked is not its answer, and some of it is
+    out of reach of the terminal by then: a prompt reads what is waiting in one chunk, and
+    what it did not use waits for the prompt that comes next. ``forget_typed_ahead`` drops it.
+    """
+
+    def forget_typed_ahead(self) -> None: ...
+
+
 class _Question:
     """A prompt for a question asked in the middle of a turn, which leaves SIGINT alone.
 
@@ -70,8 +82,13 @@ class _Question:
     async def prompt_async(self, message: str = "") -> str:
         return await self._session.prompt_async(message, handle_sigint=False)
 
+    def forget_typed_ahead(self) -> None:
+        # prompt_toolkit keeps it per input, and every prompt on the terminal's input shares
+        # one store: the REPL's prompt leaves keys there, and this one would be fed them.
+        clear_typeahead(self._session.input)
 
-def new_prompter(*, input: Input | None = None, output: Output | None = None) -> Prompter:
+
+def new_prompter(*, input: Input | None = None, output: Output | None = None) -> Questioner:
     """A bare prompt on the terminal, for a question asked in the middle of a turn.
 
     It has no history and no completion, and it leaves SIGINT to the turn it is asked in.
