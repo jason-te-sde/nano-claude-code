@@ -461,12 +461,16 @@ async def test_the_models_own_spelling_is_shown_by_name_beside_the_path_it_resol
 
 
 async def test_the_reason_a_preview_is_not_possible_shows_its_controls_by_name(tmp_repo):
-    missing = tmp_repo / "no\x1b[2Ksuch.py"
+    # A file that is not there is reported with its name in repr form, which escapes it
+    # already, so it would pass whatever was done to the text. A binary file is reported
+    # with its name as it is.
+    binary = tmp_repo / "bin\x1b[2K.dat"
+    binary.write_bytes(b"\0\1\2")
     screen = Screen("n", width=300)
     call = edit_call("x.py", "a", "b")
-    await screen.ui.confirm(call, write_request("Edit", str(missing)), ASK)
+    await screen.ui.confirm(call, write_request("Edit", str(binary)), ASK)
     [reason] = [ln for ln in screen.text.splitlines() if ln.startswith("  no preview: ")]
-    assert "no\\x1b[2Ksuch.py" in reason
+    assert f"{tmp_repo}/bin\\x1b[2K.dat looks binary" in reason
 
 
 async def test_the_tool_name_is_shown_by_name_in_the_line_the_header_and_the_question():
