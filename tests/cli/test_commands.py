@@ -662,6 +662,17 @@ async def test_a_name_with_a_null_byte_in_it_is_an_error_line_and_not_a_bug(tmp_
     assert text.count("\n") == 1
 
 
+async def test_a_tilde_name_with_a_null_byte_in_it_is_an_error_line_and_not_a_bug(tmp_repo):
+    # Path.expanduser looks the name up, and the lookup refuses a NUL with a ValueError of its
+    # own, which is not the RuntimeError it raises for a name nobody has.
+    session = build_session(tmp_repo, [says("done")])
+    await session.run("hi")
+    _, text = await run_command(session, "export", "~a\x00b/out.md", width=300)
+    assert text.startswith("error: cannot expand '~a\\x00b/out.md' \u2014 ")
+    assert text.count("\n") == 1
+    assert not list(tmp_repo.glob("*.md"))
+
+
 async def test_export_takes_the_rest_of_the_line_as_the_name(tmp_repo):
     session = build_session(tmp_repo, [says("done")])
     await session.run("hi")

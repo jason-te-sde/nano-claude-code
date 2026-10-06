@@ -253,8 +253,9 @@ async def _export(args: list[str], session: Session, console: Console) -> None:
     name = " ".join(args) or f"session-{session.session_id}.md"
     try:
         target = _export_target(session.root, name)
-    except RuntimeError:
-        # Path.expanduser: a ~name with no such user has no home directory to expand to.
+    except (RuntimeError, ValueError):
+        # Path.expanduser: a ~name with no such user has no home directory to expand to, and
+        # one that holds a NUL cannot be looked up at all.
         show_error(
             console,
             f"cannot expand {name!r} — it starts with ~ but no home directory is known for "
