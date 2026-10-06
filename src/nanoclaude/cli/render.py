@@ -145,16 +145,21 @@ def show_notice(console: Console, message: str) -> None:
 #: What every error line for a person begins with (spec 17.9).
 ERROR_PREFIX = "error: "
 
+#: A line break, and the blanks around it: what makes one line two.
+_LINE_BREAKS = re.compile(r"[ \t]*\n\s*")
+
 
 def show_error(console: Console, message: str) -> None:
     """``error: <what happened> — <what to do>``: spec 17.9's form for a person.
 
     ``message`` is what follows the prefix, or the whole line: either way the prefix is on
-    the line exactly once, so no caller can print an error line without it. ``message`` is
-    data: never read as markup.
+    the line exactly once, so no caller can print an error line without it, and it is one
+    line: a line break in ``message`` becomes a space, so that nothing it quotes can start a
+    line of its own, with a second ``error:`` in front of it, say. ``message`` is data:
+    never read as markup.
     """
-    body = message.removeprefix(ERROR_PREFIX)
-    console.print(Text.assemble((ERROR_PREFIX, "red"), sanitize(body)))
+    body = _LINE_BREAKS.sub(" ", sanitize(message.removeprefix(ERROR_PREFIX))).strip()
+    console.print(Text.assemble((ERROR_PREFIX, "red"), body))
 
 
 def _shorten(text: str) -> str:

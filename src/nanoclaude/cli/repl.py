@@ -79,8 +79,13 @@ def error_message(exc: Exception) -> str:
 
 
 def _what_to_say(exc: Exception) -> str:
-    """``<what happened> — <what to do>`` for ``exc``, without the prefix."""
-    detail = str(exc).strip().rstrip(".")
+    """``<what happened> — <what to do>`` for ``exc``, without the prefix.
+
+    What happened starts in lower case, as spec 17.9 words it, and is never a bare class
+    name. It is one line: the exception's text is somebody else's, and a second line of it
+    would be a line of the error that nobody wrote the prefix of.
+    """
+    detail = " ".join(str(exc).split()).rstrip(".")
     if " — " in detail:
         return detail
     name = type(exc).__name__
@@ -94,11 +99,12 @@ def _what_to_say(exc: Exception) -> str:
             f"the conversation is in an unexpected state ({detail or name}) — /clear starts it over"
         )
     if isinstance(exc, ContextTooSmallError):
-        return f"{detail or name} — /model switches to a model with a larger window"
+        what = detail or "the context window is too small for this conversation"
+        return f"{what} — /model switches to a model with a larger window"
     if isinstance(exc, ModelError):
-        return f"{detail or name} — try again, or switch models with /model"
+        return f"{detail or 'the model request failed'} — try again, or switch models with /model"
     what = f"{name}: {detail}" if detail else name
-    return f"{what} — this is a bug; /clear starts the conversation over"
+    return f"unexpected error ({what}) — this is a bug; /clear starts the conversation over"
 
 
 class _Cancelled(Exception):
@@ -132,8 +138,10 @@ async def _cancellable(work: Coroutine[Any, Any, _T], taps: _DoubleTap) -> _T:
 
     The handler is installed before the work is started. Installing it can fail (off the
     main thread, or where the loop has no signal handlers), and work that had been started
-    by then would be left running with nobody awaiting it. And what an earlier press left
-    in ``taps.leave`` is not this work's: a press that arrives after its own turn has ended
+    by then would be left running with nobody awaiting it. Once it is installed, the ``try``
+    that removes it begins at once: nothing that can raise may sit between the two, or a
+    handler is left behind for whatever runs next. And what an earlier press left in
+    ``taps.leave`` is not this work's: a press that arrives after its own turn has ended
     must not turn the next single Ctrl+C into an exit.
     """
     loop = asyncio.get_running_loop()
@@ -154,8 +162,8 @@ async def _cancellable(work: Coroutine[Any, Any, _T], taps: _DoubleTap) -> _T:
     except BaseException:
         work.close()  # it never started, and must not be reported as never awaited
         raise
-    task = asyncio.create_task(work)
     try:
+        task = asyncio.create_task(work)
         return await task
     except asyncio.CancelledError:
         current = asyncio.current_task()
@@ -168,6 +176,8 @@ async def _cancellable(work: Coroutine[Any, Any, _T], taps: _DoubleTap) -> _T:
         raise _Cancelled from None
     finally:
         loop.remove_signal_handler(signal.SIGINT)
+        if task is None:
+            work.close()  # no task was made for it, and it must not be reported as never awaited
 
 
 def _report_stop(console: Console, done: Done) -> None:

@@ -514,6 +514,26 @@ def test_an_error_line_carries_the_prefix_once_whether_or_not_it_was_given(tmp_p
     assert buffer.getvalue() == "error: no such model \u2014 choose another\n" * 2
 
 
+def test_an_error_line_is_one_line_whatever_the_message_holds(tmp_path):
+    # Every caller of show_error gets this, not only the ones that describe an exception.
+    console, buffer = plain_console()
+    show_error(console, "bad value\nerror: second\n\n  third")
+    assert buffer.getvalue() == "error: bad value error: second third\n"
+
+
+def test_an_error_line_does_not_end_in_a_blank_that_a_trailing_line_break_leaves(tmp_path):
+    console, buffer = plain_console()
+    show_error(console, "ends with a break\n")
+    assert buffer.getvalue() == "error: ends with a break\n"
+
+
+def test_an_error_line_keeps_the_spacing_inside_what_it_quotes(tmp_path):
+    # Only the line breaks go: "a  b" quoted from a path or a name is not "a b".
+    console, buffer = plain_console()
+    show_error(console, "no model named 'a  b' \u2014 choose one of: x")
+    assert buffer.getvalue() == "error: no model named 'a  b' \u2014 choose one of: x\n"
+
+
 # --------------------------------------------------------------------------
 # The confirmation
 # --------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import signal
 import sqlite3
 from collections.abc import Callable
@@ -395,13 +396,29 @@ async def test_a_command_that_fails_is_reported_and_the_next_prompt_is_answered(
         ),
         (
             RuntimeError("boom"),
-            "error: RuntimeError: boom — this is a bug; /clear starts the conversation over",
+            (
+                "error: unexpected error (RuntimeError: boom) — this is a bug; "
+                "/clear starts the conversation over"
+            ),
         ),
         (
             RuntimeError(""),
-            "error: RuntimeError — this is a bug; /clear starts the conversation over",
+            (
+                "error: unexpected error (RuntimeError) — this is a bug; "
+                "/clear starts the conversation over"
+            ),
         ),
-        (ModelError(""), "error: ModelError — try again, or switch models with /model"),
+        (
+            ModelError(""),
+            "error: the model request failed — try again, or switch models with /model",
+        ),
+        (
+            ContextTooSmallError(""),
+            (
+                "error: the context window is too small for this conversation"
+                " — /model switches to a model with a larger window"
+            ),
+        ),
     ],
 )
 def test_a_failure_is_described_in_the_form_the_spec_gives_for_a_person(failure, line):
@@ -429,6 +446,46 @@ def test_every_failure_is_reported_as_one_error_line_that_says_what_to_do(failur
     assert line.count("error: ") == 1
 
 
+@pytest.mark.parametrize(
+    ("failure", "line"),
+    [
+        (
+            ModelError("overloaded\nerror: second"),
+            "error: overloaded error: second \u2014 try again, or switch models with /model",
+        ),
+        (
+            RuntimeError("first\r\n\n  second\tthird "),
+            (
+                "error: unexpected error (RuntimeError: first second third) \u2014 this is a bug; "
+                "/clear starts the conversation over"
+            ),
+        ),
+        (
+            ModelError("tried\nagain \u2014 wait a moment\nthen retry."),
+            "error: tried again \u2014 wait a moment then retry",
+        ),
+    ],
+    ids=["model-error", "runtime-error", "already-says-what-to-do"],
+)
+def test_a_failure_whose_text_runs_over_several_lines_is_still_one_error_line(failure, line):
+    # A second line of an error line is a line nobody wrote the prefix of, and the text is
+    # the provider's: it can begin with "error:" and be taken for a second error.
+    assert error_message(failure) == line
+
+
+async def test_a_failure_that_quotes_several_lines_prints_one_error_line(tmp_repo, monkeypatch):
+    harness = Harness(tmp_repo, [], "hello", width=300)
+
+    async def boom(prompt: str) -> Done:
+        raise ModelError("overloaded\nerror: second")
+
+    monkeypatch.setattr(harness.session, "follow_up", boom)
+    await harness.run()
+    assert [ln for ln in harness.text.splitlines() if "overloaded" in ln or "second" in ln] == [
+        "error: overloaded error: second \u2014 try again, or switch models with /model"
+    ]
+
+
 async def test_a_reported_failure_carries_the_error_prefix_exactly_once(tmp_repo, monkeypatch):
     harness = Harness(tmp_repo, [], "hello", width=300)
 
@@ -437,7 +494,7 @@ async def test_a_reported_failure_carries_the_error_prefix_exactly_once(tmp_repo
 
     monkeypatch.setattr(harness.session, "follow_up", boom)
     await harness.run()
-    assert "error: RuntimeError: boom \u2014 this is a bug" in harness.text
+    assert "error: unexpected error (RuntimeError: boom) \u2014 this is a bug" in harness.text
     assert "error: error:" not in harness.text
 
 
@@ -557,6 +614,27 @@ async def test_a_turn_is_not_left_running_when_the_sigint_handler_cannot_be_inst
     assert asyncio.all_tasks() == {asyncio.current_task()}
     reported = [ln for ln in harness.text.splitlines() if ln.startswith("error:")]
     assert len(reported) == 2 and all("set_wakeup_fd" in ln for ln in reported)
+
+
+async def test_the_sigint_handler_is_removed_when_the_task_cannot_be_created(monkeypatch):
+    # Nothing that can raise may sit between installing the handler and the try that removes it:
+    # a handler left behind would cancel whatever task is the REPL's next, and nobody would
+    # know why. The work that was never started is closed, not left to be reported unawaited.
+    sigint = Sigint(monkeypatch)
+    ran: list[int] = []
+
+    async def work() -> None:
+        ran.append(1)
+
+    def refuse(_coroutine: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("no task for you")
+
+    coroutine = work()
+    monkeypatch.setattr(asyncio, "create_task", refuse)
+    with pytest.raises(RuntimeError, match="no task for you"):
+        await repl._cancellable(coroutine, repl._DoubleTap(FakeClock()))
+    assert (sigint.installed, sigint.removed) == (1, 1)
+    assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED and ran == []
 
 
 async def test_a_press_that_arrives_after_its_turn_cannot_turn_the_next_cancel_into_an_exit(
