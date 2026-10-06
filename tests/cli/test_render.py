@@ -49,7 +49,7 @@ from nanoclaude.providers.capabilities import CapabilityCache
 from nanoclaude.providers.pricing import Price, PriceBook
 from nanoclaude.testing.scripted import calls, says
 from nanoclaude.testing.session import build_session
-from nanoclaude.tools.base import ToolOutcome
+from nanoclaude.tools.base import ToolArgumentError, ToolOutcome
 from tests.cli.helpers import (
     ASK,
     ScriptedPrompter,
@@ -1150,6 +1150,22 @@ async def test_a_write_whose_content_cannot_be_written_is_said_not_to_be_preview
     call = ToolUseBlock("w1", "Write", {"path": "n.py"})
     await screen.ui.confirm(call, write_request("Write", str(tmp_repo / "n.py")), ASK)
     assert "  no preview: content must be a string, got NoneType" in screen.text
+
+
+async def test_the_reason_a_write_cannot_be_previewed_shows_its_controls_by_name(
+    tmp_repo, monkeypatch
+):
+    # Nothing the preview raises today holds a raw control, so the guard is pinned with a reason
+    # that does: whatever a later change puts in the message, it is shown and not obeyed.
+    def refuse(_path: str, _shown: str, _arguments: object) -> None:
+        raise ToolArgumentError("content \x1b[2K is not text")
+
+    monkeypatch.setattr(render, "preview_write", refuse)
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(
+        write_call("n.py", "x"), write_request("Write", str(tmp_repo / "n.py")), ASK
+    )
+    assert "  no preview: content \\x1b[2K is not text" in screen.text.splitlines()
 
 
 async def test_a_write_whose_request_names_no_file_is_asked_about_without_a_preview():
