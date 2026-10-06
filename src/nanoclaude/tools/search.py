@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -233,7 +234,10 @@ def python_search(
     matches: list[Match] = []
     for path in sorted(walk_files(root, pattern=glob and f"**/{glob}", limit=10_000)):
         try:
-            if Path(path).stat().st_size > MAX_SEARCH_BYTES:
+            status = Path(path).stat()
+            # Only a regular file is opened: reading a FIFO waits for a writer, and a
+            # device may never end.
+            if not stat.S_ISREG(status.st_mode) or status.st_size > MAX_SEARCH_BYTES:
                 continue
             data = Path(path).read_bytes()
         except OSError:

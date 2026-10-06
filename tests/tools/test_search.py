@@ -13,6 +13,7 @@ from nanoclaude.tools.search import (
     ripgrep_search,
     walk_files,
 )
+from tests.fifo import call_without_blocking, make_fifo
 
 
 @pytest.fixture
@@ -332,3 +333,14 @@ def test_both_backends_skip_files_over_the_size_cap(backend, corpus, monkeypatch
     found = {Path(m.path).name for m in backend("needle", root=str(corpus), glob=None, limit=100)}
     assert "small.txt" in found
     assert "big.txt" not in found
+
+
+def test_the_fallback_search_skips_a_fifo_rather_than_waiting_on_it(tmp_path):
+    # Reading a FIFO waits for a writer, so a search that opened every path it walked
+    # would stop at the first one in the tree. Only regular files are searched.
+    (tmp_path / "a.py").write_text("def hello():\n    pass\n")
+    fifo = make_fifo(tmp_path / "b.py")
+    matches = call_without_blocking(
+        fifo, python_search, "def hello", root=str(tmp_path), glob="*.py", limit=100
+    )
+    assert [Path(m.path).name for m in matches] == ["a.py"]
