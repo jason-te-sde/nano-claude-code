@@ -104,6 +104,12 @@ def test_a_preview_of_a_new_file_says_what_will_be_created_and_writes_nothing(tm
     assert not target.exists()
 
 
+def test_a_preview_counts_bytes_and_not_characters(tmp_repo):
+    content = "caf\N{LATIN SMALL LETTER E WITH ACUTE}\n"
+    preview = preview_write(str(tmp_repo / "n.txt"), "n.txt", {"path": "n.txt", "content": content})
+    assert (preview.lines, preview.size) == (1, 6)
+
+
 def test_a_preview_of_a_replacement_is_the_diff_against_what_is_there(tmp_repo):
     target = tmp_repo / "a.py"
     target.write_text("x = 1\ny = 2\n")

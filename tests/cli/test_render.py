@@ -314,6 +314,18 @@ def test_an_allowed_write_outside_the_root_is_announced_whole():
     assert screen.text == "Write /shared/lib/b.py\n"
 
 
+def test_a_root_given_through_a_link_is_resolved_as_the_paths_of_a_request_are(tmp_path):
+    # A request's paths are resolved, so a root that is not would never contain any of them.
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    screen = Screen(root=str(link))
+    call = ToolUseBlock("t1", "Write", {"path": "a.py", "content": "x"})
+    screen.ui.on_decision(call, write_request("Write", str(real / "a.py")), ALLOW)
+    assert screen.text == "Write a.py\n"
+
+
 def test_a_root_is_not_a_prefix_of_a_sibling_directory():
     # /repo is not the root of /repo-old/a.py, whatever the strings share.
     screen = Screen(root="/repo")
