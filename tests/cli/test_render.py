@@ -238,6 +238,7 @@ def test_the_note_on_a_cut_diff_line_is_drawn_dim_apart_from_the_line_it_ends():
     pieces = styled_pieces(render_diff(diff), width=1000)
     note = [style for text, style in pieces if text == "... (101 more characters)"]
     assert [style.dim for style in note] == [True]
+    assert [style.color for style in note] == [None]  # the line's colour ends with the line
     colour_of = {text: style.color.name for text, style in pieces if style.color}
     assert colour_of["+" + "y" * 199] == "green"
 
@@ -958,6 +959,14 @@ async def test_a_new_file_without_a_final_newline_says_so_after_its_last_line(tm
         "    2  last",
         "  \\ No newline at end of file",
     ]
+
+
+async def test_an_empty_new_file_does_not_say_that_it_lacks_a_final_newline(tmp_repo):
+    screen = Screen("n", width=300)
+    await screen.ui.confirm(
+        write_call("new.py", ""), write_request("Write", str(tmp_repo / "new.py")), ASK
+    )
+    assert screen.text.splitlines()[3:] == ["  new file: 0 lines, 0 bytes"]
 
 
 async def test_a_cut_listing_does_not_claim_to_know_how_the_file_ends(tmp_repo):
