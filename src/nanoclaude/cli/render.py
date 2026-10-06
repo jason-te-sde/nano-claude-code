@@ -32,10 +32,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 
 from rich.console import Console, RenderableType
 from rich.markdown import Markdown
-from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
@@ -59,26 +59,32 @@ BAR_WIDTH = 20
 #: What a call is summarised by, most informative first.
 _SUMMARY_KEYS = ("path", "command", "pattern", "subcommand")
 
-#: Every character that can change what a person believes they are reading: the C0
-#: controls, DEL and the C1 controls, which a terminal acts on, and the bidirectional
-#: embeddings, overrides and isolates, which it does not act on but which reorder the
-#: text around them.
-_UNSAFE = re.compile(
-    "[\x00-\x1f\x7f-\x9f"
-    "\N{LEFT-TO-RIGHT EMBEDDING}-\N{RIGHT-TO-LEFT OVERRIDE}"
-    "\N{LEFT-TO-RIGHT ISOLATE}-\N{POP DIRECTIONAL ISOLATE}]"
-)
+#: The characters that can change what a person believes they are reading: the ones a
+#: terminal acts on (category Cc: the C0 and C1 controls and DEL), the ones it draws as
+#: nothing (Cf, "format": zero-width spaces and joiners, left-to-right and right-to-left
+#: marks and overrides, the soft hyphen, the byte order mark), and a lone surrogate (Cs),
+#: which cannot be printed at all. A subject that holds one is not the subject without it,
+#: so each is shown by name and two different subjects never print alike.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
+
+#: Where an unsafe character can be: anything but printable ASCII. Most text has none, and
+#: is never looked at one character at a time.
+_NOT_PLAIN_ASCII = re.compile(r"[^\x20-\x7e]")
 
 _NAMED = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
 
 
 def _spelled(char: str) -> str:
-    """The escape that names ``char``: ``\\n``, ``\\r``, ``\\t``, ``\\x1b``, ``\\u202e``."""
+    """The escape that names ``char``: ``\\n``, ``\\x1b``, ``\\u200b``, ``\\U000e0001``."""
     named = _NAMED.get(char)
     if named is not None:
         return named
     code = ord(char)
-    return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}"
+    if code <= 0xFF:
+        return f"\\x{code:02x}"
+    if code <= 0xFFFF:
+        return f"\\u{code:04x}"
+    return f"\\U{code:08x}"
 
 
 def visible_text(raw: str, *, keep_newlines: bool = False) -> Text:
@@ -92,8 +98,10 @@ def visible_text(raw: str, *, keep_newlines: bool = False) -> Text:
     """
     shown = Text()
     start = 0
-    for match in _UNSAFE.finditer(raw):
+    for match in _NOT_PLAIN_ASCII.finditer(raw):
         char = match.group()
+        if unicodedata.category(char) not in _UNSAFE_CATEGORIES:
+            continue
         if keep_newlines and char in "\n\t":
             continue
         shown.append(raw[start : match.start()])
@@ -155,8 +163,43 @@ def summarise_call(call: ToolUseBlock) -> str:
     return _shorten(visible(primary))
 
 
+def _diff_line_style(line: str, in_hunk: bool) -> str:
+    """How a line of a unified diff is drawn, from what kind of line it is."""
+    if line.startswith("@@"):
+        return "cyan"
+    if not in_hunk and line.startswith(("--- ", "+++ ")):
+        return "bold"
+    if in_hunk and line.startswith("+"):
+        return "green"
+    if in_hunk and line.startswith("-"):
+        return "red"
+    if in_hunk and line.startswith("\\"):
+        return "dim"
+    return ""
+
+
 def render_diff(diff: str) -> RenderableType:
-    return Syntax(sanitize(diff), "diff", theme="ansi_dark", word_wrap=True)
+    """A unified diff, coloured by the kind of each line, with its controls shown by name.
+
+    Drawn here and not by a syntax highlighter, which would hand a made-visible escape back
+    to the terminal as plain text: in a diff that is about to be approved, ``\\x1b`` the
+    escape character and ``\\x1b`` the four characters must not look alike, so the first is
+    styled apart, as it is on a confirmation's subject line. A line that begins with ``--``
+    inside a hunk is a removed line and not a file header, and is drawn as one.
+    """
+    lines = diff.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    drawn: list[Text] = []
+    in_hunk = False
+    for line in lines:
+        text = visible_text(line, keep_newlines=True)
+        style = _diff_line_style(line, in_hunk)
+        if style:
+            text.stylize(style)
+        in_hunk = in_hunk or line.startswith("@@")
+        drawn.append(text)
+    return Text("\n").join(drawn)
 
 
 def render_markdown(text: str) -> RenderableType:
@@ -258,7 +301,7 @@ class ConsoleUI:
             return
         # The new text is the model's and is going into a file: its controls are shown, not
         # removed, so that nobody approves a cleaner edit than the one that is written.
-        self._console.print(render_diff(visible(diff, keep_newlines=True)))
+        self._console.print(render_diff(diff))
         self._previewed.add(call.id)
 
     def on_reply(self, reply: ModelReply) -> None:

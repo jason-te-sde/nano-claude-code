@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 from collections.abc import Awaitable, Callable
 from datetime import date, timedelta
 from pathlib import Path
@@ -45,8 +46,11 @@ from tests.cli.helpers import (
     colour_codes,
     edit_call,
     plain_console,
+    sgr_parameters,
     stray_escapes,
+    styled_pieces,
     terminal_console,
+    unstyled,
     write_request,
 )
 
@@ -104,7 +108,22 @@ def row(text: str, label: str) -> str:
         # Just outside the ranges: ordinary text, and not shown as escapes.
         ("a\N{NO-BREAK SPACE}b", "a\N{NO-BREAK SPACE}b"),
         ("a\N{NARROW NO-BREAK SPACE}b", "a\N{NARROW NO-BREAK SPACE}b"),
-        ("a\N{LEFT-TO-RIGHT MARK}b", "a\N{LEFT-TO-RIGHT MARK}b"),
+        ("a\N{GRINNING FACE}b", "a\N{GRINNING FACE}b"),
+        ("a\N{IDEOGRAPHIC SPACE}b", "a\N{IDEOGRAPHIC SPACE}b"),
+        # Category Cf, "format": invisible, so two subjects that differ by one print alike.
+        ("a\N{LEFT-TO-RIGHT MARK}b", "a\\u200eb"),
+        ("a\N{RIGHT-TO-LEFT MARK}b", "a\\u200fb"),
+        ("a\N{ZERO WIDTH SPACE}b", "a\\u200bb"),
+        ("a\N{ZERO WIDTH NON-JOINER}b", "a\\u200cb"),
+        ("a\N{ZERO WIDTH JOINER}b", "a\\u200db"),
+        ("a\N{WORD JOINER}b", "a\\u2060b"),
+        ("a\N{ZERO WIDTH NO-BREAK SPACE}b", "a\\ufeffb"),
+        ("a\N{SOFT HYPHEN}b", "a\\xadb"),
+        ("a\N{ARABIC NUMBER SIGN}b", "a\\u0600b"),
+        ("a\N{LANGUAGE TAG}b", "a\\U000e0001b"),
+        ("a\N{MUSICAL SYMBOL BEGIN BEAM}b", "a\\U0001d173b"),
+        # A lone surrogate cannot be printed at all.
+        ("a" + chr(0xD800) + "b", "a\\ud800b"),
         (
             "caf\N{LATIN SMALL LETTER E WITH ACUTE} \N{GREEK SMALL LETTER LAMDA}",
             "caf\N{LATIN SMALL LETTER E WITH ACUTE} \N{GREEK SMALL LETTER LAMDA}",
@@ -156,6 +175,41 @@ def test_a_diff_is_rendered_with_both_sides_visible():
     diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n"
     text = capture(render_diff(diff))
     assert "-old" in text and "+new" in text
+
+
+DIFF_OF = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new {}\n"
+
+
+def test_a_real_escape_in_a_diff_is_set_apart_from_the_four_characters_that_spell_one():
+    real = styled_pieces(render_diff(DIFF_OF.format("\x1b")))
+    spelled = styled_pieces(render_diff(DIFF_OF.format("\\x1b")))
+    assert [style.reverse for text, style in real if text == "\\x1b"] == [True]
+    assert not any(style.reverse for _, style in spelled)
+
+
+def test_a_diff_is_coloured_by_the_kind_of_each_line():
+    pieces = styled_pieces(render_diff(DIFF_OF.format("x")))
+    colour_of = {text: style.color.name for text, style in pieces if style.color}
+    assert colour_of["-old"] == "red" and colour_of["+new x"] == "green"
+    assert colour_of["@@ -1 +1 @@"] == "cyan"
+    # A line that begins with "--" inside a hunk is a removed line and not a file header.
+    inside = "--- a/f\n+++ b/f\n@@ -1 +1 @@\n--- a removed line\n+++ an added line\n"
+    pieces = styled_pieces(render_diff(inside))
+    colour_of = {text: style.color.name for text, style in pieces if style.color}
+    assert colour_of["--- a removed line"] == "red" and colour_of["+++ an added line"] == "green"
+
+
+async def test_the_preview_sets_a_real_escape_apart_from_the_text_that_spells_one(tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1\n")
+    shown = {}
+    for label, new in (("real", "x = '\x1b'"), ("spelled", "x = '\\x1b'")):
+        console, buffer = terminal_console(200)
+        ui = ConsoleUI(console, prompter=ScriptedPrompter("n"))
+        await ui.confirm(edit_call("a.py", "x = 1", new), write_request("Edit", str(target)), ASK)
+        shown[label] = buffer.getvalue()
+    assert "7" in sgr_parameters(shown["real"])  # reverse video
+    assert "7" not in sgr_parameters(shown["spelled"])
 
 
 def test_model_prose_is_rendered_as_markdown_and_not_as_markup():
@@ -374,18 +428,72 @@ async def test_a_confirmation_shows_a_bracketed_path_exactly(tmp_repo):
     assert "src/app/[id]/page.tsx" in screen.text
 
 
-async def test_a_confirmation_shows_the_escapes_in_a_path_literally():
-    # A carriage return or a screen clear inside a prompt can make a person believe they
-    # are approving something other than what runs. Not stripped (the person is not told
-    # what was removed) and not passed through: shown.
-    path = "/repo/a\x1b[2K\r.py"
-    console, buffer = terminal_console()
-    ui = ConsoleUI(console, prompter=ScriptedPrompter("n"))
-    call = edit_call(path, "x", "y")
-    await ui.confirm(call, write_request("Edit", path), ASK)
-    output = buffer.getvalue()
-    assert r"/repo/a\x1b[2K\r.py" in output
-    assert stray_escapes(output) == [] and "\r" not in output
+async def test_the_subject_line_of_a_confirmation_shows_every_control_by_name():
+    # The whole output, on a console that is not a terminal, for a call that has no preview:
+    # nothing else is printed that could hold the escapes in place of the subject line.
+    command = "echo a\x1b[2K\rb\tc\x7f\x9bd"
+    screen = Screen("n", width=200)
+    call = ToolUseBlock("t1", "Bash", {"command": command})
+    await screen.ui.confirm(call, PermissionRequest("Bash", command), ASK)
+    assert screen.text == "\nBash  echo a\\x1b[2K\\rb\\tc\\x7f\\x9bd\n"
+
+
+async def test_a_path_with_controls_in_it_is_named_on_the_subject_line_of_its_own_preview(tmp_repo):
+    # A real file, so the preview works and the "no preview" line is not what is matched.
+    target = tmp_repo / "a\x1b[2K\r.py"
+    target.write_text("x = 1\n")
+    screen = Screen("n", width=300)
+    call = edit_call("a.py", "x = 1", "x = 2")
+    await screen.ui.confirm(call, write_request("Edit", str(target)), ASK)
+    lines = screen.text.splitlines()
+    assert lines[1] == f"Edit  {tmp_repo}/a\\x1b[2K\\r.py"
+    assert lines[2] == "  called with a.py"
+    assert "no preview" not in screen.text and "-x = 1" in screen.text
+
+
+async def test_the_models_own_spelling_is_shown_by_name_beside_the_path_it_resolved_to(tmp_repo):
+    target = tmp_repo / "a.py"
+    target.write_text("x = 1\n")
+    screen = Screen("n", width=300)
+    call = edit_call("./a.py\r\x1b[2K", "x = 1", "x = 2")
+    await screen.ui.confirm(call, write_request("Edit", str(target)), ASK)
+    assert f"\nEdit  {target}\n  called with ./a.py\\r\\x1b[2K\n" in screen.text
+
+
+async def test_the_reason_a_preview_is_not_possible_shows_its_controls_by_name(tmp_repo):
+    missing = tmp_repo / "no\x1b[2Ksuch.py"
+    screen = Screen("n", width=300)
+    call = edit_call("x.py", "a", "b")
+    await screen.ui.confirm(call, write_request("Edit", str(missing)), ASK)
+    [reason] = [ln for ln in screen.text.splitlines() if ln.startswith("  no preview: ")]
+    assert "no\\x1b[2Ksuch.py" in reason
+
+
+async def test_the_tool_name_is_shown_by_name_in_the_line_the_header_and_the_question():
+    screen = Screen("n", width=200)
+    name = "Ba\x1bsh"
+    call = ToolUseBlock("t1", name, {"command": "make"})
+    screen.ui.on_decision(call, PermissionRequest(name, "make"), ALLOW)
+    await screen.ui.confirm(call, PermissionRequest(name, "make"), ASK)
+    assert screen.text == "Ba\\x1bsh make\n\nBa\\x1bsh  make\n"
+    assert "every Ba\\x1bsh call" in screen.prompter.asked[0]
+
+
+async def test_two_subjects_that_differ_by_an_invisible_character_do_not_print_alike():
+    subjects = [
+        "rm important.txt",
+        "rm important\N{ZERO WIDTH SPACE}.txt",
+        "rm\N{WORD JOINER} important.txt",
+        "rm important.txt\N{LEFT-TO-RIGHT MARK}",
+    ]
+    shown = []
+    for subject in subjects:
+        screen = Screen("n", width=200)
+        call = ToolUseBlock("t1", "Bash", {"command": subject})
+        await screen.ui.confirm(call, PermissionRequest("Bash", subject), ASK)
+        shown.append(screen.text)
+    assert len(set(shown)) == len(subjects)
+    assert all(not any(unicodedata.category(c) == "Cf" for c in text) for text in shown)
 
 
 async def test_an_edit_is_previewed_before_the_question_and_nothing_is_written(tmp_repo):
@@ -454,7 +562,8 @@ async def test_a_preview_shows_what_the_edit_would_write_with_its_controls_visib
     call = edit_call("a.py", "x = 1", "x = '\x1b[2J'")
     await ui.confirm(call, write_request("Edit", str(target)), ASK)
     output = buffer.getvalue()
-    assert r"\x1b[2J" in output and stray_escapes(output) == []
+    # The escape is styled apart from the text around it, so the styling is read out first.
+    assert r"\x1b[2J" in unstyled(output) and stray_escapes(output) == []
 
 
 async def test_the_confirmation_prompt_is_not_built_until_something_is_asked(monkeypatch):
@@ -554,6 +663,22 @@ async def test_outside_text_is_data_and_never_markup(hook):
     screen = Screen("n")
     await hook(screen.ui, MARKUP)
     assert MARKUP in screen.text
+
+
+@pytest.mark.parametrize("hostile", ESCAPES, ids=repr)
+async def test_a_tool_name_holding_controls_cannot_act_on_the_terminal(hostile):
+    # The name is the model's own text: it is in the collapsed line, the header and the
+    # question, and the question goes to the prompt as a string.
+    name = f"Ba{hostile}sh"
+    console, buffer = terminal_console(200)
+    prompter = ScriptedPrompter("n")
+    ui = ConsoleUI(console, prompter=prompter)
+    call = ToolUseBlock("t1", name, {"command": "make"})
+    ui.on_decision(call, PermissionRequest(name, "make"), ALLOW)
+    await ui.confirm(call, PermissionRequest(name, "make"), ASK)
+    assert stray_escapes(buffer.getvalue()) == []
+    [question] = prompter.asked
+    assert stray_escapes(question) == []
 
 
 @pytest.mark.parametrize("hostile", ESCAPES, ids=repr)

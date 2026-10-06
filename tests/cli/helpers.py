@@ -7,6 +7,7 @@ import re
 from collections.abc import Callable
 
 from rich.console import Console, RenderableType
+from rich.style import Style
 
 from nanoclaude.conversation.transcript import ToolUseBlock
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
@@ -52,6 +53,22 @@ _COLOUR_PARAMETER = re.compile(r"3[0-7]|4[0-7]|9[0-7]|10[0-7]|38|48")
 def stray_escapes(output: str) -> list[str]:
     """The controls in ``output`` that are not styling, each with what follows it."""
     return [output[m.start() : m.start() + 12] for m in _STRAY_ESCAPE.finditer(output)]
+
+
+def unstyled(output: str) -> str:
+    """``output`` without its styling sequences: the text a person reads."""
+    return _SGR.sub("", output)
+
+
+def sgr_parameters(output: str) -> set[str]:
+    """Every parameter of every styling sequence in ``output``: ``7`` is reverse video."""
+    return {p for m in _SGR.finditer(output) for p in m.group(1).split(";") if p}
+
+
+def styled_pieces(renderable: RenderableType, width: int = 100) -> list[tuple[str, Style]]:
+    """What a colour terminal would be sent for ``renderable``: each piece of text and its style."""
+    console, _ = terminal_console(width)
+    return [(segment.text, segment.style or Style()) for segment in console.render(renderable)]
 
 
 def colour_codes(output: str) -> list[str]:
