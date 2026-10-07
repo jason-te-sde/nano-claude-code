@@ -34,3 +34,14 @@ def _leave_the_real_terminal_echo_alone(monkeypatch: pytest.MonkeyPatch) -> None
     it directly, on a terminal of their own.
     """
     monkeypatch.setattr("nanoclaude.cli.render.silence_echo", lambda: lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def _a_terminal_that_can_move_the_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Whether Rich draws a live display on a terminal depends on ``TERM``.
+
+    ``dumb`` (an Emacs shell, some CI images) makes the consoles these tests call terminals
+    into terminals that cannot move the cursor, and nothing live is drawn on them. The test
+    of a dumb terminal says so itself.
+    """
+    monkeypatch.setenv("TERM", "xterm-256color")
