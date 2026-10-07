@@ -22,7 +22,7 @@ import asyncio
 import itertools
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,7 +63,7 @@ from nanoclaude.providers.capabilities import (
 from nanoclaude.providers.retry import RetryPolicy, classify_status
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, calls_many, cut_off, says
-from nanoclaude.testing.session import ScriptedSession, build_session
+from nanoclaude.testing.session import ScriptedClient, ScriptedSession, build_session
 from nanoclaude.tools.base import ToolContext, ToolOutcome
 
 #: A model id neither the capability table nor the price book has heard of. Its
@@ -3333,3 +3333,40 @@ async def test_a_stream_cut_off_after_only_blank_text_keeps_nothing(tmp_repo):
         await session.run("question")
     assert "kept" not in str(caught.value)
     assert [m.text() for m in session.state.transcript.messages] == ["question"]
+
+
+# --------------------------------------------------------------------------
+# A client written before streaming existed
+# --------------------------------------------------------------------------
+
+
+def as_written_before_streaming(
+    session_model: ScriptedClient,
+) -> Callable[[ModelRequest], Awaitable[ModelReply]]:
+    """``complete`` as a client wrote it when it took only the request."""
+    streaming_aware = session_model.complete
+
+    async def complete(request: ModelRequest) -> ModelReply:
+        return await streaming_aware(request)
+
+    return complete
+
+
+async def test_a_client_that_takes_only_the_request_still_serves_a_text_protocol_main_model(
+    tmp_repo, monkeypatch
+):
+    # That request is not streamed, so there is nothing to hand it the keyword for.
+    session = build_session(tmp_repo, [says("hello")], capabilities=TEXT_ONLY)
+    monkeypatch.setattr(session.model, "complete", as_written_before_streaming(session.model))
+    done = await session.run("hi")
+    assert (done.reason, done.text) == (StopReason.COMPLETED, "hello")
+
+
+async def test_a_client_that_takes_only_the_request_still_writes_the_summary(tmp_repo, monkeypatch):
+    session = build_session(tmp_repo, [says("answer")], compact_script=[says("SUMMARY")])
+    assert session.compact_model is not None
+    monkeypatch.setattr(
+        session.compact_model, "complete", as_written_before_streaming(session.compact_model)
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    assert await session.compact() is True

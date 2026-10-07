@@ -430,6 +430,10 @@ class Session:
         on_text = self.ui.on_text if stream else None
 
         async def once() -> ModelReply:
+            if on_text is None:
+                # Not handed to a client that was not asked to stream: one written to the
+                # signature that took only the request would fail on every request.
+                return await client.complete(request)
             return await client.complete(request, on_text=on_text)
 
         self.ui.on_request_start(role)
