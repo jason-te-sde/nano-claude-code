@@ -319,10 +319,10 @@ class _Arriving:
     def __init__(self) -> None:
         self._pieces: list[str] = []
         self._settled = False
-        # The reply as lines, for the pieces and the console size it was laid out for. A frame
+        # The reply as lines, for the pieces and the console width it was laid out for. A frame
         # with nothing new in it, at the size of the one before, does no Markdown work: laying
         # out 40 KB takes 70 ms, which is longer than the tenth of a second between frames.
-        self._laid_out: tuple[tuple[int, int, int], list[list[Segment]]] | None = None
+        self._laid_out: tuple[tuple[int, int], list[list[Segment]]] | None = None
 
     def add(self, piece: str) -> None:
         self._pieces.append(piece)
@@ -336,7 +336,7 @@ class _Arriving:
 
     def _lines(self, console: Console, options: ConsoleOptions) -> list[list[Segment]]:
         pieces = tuple(self._pieces)  # one snapshot, so that the key and the text agree
-        key = (len(pieces), options.max_width, options.max_height)
+        key = (len(pieces), options.max_width)  # the height is not part of a layout
         laid_out = self._laid_out
         if laid_out is None or laid_out[0] != key:
             drawn = render_markdown("".join(pieces).strip())

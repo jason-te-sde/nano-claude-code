@@ -2172,6 +2172,9 @@ def test_a_frame_with_nothing_new_in_it_does_no_markdown_work(monkeypatch):
     arriving.settle()
     console.print(arriving)  # the last frame, with the same text at the same size
     assert len(drawn) == 2
+    taller, _ = terminal_console(60, height=40, no_color=False)
+    taller.print(arriving)
+    assert len(drawn) == 2  # the height of the screen is not part of the layout
     narrow, _ = terminal_console(30, height=20, no_color=False)
     narrow.print(arriving)
     assert len(drawn) == 3  # another width is another layout
