@@ -24,6 +24,7 @@ from nanoclaude.providers.anthropic import (
     iter_sse,
 )
 from nanoclaude.providers.base import (
+    CredentialsError,
     ModelClient,
     ModelError,
     ModelReply,
@@ -340,7 +341,7 @@ def test_the_request_prefix_is_byte_stable_across_turns():
 def test_a_missing_api_key_names_the_adapter_and_the_fix():
     """Spec section 17.9, verbatim -- the exact wording and the em-dash both
     matter here, so this checks equality rather than a substring."""
-    with pytest.raises(ModelError) as excinfo:
+    with pytest.raises(CredentialsError) as excinfo:
         AnthropicClient("")
     assert str(excinfo.value) == (
         'no API key for adapter "anthropic" — set ANTHROPIC_API_KEY or run: ncc init'
@@ -381,8 +382,9 @@ async def test_an_http_error_is_classified_not_swallowed():
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as http:
         client = AnthropicClient("bad", client=http)
-        with pytest.raises(ModelError, match="ncc init"):
+        with pytest.raises(CredentialsError, match="ncc init") as excinfo:
             await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 10))
+    assert excinfo.value.status == 401 and not excinfo.value.retryable
 
 
 async def test_a_timeout_is_classified_as_retryable():

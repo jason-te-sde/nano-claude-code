@@ -21,7 +21,7 @@ from typing import TypeVar
 
 import httpx
 
-from nanoclaude.providers.base import ModelError, ModelReply
+from nanoclaude.providers.base import CredentialsError, ModelError, ModelReply
 
 T = TypeVar("T")
 
@@ -84,10 +84,9 @@ def _reports_overflow(body: str) -> bool:
 def classify_status(status: int, body: str) -> ModelError:
     detail = _message_from(body)
     if status in (401, 403):
-        return ModelError(
+        return CredentialsError(
             f"the provider rejected your credentials (HTTP {status}): {detail} — "
             "check the key, or run: ncc init",
-            retryable=False,
             status=status,
         )
     if status == 404:

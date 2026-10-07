@@ -30,6 +30,7 @@ from nanoclaude.conversation.transcript import (
     Transcript,
 )
 from nanoclaude.providers.base import (
+    CredentialsError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -269,9 +270,8 @@ class OpenAICompatClient:
         # config says which variable holds its key (spec 17.6, api_key_env), so
         # telling an OpenRouter user to set OPENAI_API_KEY would be wrong.
         if not api_key:
-            raise ModelError(
-                f'no API key for adapter "openai_compat" — set {api_key_env} or run: ncc init',
-                retryable=False,
+            raise CredentialsError(
+                f'no API key for adapter "openai_compat" — set {api_key_env} or run: ncc init'
             )
         self._model = model
         self._owns_client = client is None

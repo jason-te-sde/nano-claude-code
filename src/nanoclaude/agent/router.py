@@ -29,7 +29,7 @@ from nanoclaude.config.load import check_model, check_roles
 from nanoclaude.config.schema import ROLES, Config, ModelConfig, check_role
 from nanoclaude.providers.anthropic import DEFAULT_BASE_URL as ANTHROPIC_BASE_URL
 from nanoclaude.providers.anthropic import AnthropicClient
-from nanoclaude.providers.base import ModelClient, ModelError, Usage
+from nanoclaude.providers.base import CredentialsError, ModelClient, Usage
 from nanoclaude.providers.capabilities import (
     Capabilities,
     CapabilityCache,
@@ -118,10 +118,9 @@ class Router:
             # The adapter's own message names ANTHROPIC_API_KEY whatever the config
             # says, and cannot name the role. This one names both.
             if not key:
-                raise ModelError(
+                raise CredentialsError(
                     f"role {role!r} uses model {alias!r}, which needs {variable} "
-                    "— set it, or run: ncc init",
-                    retryable=False,
+                    "— set it, or run: ncc init"
                 )
             return AnthropicClient(
                 key, model=entry.model, base_url=entry.base_url or ANTHROPIC_BASE_URL

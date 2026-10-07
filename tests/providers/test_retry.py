@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from nanoclaude.conversation.transcript import TextBlock
-from nanoclaude.providers.base import ModelError, ModelReply, StopKind, Usage
+from nanoclaude.providers.base import CredentialsError, ModelError, ModelReply, StopKind, Usage
 from nanoclaude.providers.retry import (
     RetryPolicy,
     classify_status,
@@ -44,6 +44,22 @@ def test_a_credentials_error_points_at_the_fix():
     error = classify_status(401, '{"error":{"message":"invalid x-api-key"}}')
     assert "ncc init" in str(error)
     assert not error.retryable
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_key_is_a_credentials_error_with_its_status(status):
+    error = classify_status(status, '{"error":{"message":"invalid x-api-key"}}')
+    assert isinstance(error, CredentialsError)
+    assert error.status == status
+    assert str(error) == (
+        f"the provider rejected your credentials (HTTP {status}): invalid x-api-key "
+        "\u2014 check the key, or run: ncc init"
+    )
+
+
+@pytest.mark.parametrize("status", [400, 404, 408, 422, 429, 500, 529])
+def test_no_other_status_is_a_credentials_error(status):
+    assert type(classify_status(status, "body")) is ModelError
 
 
 def test_a_bad_request_passes_the_providers_own_message_through():
