@@ -39,7 +39,7 @@ from nanoclaude.providers.base import (
     new_call_id,
     partial_reply,
 )
-from nanoclaude.providers.retry import classify_status, classify_transport
+from nanoclaude.providers.retry import classify_status, classify_stream_error
 
 _FINISH = {
     "stop": StopKind.END_TURN,
@@ -325,6 +325,9 @@ class OpenAICompatClient:
                         accumulator.end()
                     elif payload:
                         accumulator.handle(json.loads(payload))
-        except httpx.TransportError as exc:
-            raise classify_transport(exc, accumulator.partial()) from exc
+        except (httpx.RequestError, ValueError) as exc:
+            failure = classify_stream_error(exc, accumulator.partial())
+            if failure is None:
+                raise
+            raise failure from exc
         return accumulator.result()

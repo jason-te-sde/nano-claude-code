@@ -989,3 +989,33 @@ async def test_reasoning_alone_with_no_end_marker_is_not_a_reply():
         await complete_from(arriving(seen))
     assert caught.value.retryable is False
     assert caught.value.partial is None  # nothing a person could have read
+
+
+# -- a stream that cannot be read is a stream that broke, not only one that dropped --
+
+
+async def test_a_body_that_cannot_be_decoded_after_text_keeps_what_arrived():
+    seen = payloads_of("openai_text.jsonl")[:2]  # the opening chunk, "hel"
+    with pytest.raises(ModelError, match="bad gzip") as caught:
+        await complete_from(arriving(seen, then=httpx.DecodingError("bad gzip data")))
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(), "gpt-5"
+    )
+
+
+async def test_a_line_that_is_not_json_after_text_keeps_what_arrived():
+    seen = wire(payloads_of("openai_text.jsonl")[:2])
+    response = httpx.Response(200, content=seen + b"data: {not json\n\n")
+    with pytest.raises(ModelError, match="could not be read") as caught:
+        await complete_from(response)
+    assert caught.value.retryable is False
+    assert caught.value.partial is not None
+    assert caught.value.partial.blocks == (TextBlock("hel"),)
+
+
+async def test_a_body_that_cannot_be_read_before_anything_arrived_raises_as_it_always_did():
+    with pytest.raises(httpx.DecodingError):
+        await complete_from(arriving([], then=httpx.DecodingError("bad gzip")))
+    with pytest.raises(json.JSONDecodeError):
+        await complete_from(httpx.Response(200, content=b"data: {oops\n\n"))

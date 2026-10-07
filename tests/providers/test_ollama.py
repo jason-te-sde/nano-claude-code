@@ -683,3 +683,33 @@ async def test_a_stream_that_ends_before_anything_arrived_is_still_no_content():
     with pytest.raises(ModelError, match="no content") as caught:
         await complete_from(arriving([]))
     assert caught.value.partial is None
+
+
+# -- a stream that cannot be read is a stream that broke, not only one that dropped --
+
+
+async def test_a_body_that_cannot_be_decoded_after_text_keeps_what_arrived():
+    seen = lines_of("ollama_text.jsonl")[:1]
+    with pytest.raises(ModelError, match="bad gzip") as caught:
+        await complete_from(arriving(seen, then=httpx.DecodingError("bad gzip data")))
+    assert caught.value.retryable is False
+    assert "ollama serve" not in str(caught.value)
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b"
+    )
+
+
+async def test_a_line_that_is_not_json_after_text_keeps_what_arrived():
+    seen = lines_of("ollama_text.jsonl")[:1]
+    with pytest.raises(ModelError, match="could not be read") as caught:
+        await complete_from(arriving([*seen, "{not json"]))
+    assert caught.value.retryable is False
+    assert caught.value.partial is not None
+    assert caught.value.partial.blocks == (TextBlock("hel"),)
+
+
+async def test_a_body_that_cannot_be_read_before_anything_arrived_raises_as_it_always_did():
+    with pytest.raises(httpx.DecodingError):
+        await complete_from(arriving([], then=httpx.DecodingError("bad gzip")))
+    with pytest.raises(json.JSONDecodeError):
+        await complete_from(arriving(["{oops"]))

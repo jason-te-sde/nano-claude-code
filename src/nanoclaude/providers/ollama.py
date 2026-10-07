@@ -42,7 +42,7 @@ from nanoclaude.providers.base import (
     partial_reply,
 )
 from nanoclaude.providers.capabilities import CONSERVATIVE_DEFAULT, Capabilities
-from nanoclaude.providers.retry import classify_status, connection_lost
+from nanoclaude.providers.retry import classify_status, connection_lost, unreadable_stream
 
 DEFAULT_BASE_URL = "http://localhost:11434"
 
@@ -201,6 +201,13 @@ class OllamaClient:
                 f"could not reach ollama at {self._base_url}: {exc} — start it with: ollama serve",
                 retryable=False,
             ) from exc
+        except (httpx.RequestError, ValueError) as exc:
+            # The body did not decode, or a line was not JSON. Some of the reply had arrived
+            # or it had not: kept and not asked again, or raised as it always was.
+            if not (text or calls):
+                raise
+            partial = partial_reply(["".join(text)], usage, self._model)
+            raise unreadable_stream(exc, partial, peer="ollama") from exc
 
         if (text or calls) and not done:
             # The stream closed without the line that says the reply is whole (spec 7.4:

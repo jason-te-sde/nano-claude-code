@@ -142,6 +142,36 @@ def classify_transport(exc: httpx.TransportError, partial: ModelReply | None) ->
     return ModelError(f"could not reach the provider: {exc}", retryable=True)
 
 
+def unreadable_stream(
+    exc: BaseException, partial: ModelReply, *, peer: str = "the provider"
+) -> ModelError:
+    """Spec 7.4 for a stream that arrived and could not be read: keep what came before.
+
+    A body that does not decode, a line that is not JSON: the connection did not fail, and
+    nothing is wrong with asking, but a reply that was being shown and was never finished
+    is the same case as one whose connection dropped, and is treated the same way.
+    """
+    return ModelError(
+        f"the response from {peer} could not be read: {describe(exc)}",
+        retryable=False,
+        partial=partial,
+    )
+
+
+def classify_stream_error(exc: Exception, partial: ModelReply | None) -> ModelError | None:
+    """What a failure inside a stream's loop means, or None to raise it as it came.
+
+    A connection that failed is :func:`classify_transport`. Anything else the loop raised
+    (httpx.DecodingError, a line that is not JSON, any other ValueError) is kept as a
+    cut-off once some of the reply has arrived, and before that is left as it always was.
+    """
+    if isinstance(exc, httpx.TransportError):
+        return classify_transport(exc, partial)
+    if partial is None:
+        return None
+    return unreadable_stream(exc, partial)
+
+
 async def with_retry(
     operation: Callable[[], Awaitable[T]],
     *,

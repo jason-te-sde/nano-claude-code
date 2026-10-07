@@ -817,3 +817,52 @@ def test_thinking_alone_with_no_message_stop_is_not_a_reply():
     accumulator.handle("content_block_stop", {"index": 0})
     with pytest.raises(ModelError, match="incomplete"):
         accumulator.result()
+
+
+# -- a stream that cannot be read is a stream that broke, not only one that dropped --
+
+
+def raw_response(*parts: bytes) -> httpx.Response:
+    return httpx.Response(
+        200, content=b"".join(parts), headers={"content-type": "text/event-stream"}
+    )
+
+
+async def test_a_body_that_cannot_be_decoded_after_text_keeps_what_arrived():
+    seen = events_of("anthropic_text.jsonl")[:3]  # message_start, the block, "Hello! "
+    with pytest.raises(ModelError, match="bad gzip") as caught:
+        await complete_from(arriving(seen, then=httpx.DecodingError("bad gzip data")))
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("Hello! "),), StopKind.CUT_OFF, Usage(15, 0), "claude-sonnet-5"
+    )
+
+
+async def test_an_event_that_is_not_json_after_text_keeps_what_arrived():
+    seen = wire(events_of("anthropic_text.jsonl")[:3])
+    broken = b"event: content_block_delta\ndata: {not json\n\n"
+    with pytest.raises(ModelError, match="could not be read") as caught:
+        await complete_from(raw_response(seen, broken))
+    assert caught.value.retryable is False
+    assert caught.value.partial is not None
+    assert caught.value.partial.blocks == (TextBlock("Hello! "),)
+
+
+async def test_a_value_the_stream_cannot_be_read_with_after_text_keeps_what_arrived():
+    seen = wire(events_of("anthropic_text.jsonl")[:3])
+    odd = wire([{"event": "content_block_delta", "data": {"index": "two", "delta": {}}}])
+    with pytest.raises(ModelError, match="could not be read") as caught:
+        await complete_from(raw_response(seen, odd))
+    assert caught.value.partial is not None
+    assert caught.value.partial.blocks == (TextBlock("Hello! "),)
+
+
+async def test_a_body_that_cannot_be_read_before_anything_arrived_raises_as_it_always_did():
+    with pytest.raises(httpx.DecodingError):
+        await complete_from(
+            arriving(events_of("anthropic_text.jsonl")[:1], then=httpx.DecodingError("bad gzip"))
+        )
+    with pytest.raises(json.JSONDecodeError):
+        await complete_from(
+            raw_response(wire(events_of("anthropic_text.jsonl")[:1]), b"event: x\ndata: {oops\n\n")
+        )

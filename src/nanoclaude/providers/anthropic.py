@@ -37,7 +37,7 @@ from nanoclaude.providers.base import (
     Usage,
     partial_reply,
 )
-from nanoclaude.providers.retry import classify_status, classify_transport
+from nanoclaude.providers.retry import classify_status, classify_stream_error
 
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -338,6 +338,9 @@ class AnthropicClient:
                     raise classify_status(response.status_code, body)
                 async for event, data in iter_sse(response.aiter_lines()):
                     accumulator.handle(event, data)
-        except httpx.TransportError as exc:
-            raise classify_transport(exc, accumulator.partial()) from exc
+        except (httpx.RequestError, ValueError) as exc:
+            failure = classify_stream_error(exc, accumulator.partial())
+            if failure is None:
+                raise
+            raise failure from exc
         return accumulator.result()
