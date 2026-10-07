@@ -8,10 +8,12 @@ wrong means a confusing failure several turns into someone's first session.
 
 Two divergences from a naive reading of the wire format, both load-bearing:
 ``function.arguments`` is documented as an object and some templates emit a
-JSON string instead, so both are accepted; and a stream that is cut off after
-announcing a tool call but before its final ``"done": true`` line must not
-hand that call to the executor; the tool may already have run partially, so
-retrying is also wrong.
+JSON string instead, so both are accepted; and the final ``"done": true`` line is
+the only thing that says a reply is whole. A stream that ends without it, or that
+carries an ``{"error": ...}`` line (the server reports a runner that died that way,
+and then closes the stream cleanly), was interrupted midway (spec 7.4). What arrived
+of its text is kept, its calls are dropped, since the tool may already have run
+partially, and nothing is asked again.
 """
 
 from __future__ import annotations
@@ -155,6 +157,19 @@ class OllamaClient:
                         # line must become a ModelError, not an AttributeError
                         # from calling .get() on a list or a string below.
                         raise ModelError(f"ollama sent an unexpected stream chunk: {chunk!r}")
+                    if chunk.get("error"):
+                        # The server's own report that the reply will not be finished, on a
+                        # line of its own and followed by a clean close. Spec 7.4: whatever
+                        # arrived is kept, and the reason is the server's, not ours.
+                        raise ModelError(
+                            f"ollama reported an error: {chunk['error']}",
+                            retryable=False,
+                            partial=(
+                                partial_reply(["".join(text)], usage, self._model)
+                                if text or calls
+                                else None
+                            ),
+                        )
                     message = chunk.get("message") or {}
                     if message.get("content"):
                         text.append(message["content"])
@@ -187,16 +202,17 @@ class OllamaClient:
                 retryable=False,
             ) from exc
 
-        if calls and not done:
-            # The stream ended (cleanly, from the client's point of view) after
-            # announcing a call but before the line that would have confirmed
-            # it was the whole story. Handing it over anyway risks running a
-            # tool on arguments the model never finished sending; retrying is
-            # also wrong, since an earlier call in the same turn may already
-            # have run. Text-only output is not held to this: a dropped
-            # connection after plain prose is just a shorter reply.
+        if (text or calls) and not done:
+            # The stream closed without the line that says the reply is whole (spec 7.4:
+            # interrupted midway, whatever the cause). Handing a call over anyway risks
+            # running a tool on arguments the model never finished sending, and asking
+            # again is wrong too, since an earlier call in the same turn may already have
+            # run. Plain prose is held to the same rule: a reply that stops in the middle
+            # of a sentence is not a shorter reply, it is a reply that was cut off, and
+            # the person has to be told so.
+            what = "its tool calls were" if calls else "its reply was"
             raise ModelError(
-                "the response stream ended before its tool calls were complete; the turn "
+                f"the response stream ended before {what} complete; the turn "
                 "may have partially executed, so it is not retried automatically",
                 retryable=False,
                 partial=partial_reply(["".join(text)], usage, self._model),

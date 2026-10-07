@@ -441,21 +441,6 @@ async def test_an_unfinished_stream_with_a_pending_tool_call_is_a_non_retryable_
     assert excinfo.value.retryable is False
 
 
-async def test_a_text_only_reply_without_a_final_done_is_still_accepted():
-    # The other half of the check above: a dropped connection after plain
-    # prose is just a shorter reply, not a usable-error condition.
-    def handler(request: httpx.Request) -> httpx.Response:
-        return stream_response([{"message": {"content": "hi"}}])
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        reply = await OllamaClient(model="m", client=http).complete(
-            ModelRequest("s", Transcript((user_text("hi"),)), (), 64)
-        )
-    assert isinstance(reply.blocks[0], TextBlock)
-    assert reply.blocks[0].text == "hi"
-    assert reply.stop is StopKind.END_TURN
-
-
 async def test_a_non_object_stream_chunk_is_a_model_error_not_a_crash():
     # Review focus #3: valid JSON need not be an object. A bare string or list
     # on the wire must become a ModelError, not an AttributeError from
@@ -645,3 +630,56 @@ async def test_a_stream_that_ends_cleanly_after_a_tool_call_still_hands_over_the
     assert caught.value.partial == ModelReply(
         (TextBlock("I'll read that file."),), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b"
     )
+
+
+# -- a stream that was interrupted midway (spec 7.4) -------------------------------
+
+#: What ollama sends in the middle of a stream when the runner behind it dies.
+RUNNER_DIED = json.dumps({"error": "llama runner process has terminated"})
+
+
+async def test_an_error_line_after_text_is_not_retried_and_hands_over_what_arrived():
+    # The server reports the failure on a line of its own and closes the stream cleanly,
+    # so no connection error is raised: what arrived must not be returned as a reply.
+    seen = [*lines_of("ollama_text.jsonl")[:1], RUNNER_DIED]  # "hel", then the error
+    pieces: list[str] = []
+    with pytest.raises(ModelError, match="llama runner process has terminated") as caught:
+        await complete_from(arriving(seen), on_text=pieces.append)
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b"
+    )
+    assert pieces == ["hel"]
+
+
+async def test_an_error_line_before_any_text_carries_the_providers_message():
+    # It used to come back as "ollama returned no content", and the reason was lost.
+    with pytest.raises(ModelError, match="llama runner process has terminated") as caught:
+        await complete_from(arriving([RUNNER_DIED]))
+    assert caught.value.retryable is False
+    assert caught.value.partial is None
+
+
+async def test_an_error_line_after_a_tool_call_is_not_retried_either():
+    seen = [lines_of("ollama_tool_use.jsonl")[1], RUNNER_DIED]  # a call, and no text
+    with pytest.raises(ModelError, match="llama runner process has terminated") as caught:
+        await complete_from(arriving(seen))
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply((), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b")
+
+
+async def test_a_stream_that_ends_after_text_without_its_done_line_was_cut_off():
+    # A clean close, as a proxy or a restarting server makes: the end marker never came.
+    seen = lines_of("ollama_text.jsonl")[:1]
+    with pytest.raises(ModelError, match="complete") as caught:
+        await complete_from(arriving(seen))
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b"
+    )
+
+
+async def test_a_stream_that_ends_before_anything_arrived_is_still_no_content():
+    with pytest.raises(ModelError, match="no content") as caught:
+        await complete_from(arriving([]))
+    assert caught.value.partial is None
