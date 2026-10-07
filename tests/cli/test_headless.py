@@ -25,7 +25,7 @@ from nanoclaude.conversation.store import Store
 from nanoclaude.conversation.transcript import TextBlock
 from nanoclaude.providers.base import ModelError, ModelReply, StopKind, Usage
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
-from nanoclaude.testing.scripted import cut_off, says
+from nanoclaude.testing.scripted import calls, cut_off, says
 from nanoclaude.testing.session import ScriptedClient
 from tests.cli.helpers import run_ncc
 
@@ -470,3 +470,32 @@ def test_ncc_keeps_its_files_in_the_home_directory_unless_told_to_use_another(
 )
 def test_a_message_becomes_what_happened_a_dash_and_what_to_do(message, line):
     assert ncc_main._with_advice(message, "try again") == line
+
+
+def test_the_error_console_prints_what_it_is_given_as_it_is(capsys, monkeypatch):
+    # Belt and braces under show_error, which prints Text: anything else ncc ever prints to
+    # stderr as a string is still not markup, not an emoji code, not coloured and not wrapped.
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    console = ncc_main._stderr_console(build_parser().parse_args(["-p", "x"]))
+    line = "[bold]a[/] :smile: arr[0] 3.14 https://x.y/z " + "w" * 200
+    console.print(line)
+    assert capsys.readouterr().err == line + "\n"
+
+
+def test_a_turn_is_a_round_of_tools_and_a_prompt_answered_at_once_took_none(
+    ncc_home, project, serve, capsys
+):
+    # What /status shows and --max-turns counts.
+    (project / "a.txt").write_text("x\n")
+    serve(
+        m=[
+            says("at once"),
+            calls("Read", {"path": "a.txt"}, call_id="r1"),
+            says("after reading"),
+        ]
+    )
+    _, out, _ = run_ncc(capsys, "--root", str(project), "-p", "a", "--output-format", "json")
+    assert json.loads(out)["turns"] == 0
+    _, out, _ = run_ncc(capsys, "--root", str(project), "-p", "b", "--output-format", "json")
+    assert json.loads(out)["turns"] == 1
