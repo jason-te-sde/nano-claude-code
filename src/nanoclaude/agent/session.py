@@ -60,6 +60,7 @@ from nanoclaude.providers.base import (
     ToolSpec,
     Usage,
     new_call_id,
+    partial_reply,
 )
 from nanoclaude.providers.capabilities import Capabilities
 from nanoclaude.providers.retry import RetryPolicy, with_retry
@@ -427,14 +428,32 @@ class Session:
         text of the reply goes to the UI as it arrives.
         """
         client = await self.router.client_for(role)
-        on_text = self.ui.on_text if stream else None
+        streamed: list[str] = []
+
+        def hand_on(piece: str) -> None:
+            streamed.append(piece)
+            self.ui.on_text(piece)
 
         async def once() -> ModelReply:
-            if on_text is None:
+            if not stream:
                 # Not handed to a client that was not asked to stream: one written to the
                 # signature that took only the request would fail on every request.
                 return await client.complete(request)
-            return await client.complete(request, on_text=on_text)
+            try:
+                return await client.complete(request, on_text=hand_on)
+            except ModelError as error:
+                if not (error.retryable and streamed):
+                    raise
+                # Whatever the client thinks of it, the person has read these words: asked
+                # again, the reply would be written from its first word, below them (spec
+                # 7.4). The adapters make this error themselves, and this is for the ones
+                # that let a retryable one through after text.
+                raise ModelError(
+                    str(error),
+                    retryable=False,
+                    status=error.status,
+                    partial=partial_reply(["".join(streamed)], Usage(), client.model_id),
+                ) from error
 
         self.ui.on_request_start(role)
         try:

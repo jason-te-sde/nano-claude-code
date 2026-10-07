@@ -3370,3 +3370,64 @@ async def test_a_client_that_takes_only_the_request_still_writes_the_summary(tmp
     )
     session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
     assert await session.compact() is True
+
+
+# --------------------------------------------------------------------------
+# A retry never reprints text, whatever the client let escape
+# --------------------------------------------------------------------------
+
+
+async def test_a_retryable_error_after_text_was_streamed_is_a_cut_off_and_not_a_retry(
+    tmp_repo, monkeypatch
+):
+    # A client that streams "Hello wor" and then raises an error that says it may be asked
+    # again: asked again, it would write the reply from its first word, below the first half.
+    stage = Stage()
+    session = build_session(tmp_repo, [says("Hello world")], ui=stage)
+    asked = 0
+
+    async def streams_then_is_overloaded(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
+        nonlocal asked
+        asked += 1
+        assert on_text is not None
+        on_text("Hello wor")
+        raise ModelError("provider busy (HTTP 529)", retryable=True, status=529)
+
+    monkeypatch.setattr(session.model, "complete", streams_then_is_overloaded)
+    with pytest.raises(ModelError) as caught:
+        await session.run("hi")
+    assert asked == 1 and not session.model.exhausted  # it was never asked again
+    assert caught.value.retryable is False
+    assert str(caught.value) == (
+        "the reply was cut off (provider busy (HTTP 529)) \u2014 what arrived is kept; "
+        "ask the model to continue"
+    )
+    assert streamed(stage) == "Hello wor"  # on the screen once, and not again
+    assert "retry" not in kinds(stage)
+    assert [m.text() for m in session.state.transcript.messages] == [
+        "hi",
+        "Hello wor\n\n[this reply was cut off before it finished]",
+    ]
+
+
+async def test_a_retryable_error_before_any_text_is_still_retried(tmp_repo, monkeypatch):
+    stage = Stage()
+    session = build_session(tmp_repo, [says("Hello world")], ui=stage)
+    real = session.model.complete
+    asked = 0
+
+    async def is_overloaded_first(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
+        nonlocal asked
+        asked += 1
+        if asked == 1:
+            raise ModelError("provider busy (HTTP 529)", retryable=True, status=529)
+        return await real(request, on_text=on_text)
+
+    monkeypatch.setattr(session.model, "complete", is_overloaded_first)
+    done = await session.run("hi")
+    assert (asked, done.text) == (2, "Hello world")
+    assert streamed(stage) == "Hello world"
