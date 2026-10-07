@@ -293,6 +293,59 @@ def test_a_link_in_model_prose_shows_where_it_goes():
     assert "the docs" in text and "https://example.org/x" in text
 
 
+def test_an_image_in_model_prose_shows_where_it_points():
+    # Rich draws an image as a placeholder and its description, and the address is the one
+    # thing a person needs to decide whether to go and look at it.
+    text = capture(render_markdown("see ![a diagram](http://host/x.png) here"))
+    assert "a diagram" in text and "http://host/x.png" in text
+
+
+def test_an_image_with_no_description_shows_its_address_alone():
+    text = capture(render_markdown("![](http://host/x.png)"))
+    assert "http://host/x.png" in text
+
+
+def test_raw_html_in_model_prose_is_shown_as_it_was_written():
+    # Rich drops it, and a reply made of a tag, or the tag that is the point of it, prints as
+    # nothing.
+    text = capture(render_markdown("<script>alert(1)</script> <b>x</b>"))
+    assert "<script>alert(1)</script>" in text and "<b>x</b>" in text
+
+
+def test_a_block_of_raw_html_in_model_prose_is_shown_as_it_was_written():
+    text = capture(render_markdown("<div>\nhello\n</div>\n\nafter"))
+    assert "<div>" in text and "hello" in text and "</div>" in text and "after" in text
+
+
+def test_code_that_holds_html_is_shown_as_it_always_was():
+    text = capture(render_markdown("use `<b>` or:\n\n```html\n<b>x</b>\n```"))
+    assert "<b>" in text and "<b>x</b>" in text
+    assert "&lt;" not in text  # nothing is escaped on the way in
+
+
+def test_an_autolink_still_shows_its_address():
+    assert "http://example.org/a" in capture(render_markdown("<http://example.org/a>"))
+
+
+@pytest.mark.parametrize(
+    ("markdown", "shown"),
+    [
+        ("![a diagram](http://host/x.png)", "http://host/x.png"),
+        ("<script>alert(1)</script> <b>x</b>", "<script>alert(1)</script> <b>x</b>"),
+    ],
+)
+def test_neither_an_image_nor_html_goes_missing_from_a_reply_or_from_streamed_text(markdown, shown):
+    screen = Screen()
+    screen.ui.on_reply(reply(markdown))
+    assert shown in "\n".join(rows(screen.text))
+    streamed_to = Screen()
+    streamed_to.ui.on_request_start("main")
+    streamed_to.ui.on_text(markdown[:7])
+    streamed_to.ui.on_text(markdown[7:])
+    streamed_to.ui.on_request_end()
+    assert shown in "\n".join(rows(streamed_to.text))
+
+
 # --------------------------------------------------------------------------
 # What a decision looks like
 # --------------------------------------------------------------------------

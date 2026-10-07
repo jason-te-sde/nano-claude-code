@@ -45,10 +45,12 @@ import re
 import unicodedata
 from collections.abc import Callable
 from pathlib import PurePosixPath
+from typing import ClassVar
 
+from markdown_it import MarkdownIt
 from rich.console import Console, ConsoleOptions, RenderableType, RenderResult
 from rich.live import Live
-from rich.markdown import Markdown
+from rich.markdown import ImageItem, Markdown, MarkdownElement
 from rich.segment import Segment
 from rich.spinner import Spinner
 from rich.table import Table
@@ -248,10 +250,50 @@ def render_diff(diff: str) -> RenderableType:
     return Text("\n").join(drawn)
 
 
+class _ImageWithItsAddress(ImageItem):
+    """An image as text: that it is one, what it is said to show, and where it points.
+
+    Rich draws a placeholder and the description, and with hyperlinks off nothing says where
+    the image is. A link shows its address, and an image, which a terminal cannot show, is
+    no less in need of one.
+    """
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        described = self.text.plain.strip()
+        yield Text(
+            f"image: {described} ({self.destination})"
+            if described
+            else f"image: {self.destination}",
+            end="",
+        )
+
+
+class _ModelMarkdown(Markdown):
+    """Markdown as a model writes it, shown as it was written.
+
+    Two things Rich leaves out are put back. HTML is text here, parsed as text and drawn
+    as it was typed: Rich draws no HTML at all, so a reply that is a tag, or whose point is
+    one, would print as nothing. An image shows its address (see
+    :class:`_ImageWithItsAddress`). Code is as it was: nothing in it is HTML, and nothing in
+    it is escaped.
+    """
+
+    elements: ClassVar[dict[str, type[MarkdownElement]]] = {
+        **Markdown.elements,
+        "image": _ImageWithItsAddress,
+    }
+
+    def __init__(self, markup: str) -> None:
+        super().__init__("", hyperlinks=False)
+        self.markup = markup
+        parser = MarkdownIt("commonmark", {"html": False}).enable("strikethrough").enable("table")
+        self.parsed = parser.parse(markup)
+
+
 def render_markdown(text: str) -> RenderableType:
     # Hyperlinks off: a terminal link shows its label and hides where it goes, and the
     # label is the model's to choose. Without them the address is printed beside it.
-    return Markdown(sanitize(text), hyperlinks=False)
+    return _ModelMarkdown(sanitize(text))
 
 
 #: How often, at most, a reply that is arriving is drawn again. Drawn after every piece, a
