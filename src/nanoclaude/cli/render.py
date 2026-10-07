@@ -600,14 +600,23 @@ class ConsoleUI:
         model = self._model_of(role)
         return plain(f"waiting for {model}" + ("" if role == "main" else f" ({role})"), "dim")
 
+    def _spinner(self, role: str) -> Spinner:
+        """The indicator: braille dots where the terminal can write them, and ASCII where not.
+
+        Its first frame is the first thing a request writes, and a terminal whose encoding has
+        no braille would raise at once. The request would then fail with an encoding error
+        where, before there was an indicator, its reply came out in any encoding it could be
+        written in.
+        """
+        braille = self._console.encoding.startswith("utf")
+        return Spinner("dots" if braille else "line", text=self._waiting_for(role))
+
     def on_request_start(self, role: str) -> None:
         self.on_request_end()  # a request that never ended is over now
         self._streamed = False
         if self._animated():
             self._put_echo_back = self._silence()
-            self._waiting = self._display(
-                Spinner("dots", text=self._waiting_for(role)), transient=True
-            )
+            self._waiting = self._display(self._spinner(role), transient=True)
 
     def on_text(self, delta: str) -> None:
         if self._arriving is None:

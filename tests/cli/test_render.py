@@ -1866,12 +1866,16 @@ def test_a_dumb_terminal_gets_plain_output_as_well(monkeypatch):
     buffer = io.StringIO()
     console = Console(file=buffer, width=60, force_terminal=True, legacy_windows=False)
     assert console.is_dumb_terminal  # the premise: it cannot move the cursor
-    ui = ConsoleUI(console, prompter=ScriptedPrompter(), model_of=MODELS.__getitem__)
+    echo = Echo()
+    ui = ConsoleUI(
+        console, prompter=ScriptedPrompter(), model_of=MODELS.__getitem__, silence=echo.silence
+    )
     ui.on_request_start("main")
     ui.on_text("It was bold.")
     assert buffer.getvalue() == ""
     ui.on_request_end()
     assert rows(buffer.getvalue()) == ["It was bold."]
+    assert echo.silenced == 0  # nothing live was drawn, so there is no echo to silence
 
 
 def test_a_reply_that_did_not_stream_is_printed_by_on_reply_and_the_next_one_is_not_skipped():
@@ -1906,18 +1910,23 @@ def test_the_live_region_is_drawn_at_most_ten_times_a_second(display_for):
 def test_a_console_that_is_not_a_terminal_gets_no_live_region_even_where_colour_is_allowed():
     # The plain console of these tests is told NO_COLOR as well, so it cannot say which of
     # the two it is that keeps a live display away.
+    echo = Echo()
     buffer = io.StringIO()
     console = Console(
         file=buffer, width=60, force_terminal=False, no_color=False, legacy_windows=False
     )
     assert not console.is_terminal and not console.no_color  # the premise
-    ui = ConsoleUI(console, prompter=ScriptedPrompter(), model_of=MODELS.__getitem__)
+    ui = ConsoleUI(
+        console, prompter=ScriptedPrompter(), model_of=MODELS.__getitem__, silence=echo.silence
+    )
     ui.on_request_start("main")
     ui.on_text("It was bold.")
     assert buffer.getvalue() == ""
     ui.on_request_end()
-    assert rows(buffer.getvalue()) == ["It was bold."]
+    console.print("next")  # on a line of its own: a live display leaves its last line unfinished
+    assert rows(buffer.getvalue()) == ["It was bold.", "next"]
     assert "\x1b" not in buffer.getvalue()
+    assert echo.silenced == 0  # and there is nothing live for the echo to throw off
 
 
 def test_the_terminal_does_not_echo_what_is_typed_while_a_request_is_on_screen(display_for):
@@ -1966,3 +1975,20 @@ def test_a_console_that_draws_nothing_live_leaves_the_echo_alone():
     ui.on_text("It was bold.")
     ui.on_request_end()
     assert echo.silenced == 0  # there is no display to be thrown off by it
+
+
+def test_the_indicator_is_drawn_in_ascii_on_a_terminal_that_cannot_show_braille():
+    # Its frames would not encode, and the request would fail with the error: before there
+    # was an indicator a reply came out in any encoding it could be written in.
+    raw = io.BytesIO()
+    file = io.TextIOWrapper(raw, encoding="latin-1", write_through=True)
+    console = Console(
+        file=file, width=60, force_terminal=True, no_color=False, legacy_windows=False
+    )
+    ui = ConsoleUI(
+        console, prompter=ScriptedPrompter(), model_of=MODELS.__getitem__, silence=Echo().silence
+    )
+    ui.on_request_start("main")  # must not raise UnicodeEncodeError
+    ui.on_text("Hello")
+    ui.on_request_end()
+    assert "waiting for claude-sonnet-5" in raw.getvalue().decode("latin-1")
