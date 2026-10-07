@@ -22,7 +22,7 @@ import asyncio
 import itertools
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +32,7 @@ import pytest
 
 from nanoclaude.agent.loop import StopReason
 from nanoclaude.agent.session import Session, new_session_id
-from nanoclaude.agent.ui import AutoApprove, AutoDecline
+from nanoclaude.agent.ui import Approval, AutoApprove, AutoDecline
 from nanoclaude.config.schema import LimitsConfig, ModelConfig, RolesConfig
 from nanoclaude.conversation.budget import (
     Budget,
@@ -62,7 +62,7 @@ from nanoclaude.providers.capabilities import (
 )
 from nanoclaude.providers.retry import RetryPolicy, classify_status
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
-from nanoclaude.testing.scripted import calls, calls_many, says
+from nanoclaude.testing.scripted import calls, calls_many, cut_off, says
 from nanoclaude.testing.session import ScriptedSession, build_session
 from nanoclaude.tools.base import ToolContext, ToolOutcome
 
@@ -1204,12 +1204,14 @@ async def test_the_store_holds_the_compacted_conversation_when_the_retry_is_sent
     comparisons: list[tuple[Transcript, Transcript]] = []
     real_complete = session.model.complete
 
-    async def spying_complete(request: ModelRequest) -> ModelReply:
+    async def spying_complete(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
         if not is_summary_request(request):
             assert session.store is not None
             stored = session.store.load_transcript(session.session_id)
             comparisons.append((stored, request.transcript))
-        return await real_complete(request)
+        return await real_complete(request, on_text=on_text)
 
     with monkeypatch.context() as local:
         local.setattr(session.model, "complete", spying_complete)
@@ -1519,7 +1521,9 @@ async def test_compacting_after_an_interrupted_turn_says_it_did_not_though_it_ad
     started = asyncio.Event()
     session = build_session(tmp_repo, [])
 
-    async def never_answers(request: ModelRequest) -> ModelReply:
+    async def never_answers(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
         started.set()
         await asyncio.Event().wait()
         raise AssertionError("the model was allowed to answer")
@@ -1759,12 +1763,14 @@ async def test_the_store_holds_what_the_model_is_shown_at_the_moment_it_is_shown
     comparisons: list[tuple[Transcript, Transcript]] = []
     real_complete = session.model.complete
 
-    async def spying_complete(request: ModelRequest) -> ModelReply:
+    async def spying_complete(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
         if not is_summary_request(request):
             assert session.store is not None
             stored = session.store.load_transcript(session.session_id)
             comparisons.append((stored, request.transcript))
-        return await real_complete(request)
+        return await real_complete(request, on_text=on_text)
 
     with monkeypatch.context() as local:
         local.setattr(session.model, "complete", spying_complete)
@@ -1784,11 +1790,13 @@ async def test_at_every_request_the_store_already_holds_what_is_being_sent(tmp_r
     comparisons: list[tuple[Transcript, Transcript]] = []
     real_complete = session.model.complete
 
-    async def spying_complete(request: ModelRequest) -> ModelReply:
+    async def spying_complete(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
         assert session.store is not None
         stored = session.store.load_transcript(session.session_id)
         comparisons.append((stored, request.transcript))
-        return await real_complete(request)
+        return await real_complete(request, on_text=on_text)
 
     with monkeypatch.context() as local:
         local.setattr(session.model, "complete", spying_complete)
@@ -1881,7 +1889,9 @@ async def test_cancelling_a_turn_while_the_model_is_answering_leaves_a_session_t
     started = asyncio.Event()
     session = build_session(tmp_repo, [says("an answer, this time")])
 
-    async def never_answers(request: ModelRequest) -> ModelReply:
+    async def never_answers(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
         started.set()
         await asyncio.Event().wait()
         raise AssertionError("the model was allowed to answer")
@@ -2770,11 +2780,13 @@ async def test_closing_after_a_cancelled_prompt_still_records_what_was_spent(tmp
     asked_again = asyncio.Event()
     answer = session.model.complete
 
-    async def stops_answering(request: ModelRequest) -> ModelReply:
+    async def stops_answering(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
         if session.model.requests:  # the first request was answered; this one never is
             asked_again.set()
             await asyncio.Event().wait()
-        return await answer(request)
+        return await answer(request, on_text=on_text)
 
     monkeypatch.setattr(session.model, "complete", stops_answering)
     task = asyncio.create_task(session.run("read it"))
@@ -3010,3 +3022,288 @@ async def test_the_store_is_closed_even_when_a_client_fails_to_close(tmp_repo, m
     assert session.store is not None
     with pytest.raises(RuntimeError, match="store is not open"):
         _ = session.store.db
+
+
+# --------------------------------------------------------------------------
+# Streamed replies, and a stream that breaks midway (spec 8, spec 7.4)
+# --------------------------------------------------------------------------
+
+
+class Stage(AutoApprove):
+    """Approves everything, and remembers what the session told the UI, in order."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, ...]] = []
+        #: Requests that have started and not yet ended.
+        self.open = 0
+        #: How many were open each time a confirmation was asked for.
+        self.open_when_asked: list[int] = []
+
+    def on_request_start(self, role: str) -> None:
+        self.open += 1
+        self.events.append(("start", role))
+
+    def on_text(self, delta: str) -> None:
+        self.events.append(("text", delta))
+
+    def on_request_end(self) -> None:
+        self.open -= 1
+        self.events.append(("end",))
+
+    def on_reply(self, reply: ModelReply) -> None:
+        shown = "".join(b.text for b in reply.blocks if isinstance(b, TextBlock))
+        self.events.append(("reply", shown))
+
+    def on_retry(self, attempt: int, _delay_s: float, _reason: str) -> None:
+        self.events.append(("retry", str(attempt)))
+
+    async def confirm(self, call: ToolUseBlock, _request: Any, _result: Any) -> Approval:
+        self.open_when_asked.append(self.open)
+        self.events.append(("confirm", call.name))
+        return Approval.ONCE
+
+
+def streamed(stage: Stage) -> str:
+    """The text the UI was given, joined."""
+    return "".join(event[1] for event in stage.events if event[0] == "text")
+
+
+def kinds(stage: Stage) -> list[str]:
+    return [event[0] for event in stage.events]
+
+
+async def test_a_native_main_request_streams_its_text_to_the_ui(tmp_repo):
+    stage = Stage()
+    session = build_session(tmp_repo, [says("The answer is 42.")], ui=stage)
+    await session.run("what is the answer")
+    assert stage.events[0] == ("start", "main")
+    assert streamed(stage) == "The answer is 42."
+    # In a few pieces, then the request ends, and only then is the reply reported.
+    assert kinds(stage) == ["start", "text", "text", "text", "end", "reply"]
+    assert stage.events[-1] == ("reply", "The answer is 42.")
+
+
+async def test_a_reply_that_asks_for_a_tool_streams_its_text_and_not_its_arguments(tmp_repo):
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    stage = Stage()
+    session = build_session(
+        tmp_repo,
+        [calls("Read", {"path": "a.py"}, call_id="t1", preamble="reading it"), says("done")],
+        ui=stage,
+    )
+    await session.run("read a.py")
+    assert streamed(stage) == "reading itdone"
+    assert not any("a.py" in event[1] for event in stage.events if event[0] == "text")
+
+
+async def test_a_text_protocol_request_is_framed_but_not_streamed(tmp_repo):
+    # Its reply carries tool markup, which must not be shown as it is written.
+    stage = Stage()
+    session = build_session(tmp_repo, [says("hello")], ui=stage, capabilities=TEXT_ONLY)
+    await session.run("hi")
+    assert stage.events == [("start", "main"), ("end",), ("reply", "hello")]
+
+
+async def test_a_compaction_summary_is_framed_but_not_streamed(tmp_repo):
+    stage = Stage()
+    session = build_session(
+        tmp_repo,
+        [says("SUMMARY"), says("answer")],
+        ui=stage,
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert stage.events[:2] == [("start", "compact"), ("end",)]
+    assert [event for event in stage.events if event[0] == "start"] == [
+        ("start", "compact"),
+        ("start", "main"),
+    ]
+    assert streamed(stage) == "answer"  # the summary is not in it
+
+
+async def test_a_request_that_fails_is_ended_all_the_same(tmp_repo):
+    stage = Stage()
+    session = build_session(
+        tmp_repo, [ModelError("bad key", retryable=False, status=401)], ui=stage
+    )
+    with pytest.raises(ModelError, match="bad key"):
+        await session.run("hello")
+    assert stage.events == [("start", "main"), ("end",)]
+
+
+async def test_a_retried_request_is_one_request_to_the_ui(tmp_repo):
+    # The indicator that says something is running stays up through the retry.
+    stage = Stage()
+    session = build_session(
+        tmp_repo, [ModelError("overloaded", retryable=True, status=529), says("ok")], ui=stage
+    )
+    await session.run("hello")
+    assert kinds(stage) == ["start", "retry", "text", "text", "end", "reply"]
+    assert streamed(stage) == "ok"
+
+
+async def test_a_request_that_is_cancelled_while_streaming_is_ended_and_not_kept(
+    tmp_repo, monkeypatch
+):
+    stage = Stage()
+    session = build_session(tmp_repo, [says("never")], ui=stage)
+    streaming = asyncio.Event()
+
+    async def stalls(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
+        assert on_text is not None
+        on_text("Once upon")
+        streaming.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the model was allowed to answer")
+
+    monkeypatch.setattr(session.model, "complete", stalls)
+    task = asyncio.create_task(session.run("tell me a story"))
+    await reached(streaming)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stage.events == [("start", "main"), ("text", "Once upon"), ("end",)]
+    # What was streamed is not part of the conversation. Closing the turn is what the
+    # next prompt does, as for any interrupted turn.
+    assert [m.text() for m in session.state.transcript.messages] == ["tell me a story"]
+
+
+async def test_a_confirmation_is_asked_after_the_request_has_ended_and_its_reply_shown(tmp_repo):
+    stage = Stage()
+    session = build_session(
+        tmp_repo,
+        [
+            calls(
+                "Write",
+                {"path": "a.txt", "content": "x\n"},
+                call_id="w1",
+                preamble="writing it",
+            ),
+            says("done"),
+        ],
+        ui=stage,
+    )
+    await session.run("write a.txt")
+    assert stage.open_when_asked == [0]  # nothing was running when the question came
+    asked = stage.events.index(("confirm", "Write"))
+    assert stage.events.index(("end",)) < stage.events.index(("reply", "writing it")) < asked
+
+
+async def test_a_cut_off_stream_keeps_its_text_stores_it_and_stops_with_the_error(tmp_repo):
+    stage = Stage()
+    session = build_session(
+        tmp_repo,
+        [cut_off("The first half of an ans", input_tokens=120, output_tokens=7), says("never")],
+        ui=stage,
+    )
+    with pytest.raises(ModelError) as caught:
+        await session.run("question")
+    # spec 17.9: what happened, then what to do. It says the reply was cut off, and that
+    # the person can ask the model to continue.
+    assert str(caught.value) == (
+        "the reply was cut off (the connection to the provider was lost: connection reset by "
+        "peer) \u2014 what arrived is kept; ask the model to continue"
+    )
+    assert caught.value.retryable is False
+    # Kept: as an assistant message, text only, marked as cut off.
+    assert [(m.role, m.text()) for m in session.state.transcript.messages] == [
+        ("user", "question"),
+        ("assistant", "The first half of an ans\n\n[this reply was cut off before it finished]"),
+    ]
+    # Stored, the same as what the model would be shown.
+    assert session.store is not None
+    assert session.store.load_transcript(session.session_id) == session.state.transcript
+    # What the provider reported by then is recorded, and the request is not asked again.
+    assert session.usage == Usage(120, 7)
+    assert len(session.model.requests) == 1 and not session.model.exhausted
+    assert kinds(stage) == ["start", "text", "text", "text", "end", "reply"]
+    assert streamed(stage) == "The first half of an ans"
+    # Reported as any reply is, so that a UI that did not stream it can show what is kept.
+    assert stage.events[-1] == ("reply", "The first half of an ans")
+
+
+async def test_a_follow_up_after_a_cut_off_stream_is_valid_and_answered(tmp_repo):
+    session = build_session(
+        tmp_repo, [cut_off("The first half of an ans"), says("and here is the rest")]
+    )
+    with pytest.raises(ModelError):
+        await session.run("question")
+    done = await session.follow_up("continue")
+    assert (done.reason, done.text) == (StopReason.COMPLETED, "and here is the rest")
+    sent = session.model.requests[1].transcript
+    validate(sent)
+    assert [(m.role, m.text()) for m in sent.messages] == [
+        ("user", "question"),
+        ("assistant", "The first half of an ans\n\n[this reply was cut off before it finished]"),
+        ("user", "continue"),
+    ]
+
+
+async def test_a_stream_cut_off_before_any_text_keeps_nothing_and_the_next_prompt_is_answered(
+    tmp_repo,
+):
+    # It broke inside its first tool call: there is nothing to keep, and the call is dropped.
+    session = build_session(tmp_repo, [cut_off("", input_tokens=50), says("fine")])
+    with pytest.raises(ModelError) as caught:
+        await session.run("question")
+    assert str(caught.value) == (
+        "the reply was cut off (the connection to the provider was lost: connection reset by "
+        "peer) \u2014 ask the model to continue"
+    )
+    assert [m.text() for m in session.state.transcript.messages] == ["question"]
+    assert session.usage == Usage(50, 0)  # what had been billed is still counted
+    done = await session.follow_up("go on")
+    assert done.reason is StopReason.COMPLETED
+    sent = session.model.requests[1].transcript
+    validate(sent)  # the turn nobody answered is closed, as after Ctrl+C
+    assert [m.role for m in sent.messages] == ["user", "assistant", "user"]
+
+
+async def test_a_text_that_was_not_streamed_is_shown_when_it_is_kept_after_a_cut_off(tmp_repo):
+    # A text-protocol reply is not streamed, so the person has not seen what is kept.
+    stage = Stage()
+    session = build_session(tmp_repo, [cut_off("half of it")], ui=stage, capabilities=TEXT_ONLY)
+    with pytest.raises(ModelError):
+        await session.run("hi")
+    assert stage.events == [("start", "main"), ("end",), ("reply", "half of it")]
+
+
+async def test_a_cut_off_in_a_later_turn_of_a_prompt_keeps_what_the_tools_had_done(tmp_repo):
+    (tmp_repo / "a.py").write_text("x = 1\n")
+    session = build_session(
+        tmp_repo, [calls("Read", {"path": "a.py"}, call_id="t1"), cut_off("It sets x")]
+    )
+    with pytest.raises(ModelError):
+        await session.run("what does a.py set")
+    validate(session.state.transcript)
+    assert [m.role for m in session.state.transcript.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert session.state.transcript.messages[-1].text().startswith("It sets x")
+
+
+async def test_a_cut_off_summary_is_not_kept_and_is_the_compact_roles_failure(tmp_repo):
+    session = build_session(
+        tmp_repo,
+        [says("never asked")],
+        compact_script=[cut_off("The conversation so f")],
+        compact_soft=0.00005,
+        compact_hard=0.0001,
+    )
+    history = tool_history(5, result_chars=400)
+    session.state = replace(session.state, transcript=history)
+    with pytest.raises(ModelError, match="could not summarise") as caught:
+        await session.follow_up("what next")
+    assert "connection to the provider was lost" in str(caught.value)
+    # The half of a summary is not a summary: the history is as it was.
+    assert session.state.transcript.messages[: len(history.messages)] == history.messages
+    assert all(
+        "cut off before it finished" not in m.text() for m in session.state.transcript.messages
+    )

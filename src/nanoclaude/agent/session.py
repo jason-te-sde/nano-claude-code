@@ -6,9 +6,9 @@ decided, because the budget verdict depends on the assembled context, which
 depends on the model's window, which depends on the role -- all of which meet
 here and nowhere else.
 
-What it still does not know about is the CLI. Confirmation, progress and retry
-notices go out through the UI protocol, so the same class backs the REPL,
-headless mode and every test.
+What it still does not know about is the CLI. Confirmation, progress, retry
+notices and the text of a reply as it arrives go out through the UI protocol, so
+the same class backs the REPL, headless mode and every test.
 
 Two things are true of a session whatever happened to its last turn, so nothing
 above this module has to repair one:
@@ -77,6 +77,10 @@ _INTERRUPTED_CALL = (
 
 #: Stands where the reply a stopped turn never got would have been.
 _INTERRUPTED_TURN = "[this turn was interrupted before it finished]"
+
+#: Ends the text of a reply whose stream broke midway, as the model sees it when the person
+#: asks it to go on: it knows where it stopped, and that nobody saw the rest.
+_CUT_OFF_REPLY = "[this reply was cut off before it finished]"
 
 #: A main model whose window is smaller than this many tokens keeps at most
 #: ``SMALL_WINDOW_KEEP_RECENT`` recent turns whatever ``keep_recent_turns`` says
@@ -273,7 +277,12 @@ class Session:
             system, specs = self._prompt(capabilities)
             await self._maybe_compact(capabilities, system, specs)
 
-            raw = await self._ask_main(capabilities, system, specs)
+            try:
+                raw = await self._ask_main(capabilities, system, specs)
+            except ModelError as error:
+                if error.partial is None:
+                    raise
+                raise self._keep_cut_off(error.partial, error) from error
             self.router.record("main", raw.usage, *self._adapter_and_model("main"))
             reply: ModelReply = raw
             complaints: tuple[str, ...] = ()
@@ -361,8 +370,13 @@ class Session:
         only. The summary is a request to a model with a window of its own, and an
         overflow there is that model's error and not something to retry.
         """
+        # A native model's text is shown as it arrives. A text-protocol reply is not: it
+        # carries tool markup, and is parsed once the whole of it is here.
+        stream = capabilities.native_tools
         try:
-            return await self._complete("main", self._request(capabilities, system, specs))
+            return await self._complete(
+                "main", self._request(capabilities, system, specs), stream=stream
+            )
         except ModelError as error:
             if not error.context_overflow:
                 raise
@@ -370,7 +384,9 @@ class Session:
         if not await self._compact_fully(capabilities):
             raise self._does_not_fit(overflow, self._nothing_to_compact(capabilities)) from overflow
         try:
-            return await self._complete("main", self._request(capabilities, system, specs))
+            return await self._complete(
+                "main", self._request(capabilities, system, specs), stream=stream
+            )
         except ModelError as error:
             if error.context_overflow:
                 raise self._does_not_fit(error, "even after compacting it") from error
@@ -400,14 +416,54 @@ class Session:
             status=cause.status,
         )
 
-    async def _complete(self, role: str, request: ModelRequest) -> ModelReply:
-        """One provider call under the retry policy; each retry is reported to the UI."""
+    async def _complete(
+        self, role: str, request: ModelRequest, *, stream: bool = False
+    ) -> ModelReply:
+        """One provider call under the retry policy; each retry is reported to the UI.
+
+        The UI is told when the request starts and when it ends, however it ends: answered,
+        failed or cancelled. The retries in between are part of the one request, so that
+        whatever shows that something is running stays up through them. With ``stream`` the
+        text of the reply goes to the UI as it arrives.
+        """
         client = await self.router.client_for(role)
+        on_text = self.ui.on_text if stream else None
 
         async def once() -> ModelReply:
-            return await client.complete(request)
+            return await client.complete(request, on_text=on_text)
 
-        return await with_retry(once, policy=self.retry, on_retry=self.ui.on_retry)
+        self.ui.on_request_start(role)
+        try:
+            return await with_retry(once, policy=self.retry, on_retry=self.ui.on_retry)
+        finally:
+            self.ui.on_request_end()
+
+    def _keep_cut_off(self, partial: ModelReply, cause: ModelError) -> ModelError:
+        """Keep what arrived of a reply whose stream broke midway, and say so (spec 7.4).
+
+        The text is kept as an assistant message, marked as cut off, and stored with the rest
+        of the conversation: the person can ask the model to continue, and it knows where it
+        stopped. A call that had been half received is dropped, since it cannot be run, and
+        so is thinking. What the provider had reported is recorded. Nothing is asked again,
+        because the request may already have had effects: the turn stops, with the error that
+        says so, and what to do next is the person's to decide.
+
+        Returns the error to raise. The UI is given what is kept, as for any reply, so that
+        one that did not show it as it arrived (a text-protocol reply is not streamed) can.
+        """
+        self.router.record("main", partial.usage, *self._adapter_and_model("main"))
+        self.state = replace(self.state, usage=self.state.usage + partial.usage)
+        text = "".join(b.text for b in partial.blocks if isinstance(b, TextBlock)).strip()
+        what = f"the reply was cut off ({cause})"
+        if not text:
+            return ModelError(f"{what} \u2014 ask the model to continue", retryable=False)
+        marked = assistant_text(f"{text}\n\n{_CUT_OFF_REPLY}")
+        self.state = replace(self.state, transcript=self.state.transcript.append(marked))
+        self._persist()
+        self.ui.on_reply(partial)
+        return ModelError(
+            f"{what} \u2014 what arrived is kept; ask the model to continue", retryable=False
+        )
 
     def _budget(self, capabilities: Capabilities) -> Budget:
         return Budget(
