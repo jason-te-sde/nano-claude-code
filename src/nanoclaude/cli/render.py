@@ -26,6 +26,15 @@ config file. It is data, and two things can go wrong when data is printed.
 
 Colour is whatever the console allows. This module never writes an escape sequence of
 its own, so ``NO_COLOR`` and a console that is not a terminal both give plain text.
+
+A reply that takes tens of seconds is shown as it arrives (spec 8): a waiting indicator that
+names the model, then the text so far as Markdown in a live region that is drawn again at most
+ten times a second, and left on the screen when the request ends. Nothing live is drawn on a
+console that is not a terminal, that cannot move the cursor, or that has ``NO_COLOR`` set: the
+text is printed once, when the request ends. A question to the person is never asked with
+anything live on the screen. While a request is on the screen the terminal's own echo is off:
+a key typed ahead, or the ``^C`` of Ctrl+C, would be printed at the cursor and throw the
+display off by a line, which leaves a copy of its last frame behind.
 """
 
 from __future__ import annotations
@@ -36,16 +45,21 @@ import re
 import unicodedata
 from collections.abc import Callable
 from pathlib import PurePosixPath
+from typing import ClassVar
 
-from rich.console import Console, RenderableType
-from rich.markdown import Markdown
+from markdown_it import MarkdownIt
+from rich.console import Console, ConsoleOptions, RenderableType, RenderResult
+from rich.live import Live
+from rich.markdown import ImageItem, Markdown, MarkdownElement
+from rich.segment import Segment
+from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
 from nanoclaude.agent.router import Router
 from nanoclaude.agent.session import Session
 from nanoclaude.agent.ui import Approval
-from nanoclaude.cli.prompt import Questioner, discard_pending_input, new_prompter
+from nanoclaude.cli.prompt import Questioner, discard_pending_input, new_prompter, silence_echo
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
@@ -236,10 +250,109 @@ def render_diff(diff: str) -> RenderableType:
     return Text("\n").join(drawn)
 
 
+class _ImageWithItsAddress(ImageItem):
+    """An image as text: that it is one, what it is said to show, and where it points.
+
+    Rich draws a placeholder and the description, and with hyperlinks off nothing says where
+    the image is. A link shows its address, and an image, which a terminal cannot show, is
+    no less in need of one.
+    """
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        described = self.text.plain.strip()
+        yield Text(
+            f"image: {described} ({self.destination})"
+            if described
+            else f"image: {self.destination}",
+            end="",
+        )
+
+
+class _ModelMarkdown(Markdown):
+    """Markdown as a model writes it, shown as it was written.
+
+    Two things Rich leaves out are put back. HTML is text here, parsed as text and drawn
+    as it was typed: Rich draws no HTML at all, so a reply that is a tag, or whose point is
+    one, would print as nothing. An image shows its address (see
+    :class:`_ImageWithItsAddress`). Code is as it was: nothing in it is HTML, and nothing in
+    it is escaped.
+    """
+
+    elements: ClassVar[dict[str, type[MarkdownElement]]] = {
+        **Markdown.elements,
+        "image": _ImageWithItsAddress,
+    }
+
+    def __init__(self, markup: str) -> None:
+        super().__init__("", hyperlinks=False)
+        self.markup = markup
+        parser = MarkdownIt("commonmark", {"html": False}).enable("strikethrough").enable("table")
+        self.parsed = parser.parse(markup)
+
+
 def render_markdown(text: str) -> RenderableType:
     # Hyperlinks off: a terminal link shows its label and hides where it goes, and the
     # label is the model's to choose. Without them the address is printed beside it.
-    return Markdown(sanitize(text), hyperlinks=False)
+    return _ModelMarkdown(sanitize(text))
+
+
+#: How often, at most, a reply that is arriving is drawn again. Drawn after every piece, a
+#: reply written in hundreds of pieces would be parsed and painted as Markdown hundreds of
+#: times a second, and every one of them would be a frame to redraw.
+STREAM_REFRESH_PER_SECOND = 10
+
+
+class _Arriving:
+    """The text of a reply as far as it has arrived, drawn as Markdown whenever it is drawn.
+
+    Pieces are added from the loop's thread and drawn from the live display's own, so they
+    are kept as they come and joined and parsed only when drawn. Adding to a list and
+    joining one are each safe to do from two threads.
+
+    A reply taller than the screen is drawn as its last screenful while it grows. Left to
+    itself Rich draws the top of it and hides the end, which is the part being written, and
+    drawn without limit it leaves a copy of its top in the scrollback with every frame: the
+    cursor cannot go back up past the first line of the screen to erase it. ``settle`` makes
+    the next frame draw all of the reply, which is the one the display leaves behind.
+    """
+
+    def __init__(self) -> None:
+        self._pieces: list[str] = []
+        self._settled = False
+        # The reply as lines, for the pieces and the console width it was laid out for. A frame
+        # with nothing new in it, at the size of the one before, does no Markdown work: laying
+        # out 40 KB takes 70 ms, which is longer than the tenth of a second between frames.
+        self._laid_out: tuple[tuple[int, int], list[list[Segment]]] | None = None
+
+    def add(self, piece: str) -> None:
+        self._pieces.append(piece)
+
+    def settle(self) -> None:
+        self._settled = True
+
+    @property
+    def text(self) -> str:
+        return "".join(self._pieces)
+
+    def _lines(self, console: Console, options: ConsoleOptions) -> list[list[Segment]]:
+        pieces = tuple(self._pieces)  # one snapshot, so that the key and the text agree
+        key = (len(pieces), options.max_width)  # the height is not part of a layout
+        laid_out = self._laid_out
+        if laid_out is None or laid_out[0] != key:
+            drawn = render_markdown("".join(pieces).strip())
+            laid_out = (key, console.render_lines(drawn, options, pad=False))
+            self._laid_out = laid_out
+        return laid_out[1]
+
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        lines = self._lines(console, options)
+        if not self._settled:
+            # One line short of the screen, so that drawing it scrolls nothing.
+            lines = lines[-max(1, options.max_height - 1) :]
+        for number, line in enumerate(lines):
+            if number:
+                yield Segment.line()
+            yield from line
 
 
 def _call_line(call: ToolUseBlock) -> Text:
@@ -290,9 +403,20 @@ class ConsoleUI:
         prompter: Questioner | None = None,
         root: str | None = None,
         discard_input: Callable[[], None] | None = None,
+        model_of: Callable[[str], str] | None = None,
+        silence: Callable[[], Callable[[], None]] | None = None,
     ) -> None:
         self._console = console
         self._auto = auto_approve
+        # What the waiting indicator calls the model that answers a role. The UI is handed a
+        # role and not a model, and which model plays a role changes with /model, so it asks
+        # when a request starts. Without it the indicator names the role.
+        self._model_of = model_of
+        # What stops the terminal echoing what is typed while a live display is on the screen,
+        # and returns what puts the echo back: the echo moves the cursor the display counts
+        # its lines from.
+        self._silence = silence if silence is not None else silence_echo
+        self._put_echo_back: Callable[[], None] | None = None
         # The project, so that a path inside it can be shown relative to it: "src/a.py" is
         # shorter than the resolved path and says the same. Resolved, like the paths of a
         # request are. Without it a path is shown whole.
@@ -304,10 +428,23 @@ class ConsoleUI:
         self._prompter: Questioner | None = prompter
         # Edits whose diff was shown at the confirmation, so that it is not shown again.
         self._previewed: set[str] = set()
+        # What is on the screen for the request that is running: the indicator while it
+        # waits, and a live region once its text arrives. Never both.
+        self._waiting: Live | None = None
+        self._live: Live | None = None
+        # The text of the request that is running, not parsed until it is drawn.
+        self._arriving: _Arriving | None = None
+        # Whether the last request showed its text, so that the reply that follows it is not
+        # shown as well. Taken by that reply, and cleared when the next request starts.
+        self._streamed = False
 
     async def confirm(
         self, call: ToolUseBlock, request: PermissionRequest, _result: PermissionResult
     ) -> Approval:
+        # The session ends a request before it runs a tool, so this is not needed. It is here
+        # because a question asked over a live display cannot be read, and a rule that is only
+        # kept by whoever calls is a rule that gets broken.
+        self.on_request_end()
         if self._auto:
             # The question is not asked, so the confirmation names the call: on_decision
             # stays quiet for a call that is asked about, and it would be named twice.
@@ -478,9 +615,107 @@ class ConsoleUI:
         self._previewed.add(call.id)
 
     def on_reply(self, reply: ModelReply) -> None:
+        streamed, self._streamed = self._streamed, False
+        if streamed:
+            return  # its text is on the screen already, once
         for block in reply.blocks:
             if isinstance(block, TextBlock) and block.text.strip():
                 self._console.print(render_markdown(block.text.strip()))
+
+    def _animated(self) -> bool:
+        """Whether this console can draw over what it drew, and may.
+
+        A terminal that can move the cursor, with no ``NO_COLOR`` asking for plain output:
+        anywhere else a live display is a stream of escape sequences, or lines repeated.
+        """
+        console = self._console
+        return console.is_terminal and not console.is_dumb_terminal and not console.no_color
+
+    def _display(self, renderable: RenderableType, *, transient: bool) -> Live:
+        """A live display of ``renderable`` on this console, started and drawn at once."""
+        live = Live(
+            renderable,
+            console=self._console,
+            refresh_per_second=STREAM_REFRESH_PER_SECOND,
+            transient=transient,
+            # Rich would otherwise swap sys.stdout and sys.stderr for as long as it runs.
+            # Everything this UI writes goes through its console, and two process-wide
+            # streams are state that a request that fails must not be able to leave behind.
+            redirect_stdout=False,
+            redirect_stderr=False,
+        )
+        live.start(refresh=True)
+        return live
+
+    def _waiting_for(self, role: str) -> Text:
+        """What the indicator says: the model that is answering, and for what if not the main."""
+        if self._model_of is None:
+            return plain(f"waiting for the {role} model", "dim")
+        model = self._model_of(role)
+        return plain(f"waiting for {model}" + ("" if role == "main" else f" ({role})"), "dim")
+
+    def _spinner(self, role: str) -> Spinner:
+        """The indicator: braille dots where the terminal can write them, and ASCII where not.
+
+        Its first frame is the first thing a request writes, and a terminal whose encoding has
+        no braille would raise at once. The request would then fail with an encoding error
+        where, before there was an indicator, its reply came out in any encoding it could be
+        written in.
+        """
+        braille = self._console.encoding.startswith("utf")
+        return Spinner("dots" if braille else "line", text=self._waiting_for(role))
+
+    def on_request_start(self, role: str) -> None:
+        self.on_request_end()  # a request that never ended is over now
+        self._streamed = False
+        if self._animated():
+            restore = self._silence()
+            self._put_echo_back = restore
+            try:
+                self._waiting = self._display(self._spinner(role), transient=True)
+            except BaseException:
+                # The display could not be started: nothing is on the screen to throw off,
+                # and the person must be able to see what they type.
+                self._put_echo_back = None
+                restore()
+                raise
+
+    def on_text(self, delta: str) -> None:
+        if self._arriving is None:
+            self._arriving = _Arriving()
+        self._arriving.add(delta)
+        if self._streamed or not delta.strip():
+            return  # blank lines the model opens with are nothing to read yet
+        self._streamed = True
+        if not self._animated():
+            return  # printed once, when the request ends
+        if self._waiting is not None:
+            self._waiting.stop()
+            self._waiting = None
+        self._live = self._display(self._arriving, transient=False)
+
+    def on_request_end(self) -> None:
+        waiting, self._waiting = self._waiting, None
+        live, self._live = self._live, None
+        arriving, self._arriving = self._arriving, None
+        put_echo_back, self._put_echo_back = self._put_echo_back, None
+        # Each thing that has to be undone is undone whatever the one before it did: a
+        # display that fails to stop must not leave the text unprinted, nor the echo off.
+        # The echo goes back last, once nothing is drawing, and in a finally of its own.
+        try:
+            try:
+                if waiting is not None:
+                    waiting.stop()  # transient: its line is erased
+            finally:
+                if live is not None:
+                    if arriving is not None:
+                        arriving.settle()
+                    live.stop()  # draws all of the reply, once, and leaves it there
+                elif arriving is not None and self._streamed:
+                    self._console.print(render_markdown(arriving.text.strip()))
+        finally:
+            if put_echo_back is not None:
+                put_echo_back()
 
     def on_decision(
         self, call: ToolUseBlock, request: PermissionRequest, result: PermissionResult

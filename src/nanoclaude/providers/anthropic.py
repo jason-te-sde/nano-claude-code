@@ -16,7 +16,7 @@ tools in a different order -- costs the entire cache, so both are frozen.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -35,8 +35,9 @@ from nanoclaude.providers.base import (
     StopKind,
     ToolSpec,
     Usage,
+    partial_reply,
 )
-from nanoclaude.providers.retry import classify_status
+from nanoclaude.providers.retry import classify_status, classify_stream_error
 
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -97,17 +98,22 @@ class StreamAccumulator:
     Tool arguments arrive as JSON fragments that only parse once concatenated.
     A fragment stream that stops early is reported loudly: quietly passing ``{}``
     to a tool would look like the model asked for something it did not.
+
+    ``on_text`` hears each piece of visible text as it arrives. Thinking and tool
+    arguments are not text, and never reach it.
     """
 
-    def __init__(self, *, model: str = DEFAULT_MODEL) -> None:
+    def __init__(
+        self, *, model: str = DEFAULT_MODEL, on_text: Callable[[str], None] | None = None
+    ) -> None:
         self._model = model
+        self._on_text = on_text
         self._kinds: dict[int, tuple[str, Any]] = {}
         self._json: dict[int, list[str]] = {}
         self._text: dict[int, list[str]] = {}
         # A thinking block's signature streams separately from its text and must
         # be sent back verbatim on the next turn, so it is kept per block.
         self._signature: dict[int, list[str]] = {}
-        self._closed: set[int] = set()
         self._stop = StopKind.END_TURN
         self._usage = Usage()
         self._saw_message_stop = False
@@ -139,16 +145,17 @@ class StreamAccumulator:
         elif event == "content_block_delta":
             index, delta = int(data["index"]), data["delta"]
             kind = delta["type"]
-            if kind in ("text_delta", "thinking_delta"):
-                self._text.setdefault(index, []).append(
-                    delta.get("text") or delta.get("thinking", "")
-                )
+            if kind == "text_delta":
+                piece = delta.get("text") or ""
+                self._text.setdefault(index, []).append(piece)
+                if piece and self._on_text is not None:
+                    self._on_text(piece)
+            elif kind == "thinking_delta":
+                self._text.setdefault(index, []).append(delta.get("thinking") or "")
             elif kind == "input_json_delta":
                 self._json.setdefault(index, []).append(delta["partial_json"])
             elif kind == "signature_delta":
                 self._signature.setdefault(index, []).append(delta["signature"])
-        elif event == "content_block_stop":
-            self._closed.add(int(data["index"]))
         elif event == "message_delta":
             reason = data.get("delta", {}).get("stop_reason")
             if reason is not None:
@@ -165,22 +172,50 @@ class StreamAccumulator:
             self._saw_message_stop = True
         elif event == "error":
             error = data.get("error", {})
+            # An error in the middle of the reply is the stream breaking, like a dropped
+            # connection: what arrived is kept and the request is not asked again.
+            partial = self.partial()
             raise ModelError(
                 f"{error.get('type', 'error')}: {error.get('message', data)}",
-                retryable=error.get("type") in {"overloaded_error", "rate_limit_error"},
+                retryable=partial is None
+                and error.get("type") in {"overloaded_error", "rate_limit_error"},
+                partial=partial,
             )
 
+    def partial(self) -> ModelReply | None:
+        """What had arrived, as a reply; None while nothing a person could have read has.
+
+        Visible text, or a tool call that had begun. Thinking does not count: it is not
+        shown and cannot have run anything, so a stream that broke after nothing but
+        thinking may be asked again. A call that had begun is not in the reply, whole or
+        not (see :func:`~nanoclaude.providers.base.partial_reply`), but it is why a stream
+        with no text yet is not asked again: an earlier call in the turn may have run.
+        """
+        texts = [
+            "".join(self._text.get(index, ()))
+            for index in sorted(self._kinds)
+            if self._kinds[index][0] == "text"
+        ]
+        began_a_call = any(kind == "tool_use" for kind, _ in self._kinds.values())
+        if not any(texts) and not began_a_call:
+            return None
+        return partial_reply(texts, self._usage, self._model)
+
     def result(self) -> ModelReply:
+        if self._kinds and not self._saw_message_stop:
+            # message_stop is what says the reply is whole (spec 7.4: a stream that closes
+            # without it was interrupted midway, whatever closed it). A block that was
+            # stopped is no proof: a call that parses may be the first of several, and an
+            # earlier one in the turn may already have run, so nothing is handed over.
+            raise ModelError(
+                "the response stream ended incomplete, with no message_stop; the turn may "
+                "have partially executed, so it is not retried automatically",
+                retryable=False,
+                partial=self.partial(),
+            )
         blocks: list[Block] = []
         for index in sorted(self._kinds):
             kind, meta = self._kinds[index]
-            if index not in self._closed and not self._saw_message_stop:
-                raise ModelError(
-                    f"the response stream ended with content block {index} incomplete; "
-                    "the turn may have partially executed, so it is not retried "
-                    "automatically",
-                    retryable=False,
-                )
             if kind == "text":
                 blocks.append(TextBlock("".join(self._text.get(index, ()))))
             elif kind == "thinking":
@@ -289,8 +324,10 @@ class AnthropicClient:
             body["tools"] = tools
         return body
 
-    async def complete(self, request: ModelRequest) -> ModelReply:
-        accumulator = StreamAccumulator(model=self._model)
+    async def complete(
+        self, request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
+        accumulator = StreamAccumulator(model=self._model, on_text=on_text)
         url = f"{self._base_url}/v1/messages"
         try:
             async with self._client.stream(
@@ -301,8 +338,9 @@ class AnthropicClient:
                     raise classify_status(response.status_code, body)
                 async for event, data in iter_sse(response.aiter_lines()):
                     accumulator.handle(event, data)
-        except httpx.TimeoutException as exc:
-            raise ModelError(f"the provider timed out: {exc}", retryable=True) from exc
-        except httpx.TransportError as exc:
-            raise ModelError(f"could not reach the provider: {exc}", retryable=True) from exc
+        except (httpx.RequestError, ValueError) as exc:
+            failure = classify_stream_error(exc, accumulator.partial())
+            if failure is None:
+                raise
+            raise failure from exc
         return accumulator.result()

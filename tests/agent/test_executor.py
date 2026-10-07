@@ -489,6 +489,36 @@ async def test_auto_approve_answers_once():
     assert await ui.confirm(call, request, result) is Approval.ONCE
 
 
+@pytest.mark.parametrize("ui", [SilentUI(), AutoApprove(), AutoDecline()], ids=type)
+def test_every_built_in_ui_takes_the_streaming_calls_and_does_nothing_with_them(ui):
+    # A request is framed by a start and an end, with the text in between. A UI that has
+    # nothing to show for it (a test, headless mode) must not have to say so.
+    assert ui.on_request_start("main") is None
+    assert ui.on_text("hello") is None
+    assert ui.on_request_end() is None
+
+
+@pytest.mark.parametrize("missing", ["on_request_start", "on_text", "on_request_end"])
+def test_a_ui_that_does_not_take_the_streaming_calls_is_not_a_ui(missing):
+    everything = (
+        "confirm",
+        "on_reply",
+        "on_decision",
+        "on_outcome",
+        "on_output",
+        "on_retry",
+        "on_request_start",
+        "on_text",
+        "on_request_end",
+    )
+    made = type("Incomplete", (), {name: lambda _self, *_args: None for name in everything})
+    assert isinstance(made(), UI)
+    without = type(
+        "Without", (), {name: lambda _self, *_args: None for name in everything if name != missing}
+    )
+    assert not isinstance(without(), UI)
+
+
 async def test_auto_decline_behaves_like_silent_ui():
     ui = AutoDecline()
     assert isinstance(ui, UI)

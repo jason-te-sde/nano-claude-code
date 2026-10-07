@@ -57,7 +57,12 @@ class FakeClient:
     def model_id(self) -> str:
         return self._model_id
 
-    async def complete(self, request: ModelRequest) -> ModelReply:
+    async def complete(
+        self,
+        request: ModelRequest,
+        *,
+        on_text: Callable[[str], None] | None = None,  # noqa: ARG002 - the protocol's keyword
+    ) -> ModelReply:
         raise AssertionError(f"a router test must not send a request: {request}")
 
     async def aclose(self) -> None:
@@ -72,7 +77,12 @@ class ClientWithoutClose:
 
     model_id = "no-close"
 
-    async def complete(self, request: ModelRequest) -> ModelReply:
+    async def complete(
+        self,
+        request: ModelRequest,
+        *,
+        on_text: Callable[[str], None] | None = None,  # noqa: ARG002 - the protocol's keyword
+    ) -> ModelReply:
         raise AssertionError(f"a router test must not send a request: {request}")
 
 

@@ -11,7 +11,7 @@ from nanoclaude.agent.ui import AutoApprove
 from nanoclaude.conversation.transcript import TextBlock, Transcript, user_text
 from nanoclaude.providers.base import ModelClient, ModelError, ModelRequest
 from nanoclaude.providers.capabilities import Capabilities
-from nanoclaude.testing.scripted import says
+from nanoclaude.testing.scripted import cut_off, says
 from nanoclaude.testing.session import SCRIPTED_MODEL, ScriptedClient, build_session
 
 # Checked by mypy --strict, as test_scripted.py does for ScriptedModel: a client
@@ -38,6 +38,34 @@ async def test_a_scripted_client_serves_replies_and_raises_errors_in_the_order_w
     # All three requests were recorded, the one that raised included.
     assert len(client.requests) == 3
     assert client.exhausted
+
+
+async def test_a_scripted_client_streams_a_reply_to_on_text_in_a_few_pieces():
+    client = ScriptedClient([says("hello there")])
+    pieces: list[str] = []
+    reply = await client.complete(request(), on_text=pieces.append)
+    assert len(pieces) > 1
+    assert "".join(pieces) == "hello there"
+    assert reply == says("hello there")
+
+
+async def test_a_scripted_client_streams_what_arrived_before_it_raises_a_cut_off_error():
+    # As an adapter does: the text goes out as it arrives, and then the stream breaks.
+    client = ScriptedClient([cut_off("half an ans")])
+    pieces: list[str] = []
+    with pytest.raises(ModelError) as caught:
+        await client.complete(request(), on_text=pieces.append)
+    assert "".join(pieces) == "half an ans"
+    assert caught.value.partial is not None
+    assert caught.value.partial.blocks == (TextBlock("half an ans"),)
+
+
+async def test_an_error_that_is_not_a_cut_off_streams_nothing():
+    client = ScriptedClient([ModelError("overloaded", retryable=True, status=529)])
+    pieces: list[str] = []
+    with pytest.raises(ModelError):
+        await client.complete(request(), on_text=pieces.append)
+    assert pieces == []
 
 
 async def test_a_script_that_runs_out_fails_by_name_after_the_request_is_recorded():

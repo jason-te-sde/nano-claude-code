@@ -32,9 +32,10 @@ from nanoclaude.conversation.transcript import TextBlock, TranscriptError
 from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, StopKind, Usage
 from nanoclaude.providers.capabilities import Capabilities
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
-from nanoclaude.testing.scripted import calls, says
+from nanoclaude.testing.scripted import calls, cut_off, says
 from nanoclaude.testing.session import ScriptedSession, build_session
-from tests.cli.helpers import FakeClock, ScriptedPrompter, plain_console
+from tests.cli.helpers import FakeClock, ScriptedPrompter, plain_console, terminal_console
+from tests.cli.screen import cursor_is_hidden, foreign_controls, on_screen
 
 
 class Harness:
@@ -51,21 +52,44 @@ class Harness:
         script: list[Any],
         *lines: str | BaseException,
         width: int = 100,
+        terminal: bool = False,
+        height: int = 30,
         **options: Any,
     ) -> None:
-        self.console, self._buffer = plain_console(width)
+        """``terminal`` makes the console a terminal of ``height`` lines, which draws a live
+        display for a reply that is arriving; the default console is not one."""
+        if terminal:
+            self.console, self._buffer = terminal_console(width, height=height, no_color=False)
+        else:
+            self.console, self._buffer = plain_console(width)
+        self._terminal = terminal
+        self._height = height
         self.prompter = ScriptedPrompter(*lines)
         self.clock = FakeClock()
         self.session: ScriptedSession = build_session(
             root,
             script,
-            ui=ConsoleUI(self.console, prompter=self.prompter, root=str(root)),
+            ui=ConsoleUI(
+                self.console, prompter=self.prompter, root=str(root), model_of=self._model_of
+            ),
             **options,
         )
+
+    def _model_of(self, role: str) -> str:
+        """The model that plays ``role``, as the live router says: it changes with /model."""
+        config = self.session.router.config
+        return config.models[config.roles.alias_for(role)].model
 
     @property
     def text(self) -> str:
         return self._buffer.getvalue()
+
+    @property
+    def rows(self) -> list[str]:
+        """The lines a person would read: what a terminal shows, or a plain console printed."""
+        if self._terminal:
+            return on_screen(self.text, self._height).splitlines()
+        return [line.rstrip() for line in self.text.splitlines()]
 
     def start(self) -> asyncio.Task[int]:
         return asyncio.create_task(
@@ -131,17 +155,47 @@ def block_the_answer(
     answer = session.model.complete
     asked = 0
 
-    async def complete(request: ModelRequest) -> ModelReply:
+    async def complete(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
         nonlocal asked
         asked += 1
         if asked == nth:
             started.set()
             await asyncio.Event().wait()
             raise AssertionError("the model was allowed to answer")
-        return await answer(request)
+        return await answer(request, on_text=on_text)
 
     monkeypatch.setattr(session.model, "complete", complete)
     return started
+
+
+def stream_then_stall(
+    session: ScriptedSession, monkeypatch: pytest.MonkeyPatch, text: str, nth: int = 1
+) -> asyncio.Event:
+    """Make the model's ``nth`` answer stream ``text`` and then never finish, and say when.
+
+    The answers before it come from the script as usual, and so do the ones after.
+    """
+    streaming = asyncio.Event()
+    answer = session.model.complete
+    asked = 0
+
+    async def complete(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
+        nonlocal asked
+        asked += 1
+        if asked == nth:
+            assert on_text is not None, "the session did not ask for the text as it arrives"
+            on_text(text)
+            streaming.set()
+            await asyncio.Event().wait()
+            raise AssertionError("the model was allowed to finish")
+        return await answer(request, on_text=on_text)
+
+    monkeypatch.setattr(session.model, "complete", complete)
+    return streaming
 
 
 async def reached(event: asyncio.Event) -> None:
@@ -984,3 +1038,92 @@ async def test_the_repl_builds_its_prompt_from_the_session_and_the_environment(
     assert asked["history_path"] == str(tmp_repo / "history")
     assert asked["vi_mode"] is True
     assert asked["commands"] == {name: c.summary for name, c in COMMANDS.items()}
+
+
+# --------------------------------------------------------------------------
+# A reply that is arriving when the person cancels, or when the stream breaks
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("terminal", [False, True], ids=["plain console", "terminal"])
+async def test_ctrl_c_while_a_reply_is_streaming_leaves_what_arrived_on_the_screen_only(
+    tmp_repo, monkeypatch, terminal
+):
+    sigint = Sigint(monkeypatch)
+    harness = Harness(tmp_repo, [says("a second answer")], "first", "second", terminal=terminal)
+    streaming = stream_then_stall(harness.session, monkeypatch, "Once upon a time")
+    repl_task = harness.start()
+    await reached(streaming)
+    sigint.press()
+    assert await asyncio.wait_for(repl_task, timeout=5) == 0
+    # On the screen once, and before the notice that the turn was cancelled, whichever
+    # kind of console it was.
+    rows = harness.rows
+    assert rows.count("Once upon a time") == 1
+    assert rows.index("Once upon a time") < rows.index("cancelled") < rows.index("a second answer")
+    # Not in the conversation: the repair at the next prompt is what the model is told.
+    assert sent_messages(harness.session) == [
+        "first",
+        "[this turn was interrupted before it finished]",
+        "second",
+    ]
+    # Nothing is left drawing, and the cursor is the person's again.
+    assert cursor_is_hidden(harness.text) is False
+
+
+async def test_a_stream_that_breaks_keeps_what_arrived_and_the_person_can_ask_for_the_rest(
+    tmp_repo,
+):
+    harness = Harness(
+        tmp_repo,
+        [cut_off("The first half of"), says("an answer, and here is the rest")],
+        "write it",
+        "continue",
+        width=200,
+        terminal=True,
+    )
+    assert await harness.run() == 0
+    rows = harness.rows
+    assert rows.count("The first half of") == 1
+    [error] = [row for row in rows if row.startswith("error:")]
+    assert error == (
+        "error: the reply was cut off (the connection to the provider was lost: connection reset "
+        "by peer) \u2014 what arrived is kept; ask the model to continue"
+    )
+    assert rows.index("The first half of") < rows.index(error)
+    # Asked to continue, the model was shown what it had said, and that it was cut off.
+    assert sent_messages(harness.session, 1) == [
+        "write it",
+        "The first half of\n\n[this reply was cut off before it finished]",
+        "continue",
+    ]
+    assert rows[-2] == "an answer, and here is the rest"
+    assert foreign_controls(harness.text) == []
+
+
+async def test_a_question_after_streamed_text_is_asked_when_nothing_is_drawing(tmp_repo):
+    harness = Harness(
+        tmp_repo,
+        [
+            calls(
+                "Write",
+                {"path": "new.txt", "content": "hello\n"},
+                call_id="w1",
+                preamble="Writing it now.",
+            ),
+            says("written"),
+        ],
+        "write it",
+        "y",
+        terminal=True,
+        width=100,
+    )
+    when_asked: list[tuple[bool, list[str]]] = []
+    harness.prompter.on_ask = lambda _message: when_asked.append(
+        (cursor_is_hidden(harness.text), harness.rows)
+    )
+    assert await harness.run() == 0
+    assert (tmp_repo / "new.txt").read_text() == "hello\n"
+    _prompt, (hidden, rows), _next = when_asked
+    assert hidden is False
+    assert rows.count("Writing it now.") == 1  # on the screen above the question, once

@@ -8,12 +8,12 @@ as :class:`~nanoclaude.providers.capabilities.Capabilities` and nothing else.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
-from nanoclaude.conversation.transcript import Block, Transcript
+from nanoclaude.conversation.transcript import Block, TextBlock, Transcript
 
 
 def new_call_id(prefix: str) -> str:
@@ -32,6 +32,10 @@ class StopKind(StrEnum):
     TOOL_USE = "tool_use"
     MAX_TOKENS = "max_tokens"
     REFUSAL = "refusal"
+    #: Not a reason the model gave: the stream broke before the model had finished. Only
+    #: the ``partial`` reply of a :class:`ModelError` carries it, and such a reply is
+    #: never a whole one, so it is never handed to the loop as the model's answer.
+    CUT_OFF = "cut_off"
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +107,17 @@ class ModelReply:
     __hash__ = None  # type: ignore[assignment]
 
 
+def partial_reply(texts: Iterable[str], usage: Usage, model: str) -> ModelReply:
+    """What had arrived of a reply whose stream broke: its text, and the usage so far.
+
+    Text only, one block for each non-empty piece of ``texts``. Thinking and tool calls are
+    left out, whole or not: nothing may be run or sent back to the model from a reply that
+    did not finish. A reply with no text is still a reply, so that what the provider had
+    reported by then (the input it billed) is not lost with it.
+    """
+    return ModelReply(tuple(TextBlock(t) for t in texts if t), StopKind.CUT_OFF, usage, model)
+
+
 class ModelError(RuntimeError):
     """The provider failed in a way the loop cannot paper over.
 
@@ -117,18 +132,44 @@ class ModelError(RuntimeError):
         retryable: bool = False,
         status: int | None = None,
         context_overflow: bool = False,
+        partial: ModelReply | None = None,
     ) -> None:
+        if partial is not None and retryable:
+            # Asking again would show the same words twice and run again a call that
+            # the first attempt may have made. Refused here, where the mistake is made,
+            # rather than left to be found by whoever retries.
+            raise ValueError(
+                "a reply that was partly received is never retried (spec 7.4): "
+                "an error that holds one cannot be retryable"
+            )
         super().__init__(message)
         self.retryable = retryable
         self.status = status
         #: True when the provider said the request does not fit the model's context
         #: window. Spec 7.4: the session answers it with one compaction and one retry.
         self.context_overflow = context_overflow
+        #: What had arrived when a stream broke midway (spec 7.4): the text received, as
+        #: :func:`partial_reply` builds it, and the usage the provider had reported by
+        #: then. None when nothing a person could have seen or a tool could have run on
+        #: had arrived, so that the request may be asked again. Never set on an error
+        #: that is retryable.
+        self.partial = partial
 
 
 @runtime_checkable
 class ModelClient(Protocol):
+    """Something that answers a :class:`ModelRequest`.
+
+    ``on_text``, when given, is called with every piece of visible reply text as it
+    arrives, in order, so that a person can read a reply that takes tens of seconds
+    while it is written. It is never given thinking text or the arguments of a tool
+    call, and the pieces joined are the reply's text blocks joined. A stream that
+    breaks midway raises a :class:`ModelError` whose ``partial`` holds what had arrived.
+    """
+
     @property
     def model_id(self) -> str: ...
 
-    async def complete(self, request: ModelRequest) -> ModelReply: ...
+    async def complete(
+        self, request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply: ...

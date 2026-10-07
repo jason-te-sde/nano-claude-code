@@ -7,14 +7,16 @@ from pathlib import Path
 
 import pytest
 
-from nanoclaude.conversation.transcript import ToolUseBlock, Transcript, user_text
+from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock, Transcript, user_text
 from nanoclaude.providers.base import (
+    ModelError,
     ModelReply,
     ModelRequest,
     StopKind,
     ToolSpec,
     Usage,
     new_call_id,
+    partial_reply,
 )
 
 
@@ -94,3 +96,38 @@ def test_a_new_process_does_not_mint_the_ids_an_earlier_one_did():
     ]
     assert all(re.fullmatch(r"call_[0-9a-f]{12}", one) for one in minted)
     assert minted[0] != minted[1]
+
+
+def test_an_error_carries_no_partial_reply_unless_it_is_given_one():
+    assert ModelError("the provider is down").partial is None
+
+
+def test_an_error_holds_what_had_arrived_of_a_reply_that_broke_off():
+    arrived = ModelReply((TextBlock("half an ans"),), StopKind.CUT_OFF, Usage(10, 2), "m")
+    error = ModelError("the connection was lost", partial=arrived)
+    assert error.partial is arrived
+    assert error.retryable is False
+
+
+def test_a_reply_that_was_partly_received_cannot_be_marked_retryable():
+    # Asking again would show the person the same words twice, and run a call the
+    # first attempt may already have made (spec 7.4). An adapter that built such an
+    # error has a bug, and finds out when it is built rather than when it is retried.
+    arrived = ModelReply((TextBlock("half"),), StopKind.CUT_OFF, Usage(), "m")
+    with pytest.raises(ValueError, match="never retried"):
+        ModelError("the connection was lost", retryable=True, partial=arrived)
+
+
+def test_a_partial_reply_is_the_text_that_arrived_and_nothing_else():
+    arrived = partial_reply(["Hello", "", ", there"], Usage(5, 1), "m")
+    assert arrived == ModelReply(
+        (TextBlock("Hello"), TextBlock(", there")), StopKind.CUT_OFF, Usage(5, 1), "m"
+    )
+
+
+def test_a_partial_reply_with_no_text_is_a_reply_with_no_blocks():
+    # What a stream that broke inside its first tool call leaves: nothing to keep, and
+    # still a reply, so that what the provider had billed by then is not lost.
+    arrived = partial_reply([], Usage(7, 0), "m")
+    assert arrived.blocks == ()
+    assert arrived.usage == Usage(7, 0)

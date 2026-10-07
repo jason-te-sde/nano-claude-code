@@ -5,10 +5,18 @@ distinct error branch, and the status/no-status split in the attempt limit."""
 from collections.abc import Hashable
 from typing import Never
 
+import httpx
 import pytest
 
-from nanoclaude.providers.base import ModelError
-from nanoclaude.providers.retry import RetryPolicy, classify_status, with_retry
+from nanoclaude.conversation.transcript import TextBlock
+from nanoclaude.providers.base import ModelError, ModelReply, StopKind, Usage
+from nanoclaude.providers.retry import (
+    RetryPolicy,
+    classify_status,
+    classify_transport,
+    connection_lost,
+    with_retry,
+)
 
 
 @pytest.mark.parametrize(
@@ -319,3 +327,36 @@ def test_the_marker_is_found_in_the_body_even_past_the_part_of_it_that_is_quoted
 def test_an_error_is_not_an_overflow_unless_it_says_so():
     assert ModelError("boom").context_overflow is False
     assert ModelError("boom", context_overflow=True).context_overflow is True
+
+
+# -- a connection that fails (spec 7.4) ----------------------------------------------
+
+
+def test_a_connection_lost_after_part_of_the_reply_arrived_is_not_retried_and_keeps_it():
+    arrived = ModelReply((TextBlock("half"),), StopKind.CUT_OFF, Usage(5, 0), "m")
+    error = classify_transport(httpx.ReadError("connection reset by peer"), arrived)
+    assert error.retryable is False
+    assert error.partial is arrived
+    assert str(error) == "the connection to the provider was lost: connection reset by peer"
+
+
+@pytest.mark.parametrize(
+    ("lost", "said"),
+    [
+        (httpx.ReadTimeout("no bytes for 600 seconds"), "the provider timed out: no bytes"),
+        (httpx.ConnectError("connection refused"), "could not reach the provider: connection"),
+    ],
+    ids=["timeout", "no connection"],
+)
+def test_a_connection_lost_before_anything_arrived_is_retried_and_says_which_kind(lost, said):
+    error = classify_transport(lost, None)
+    assert error.retryable is True
+    assert error.partial is None
+    assert str(error).startswith(said)
+
+
+def test_a_connection_lost_with_no_message_is_named_by_its_type():
+    # httpx.ReadError is often raised with nothing to say, and "was lost: " ends nowhere.
+    arrived = ModelReply((), StopKind.CUT_OFF, Usage(), "m")
+    error = connection_lost(httpx.ReadError(""), arrived, peer="ollama")
+    assert str(error) == "the connection to ollama was lost: ReadError"

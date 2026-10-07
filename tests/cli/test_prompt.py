@@ -12,6 +12,7 @@ import pty
 import select
 import signal
 import sys
+import termios
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -30,6 +31,7 @@ from nanoclaude.cli.prompt import (
     build_prompt_session,
     discard_pending_input,
     new_prompter,
+    silence_echo,
     wants_vi_mode,
 )
 
@@ -391,3 +393,129 @@ def test_a_terminal_that_cannot_be_flushed_is_not_an_error():
 def test_there_is_nothing_to_discard_without_a_standard_input(monkeypatch):
     monkeypatch.setattr("sys.stdin", None)
     discard_pending_input()
+
+
+# --------------------------------------------------------------------------
+# The terminal's echo, while something is drawn on the screen
+# --------------------------------------------------------------------------
+
+
+def echo_is_on(fd: int) -> bool:
+    return bool(termios.tcgetattr(fd)[3] & termios.ECHO)
+
+
+def test_the_echo_is_off_while_a_terminal_is_silenced_and_on_again_after():
+    master, slave = pty.openpty()
+    stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
+    try:
+        assert echo_is_on(slave)  # the premise: a terminal echoes what is typed
+        restore = silence_echo(stream)
+        assert not echo_is_on(slave)
+        restore()
+        assert echo_is_on(slave)
+        os.write(master, b"k")  # and it echoes again: what is typed comes back
+        assert readable(master, wait=ARRIVES_WITHIN_S)
+        assert os.read(master, 10) == b"k"
+    finally:
+        stream.close()
+        os.close(master)
+        os.close(slave)
+
+
+def test_a_terminal_that_was_already_silent_is_left_as_the_person_had_it():
+    master, slave = pty.openpty()
+    stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
+    try:
+        attributes = termios.tcgetattr(slave)
+        attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
+        silence_echo(stream)()
+        assert not echo_is_on(slave)  # not switched on, since it was not ours to switch off
+    finally:
+        stream.close()
+        os.close(master)
+        os.close(slave)
+
+
+def test_putting_the_echo_back_changes_nothing_else_about_the_terminal():
+    master, slave = pty.openpty()
+    stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
+    try:
+        restore = silence_echo(stream)
+        attributes = termios.tcgetattr(slave)  # somebody else changes a setting meanwhile
+        attributes[3] &= ~termios.ISIG
+        termios.tcsetattr(slave, termios.TCSANOW, attributes)
+        restore()
+        flags = termios.tcgetattr(slave)[3]
+        assert flags & termios.ECHO
+        assert not flags & termios.ISIG  # what was saved before is not written back over it
+    finally:
+        stream.close()
+        os.close(master)
+        os.close(slave)
+
+
+def test_where_there_is_no_termios_the_echo_is_left_alone_and_nothing_fails(monkeypatch):
+    monkeypatch.setitem(sys.modules, "termios", None)
+    master, slave = pty.openpty()
+    stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
+    try:
+        silence_echo(stream)()
+        assert echo_is_on(slave)
+    finally:
+        stream.close()
+        os.close(master)
+        os.close(slave)
+
+
+def test_something_that_is_not_a_terminal_is_not_touched_and_has_nothing_to_put_back():
+    read_end, write_end = os.pipe()
+    stream = os.fdopen(read_end, "rb", buffering=0, closefd=False)
+    try:
+        silence_echo(stream)()
+    finally:
+        stream.close()
+        os.close(read_end)
+        os.close(write_end)
+
+
+def test_a_terminal_that_cannot_be_changed_is_not_an_error():
+    silence_echo(TerminalThatCannotBeFlushed())()
+
+
+def test_a_terminal_that_has_gone_by_the_time_the_echo_is_put_back_is_not_an_error():
+    master, slave = pty.openpty()
+    stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
+    restore = silence_echo(stream)
+    stream.close()
+    os.close(slave)
+    os.close(master)
+    restore()  # the descriptor is closed: there is nothing left to put back, and no one to tell
+
+
+def test_there_is_no_echo_to_silence_without_a_standard_input(monkeypatch):
+    monkeypatch.setattr("sys.stdin", None)
+    silence_echo()()
+
+
+def test_what_was_typed_before_the_echo_was_silenced_is_still_there_to_be_read():
+    # Changing the terminal's settings must not flush its input: a person who typed ahead
+    # before a reply began has typed it, and it waits for the next prompt.
+    master, slave = pty.openpty()
+    stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
+    try:
+        os.write(master, b"abc\n")
+        assert readable(slave, wait=ARRIVES_WITHIN_S)
+        # What the terminal echoed is read, as a screen reads it. A change that waits for the
+        # terminal's output to drain would otherwise wait for ever, here, and not fail.
+        assert readable(master, wait=ARRIVES_WITHIN_S)
+        os.read(master, 100)
+        restore = silence_echo(stream)
+        assert readable(slave)  # not flushed by switching the echo off
+        restore()
+        assert readable(slave)  # nor by putting it back
+        assert os.read(slave, 10) == b"abc\n"
+    finally:
+        stream.close()
+        os.close(master)
+        os.close(slave)

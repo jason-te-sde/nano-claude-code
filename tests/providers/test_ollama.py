@@ -1,5 +1,7 @@
 import json
 import re
+from collections.abc import AsyncIterator, Callable, Sequence
+from pathlib import Path
 
 import httpx
 import pytest
@@ -13,7 +15,15 @@ from nanoclaude.conversation.transcript import (
     user_text,
     validate,
 )
-from nanoclaude.providers.base import ModelClient, ModelError, ModelRequest, StopKind, ToolSpec
+from nanoclaude.providers.base import (
+    ModelClient,
+    ModelError,
+    ModelReply,
+    ModelRequest,
+    StopKind,
+    ToolSpec,
+    Usage,
+)
 from nanoclaude.providers.ollama import (
     DEFAULT_BASE_URL,
     OllamaClient,
@@ -22,10 +32,50 @@ from nanoclaude.providers.ollama import (
     parse_arguments,
 )
 
+CASSETTES = Path(__file__).resolve().parents[1] / "cassettes"
+
 
 def stream_response(chunks: list[dict[str, object]]) -> httpx.Response:
     body = "".join(json.dumps(c) + "\n" for c in chunks)
     return httpx.Response(200, text=body)
+
+
+def lines_of(name: str) -> list[str]:
+    """The lines of a cassette: one chunk of the reply each, as the server sends them."""
+    return [line for line in (CASSETTES / name).read_text().splitlines() if line.strip()]
+
+
+def arriving(
+    lines: Sequence[str], *, log: list[str] | None = None, then: Exception | None = None
+) -> httpx.Response:
+    """A 200 response that sends ``lines`` one at a time, and then fails with ``then``.
+
+    ``then`` is what a dropped connection looks like to the client: raised from the body,
+    after the response began. ``log`` hears each line as it is sent, so that a test can
+    tell what the client did before the next one went out.
+    """
+
+    async def body() -> AsyncIterator[bytes]:
+        for number, line in enumerate(lines):
+            if log is not None:
+                log.append(f"sent {number}")
+            yield (line + "\n").encode()
+        if then is not None:
+            raise then
+
+    return httpx.Response(200, content=body())
+
+
+async def complete_from(
+    response: httpx.Response, on_text: Callable[[str], None] | None = None
+) -> ModelReply:
+    """What ``OllamaClient.complete`` makes of a response it was sent."""
+    transport = httpx.MockTransport(lambda _request: response)
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = OllamaClient(model="qwen3-coder:30b", client=http)
+        return await client.complete(
+            ModelRequest("s", Transcript((user_text("hi"),)), (), 64), on_text=on_text
+        )
 
 
 # -- parse_arguments ---------------------------------------------------------
@@ -391,21 +441,6 @@ async def test_an_unfinished_stream_with_a_pending_tool_call_is_a_non_retryable_
     assert excinfo.value.retryable is False
 
 
-async def test_a_text_only_reply_without_a_final_done_is_still_accepted():
-    # The other half of the check above: a dropped connection after plain
-    # prose is just a shorter reply, not a usable-error condition.
-    def handler(request: httpx.Request) -> httpx.Response:
-        return stream_response([{"message": {"content": "hi"}}])
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        reply = await OllamaClient(model="m", client=http).complete(
-            ModelRequest("s", Transcript((user_text("hi"),)), (), 64)
-        )
-    assert isinstance(reply.blocks[0], TextBlock)
-    assert reply.blocks[0].text == "hi"
-    assert reply.stop is StopKind.END_TURN
-
-
 async def test_a_non_object_stream_chunk_is_a_model_error_not_a_crash():
     # Review focus #3: valid JSON need not be an object. A bare string or list
     # on the wire must become a ModelError, not an AttributeError from
@@ -503,3 +538,188 @@ async def test_a_trailing_slash_on_base_url_does_not_double_up():
         client = OllamaClient(model="m", base_url="http://x/", client=http)
         await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 64))
     assert str(seen[0].url) == "http://x/api/chat"
+
+
+# -- streaming: on_text, and a stream that breaks midway (spec 7.4) --------------
+
+
+async def test_text_chunks_reach_on_text_in_order_and_join_to_the_reply_text():
+    pieces: list[str] = []
+    reply = await complete_from(arriving(lines_of("ollama_text.jsonl")), on_text=pieces.append)
+    # The closing chunk carries an empty content, which is no text to show.
+    assert pieces == ["hel", "lo"]
+    assert reply.blocks == (TextBlock("hello"),)
+
+
+async def test_a_reply_with_a_tool_call_streams_its_text_and_none_of_its_arguments():
+    pieces: list[str] = []
+    reply = await complete_from(arriving(lines_of("ollama_tool_use.jsonl")), on_text=pieces.append)
+    assert pieces == ["I'll read that file."]
+    call = next(b for b in reply.blocks if isinstance(b, ToolUseBlock))
+    assert call.arguments == {"path": "README.md"}  # the call was still collected
+
+
+async def test_complete_hands_text_over_while_the_stream_is_still_arriving():
+    # Not after it: a person reads a reply that takes half a minute as it is written.
+    log: list[str] = []
+    reply = await complete_from(
+        arriving(lines_of("ollama_text.jsonl"), log=log),
+        on_text=lambda piece: log.append(f"text {piece!r}"),
+    )
+    assert reply.blocks == (TextBlock("hello"),)
+    assert log == ["sent 0", "text 'hel'", "sent 1", "text 'lo'", "sent 2"]
+
+
+@pytest.mark.parametrize(
+    "dropped",
+    [
+        httpx.ReadError("connection reset by peer"),
+        httpx.RemoteProtocolError("peer closed connection without a complete message body"),
+        httpx.ReadTimeout("no bytes for 600 seconds"),
+    ],
+    ids=["read error", "protocol error", "timeout"],
+)
+async def test_a_connection_lost_after_text_is_not_retried_and_hands_over_what_arrived(dropped):
+    pieces: list[str] = []
+    seen = lines_of("ollama_text.jsonl")[:1]  # "hel"
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=dropped), on_text=pieces.append)
+    error = caught.value
+    assert error.retryable is False
+    # The counts come with the closing chunk, which had not arrived.
+    assert error.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b"
+    )
+    assert pieces == ["hel"]
+    assert str(dropped) in str(error)
+    # The server was up and answering: telling the person to start it would be wrong.
+    assert "ollama serve" not in str(error)
+
+
+async def test_a_connection_lost_after_a_tool_call_is_not_retried_either():
+    # Nothing to keep, but not asking again: an earlier call in the turn may have run.
+    seen = lines_of("ollama_tool_use.jsonl")[1:2]  # the call, and no text
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
+    error = caught.value
+    assert error.retryable is False
+    assert error.partial == ModelReply((), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b")
+
+
+async def test_a_timeout_before_anything_arrived_is_retryable_as_before():
+    with pytest.raises(ModelError, match="timed out") as caught:
+        await complete_from(arriving([], then=httpx.ReadTimeout("no bytes for 600 seconds")))
+    assert caught.value.retryable is True
+    assert caught.value.partial is None
+
+
+async def test_a_connection_lost_before_anything_arrived_still_says_how_to_start_the_server():
+    # As before: for ollama a connection that fails with nothing sent is a server that is
+    # not running, and is not retried.
+    with pytest.raises(ModelError, match="ollama serve") as caught:
+        await complete_from(arriving([], then=httpx.ReadError("connection reset")))
+    assert caught.value.retryable is False
+    assert caught.value.partial is None
+
+
+async def test_a_stream_that_ends_cleanly_after_a_tool_call_still_hands_over_the_text_before_it():
+    seen = lines_of("ollama_tool_use.jsonl")[:2]  # the text, and a call, with no closing chunk
+    with pytest.raises(ModelError, match="before its tool calls were complete") as caught:
+        await complete_from(arriving(seen))
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("I'll read that file."),), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b"
+    )
+
+
+# -- a stream that was interrupted midway (spec 7.4) -------------------------------
+
+#: What ollama sends in the middle of a stream when the runner behind it dies.
+RUNNER_DIED = json.dumps({"error": "llama runner process has terminated"})
+
+
+async def test_an_error_line_after_text_is_not_retried_and_hands_over_what_arrived():
+    # The server reports the failure on a line of its own and closes the stream cleanly,
+    # so no connection error is raised: what arrived must not be returned as a reply.
+    seen = [*lines_of("ollama_text.jsonl")[:1], RUNNER_DIED]  # "hel", then the error
+    pieces: list[str] = []
+    with pytest.raises(ModelError, match="llama runner process has terminated") as caught:
+        await complete_from(arriving(seen), on_text=pieces.append)
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b"
+    )
+    assert pieces == ["hel"]
+
+
+async def test_an_error_line_before_any_text_carries_the_providers_message():
+    # It used to come back as "ollama returned no content", and the reason was lost.
+    with pytest.raises(ModelError, match="llama runner process has terminated") as caught:
+        await complete_from(arriving([RUNNER_DIED]))
+    assert caught.value.retryable is False
+    assert caught.value.partial is None
+
+
+async def test_an_error_line_after_a_tool_call_is_not_retried_either():
+    seen = [lines_of("ollama_tool_use.jsonl")[1], RUNNER_DIED]  # a call, and no text
+    with pytest.raises(ModelError, match="llama runner process has terminated") as caught:
+        await complete_from(arriving(seen))
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply((), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b")
+
+
+async def test_a_stream_that_ends_after_text_without_its_done_line_was_cut_off():
+    # A clean close, as a proxy or a restarting server makes: the end marker never came.
+    seen = lines_of("ollama_text.jsonl")[:1]
+    with pytest.raises(ModelError, match="complete") as caught:
+        await complete_from(arriving(seen))
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b"
+    )
+
+
+async def test_a_stream_that_ends_before_anything_arrived_is_still_no_content():
+    with pytest.raises(ModelError, match="no content") as caught:
+        await complete_from(arriving([]))
+    assert caught.value.partial is None
+
+
+# -- a stream that cannot be read is a stream that broke, not only one that dropped --
+
+
+async def test_a_body_that_cannot_be_decoded_after_text_keeps_what_arrived():
+    seen = lines_of("ollama_text.jsonl")[:1]
+    with pytest.raises(ModelError, match="bad gzip") as caught:
+        await complete_from(arriving(seen, then=httpx.DecodingError("bad gzip data")))
+    assert caught.value.retryable is False
+    assert "ollama serve" not in str(caught.value)
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(), "qwen3-coder:30b"
+    )
+
+
+async def test_a_line_that_is_not_json_after_text_keeps_what_arrived():
+    seen = lines_of("ollama_text.jsonl")[:1]
+    with pytest.raises(ModelError, match="could not be read") as caught:
+        await complete_from(arriving([*seen, "{not json"]))
+    assert caught.value.retryable is False
+    assert caught.value.partial is not None
+    assert caught.value.partial.blocks == (TextBlock("hel"),)
+
+
+async def test_a_body_that_cannot_be_read_before_anything_arrived_raises_as_it_always_did():
+    with pytest.raises(httpx.DecodingError):
+        await complete_from(arriving([], then=httpx.DecodingError("bad gzip")))
+    with pytest.raises(json.JSONDecodeError):
+        await complete_from(arriving(["{oops"]))
+
+
+async def test_the_counts_the_server_had_reported_are_in_the_partial_reply():
+    lines = lines_of("ollama_text.jsonl")
+    seen = [lines[0], lines[2]]  # "hel", and the closing line with the counts
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(11, 2), "qwen3-coder:30b"
+    )

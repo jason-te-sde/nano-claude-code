@@ -15,7 +15,8 @@ from nanoclaude.agent.loop import (
     start,
     step,
 )
-from nanoclaude.conversation.transcript import Transcript, validate
+from nanoclaude.conversation.transcript import TextBlock, Transcript, validate
+from nanoclaude.providers.base import ModelReply, StopKind, Usage
 from nanoclaude.testing.scripted import calls, calls_many, says
 from nanoclaude.tools.base import ToolOutcome
 
@@ -360,3 +361,11 @@ def test_turn_limit_closes_every_pending_call_not_just_the_first():
     assert [r.tool_use_id for r in results] == ["t1", "t2"]
     assert all(r.is_error for r in results)
     assert all("turn limit" in r.content for r in results)
+
+
+def test_a_reply_that_was_cut_off_is_not_an_answer_and_the_loop_refuses_it():
+    # What arrived of a stream that broke is kept by whoever caught the error, as a message
+    # that says it was cut off. Taken for the model's answer it would end the turn as done.
+    cut_off = ModelReply((TextBlock("half an ans"),), StopKind.CUT_OFF, Usage(), "m")
+    with pytest.raises(LoopError, match="cut off"):
+        step(start("question"), cut_off)

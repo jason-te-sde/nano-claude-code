@@ -19,7 +19,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
-from nanoclaude.providers.base import ModelError
+import httpx
+
+from nanoclaude.providers.base import ModelError, ModelReply
 
 T = TypeVar("T")
 
@@ -106,6 +108,68 @@ def classify_status(status: int, body: str) -> ModelError:
         # the session knows how to fix.
         context_overflow=status == 400 and _reports_overflow(body),
     )
+
+
+def describe(exc: BaseException) -> str:
+    """What a person is told of an exception: its message, or its name when it has none."""
+    return str(exc) or type(exc).__name__
+
+
+def connection_lost(
+    exc: BaseException, partial: ModelReply, *, peer: str = "the provider"
+) -> ModelError:
+    """Spec 7.4, a stream that breaks midway: keep what arrived, and do not ask again.
+
+    The request may already have had effects, and asking again would write the first half
+    of the reply a second time, so the error is not retryable and what to do next is left
+    to the person. ``partial`` is what the adapter had received when the connection went.
+    """
+    return ModelError(
+        f"the connection to {peer} was lost: {describe(exc)}", retryable=False, partial=partial
+    )
+
+
+def classify_transport(exc: httpx.TransportError, partial: ModelReply | None) -> ModelError:
+    """Spec 7.4 for a connection that failed, a timeout included.
+
+    Asked again, as before, unless some of the reply had arrived (``partial`` is not
+    None): then it is :func:`connection_lost`, and not retried.
+    """
+    if partial is not None:
+        return connection_lost(exc, partial)
+    if isinstance(exc, httpx.TimeoutException):
+        return ModelError(f"the provider timed out: {exc}", retryable=True)
+    return ModelError(f"could not reach the provider: {exc}", retryable=True)
+
+
+def unreadable_stream(
+    exc: BaseException, partial: ModelReply, *, peer: str = "the provider"
+) -> ModelError:
+    """Spec 7.4 for a stream that arrived and could not be read: keep what came before.
+
+    A body that does not decode, a line that is not JSON: the connection did not fail, and
+    nothing is wrong with asking, but a reply that was being shown and was never finished
+    is the same case as one whose connection dropped, and is treated the same way.
+    """
+    return ModelError(
+        f"the response from {peer} could not be read: {describe(exc)}",
+        retryable=False,
+        partial=partial,
+    )
+
+
+def classify_stream_error(exc: Exception, partial: ModelReply | None) -> ModelError | None:
+    """What a failure inside a stream's loop means, or None to raise it as it came.
+
+    A connection that failed is :func:`classify_transport`. Anything else the loop raised
+    (httpx.DecodingError, a line that is not JSON, any other ValueError) is kept as a
+    cut-off once some of the reply has arrived, and before that is left as it always was.
+    """
+    if isinstance(exc, httpx.TransportError):
+        return classify_transport(exc, partial)
+    if partial is None:
+        return None
+    return unreadable_stream(exc, partial)
 
 
 async def with_retry(

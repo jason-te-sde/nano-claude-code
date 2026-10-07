@@ -2,7 +2,7 @@ import pytest
 
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock, Transcript, user_text
 from nanoclaude.providers.base import ModelClient, ModelError, ModelRequest, StopKind, Usage
-from nanoclaude.testing.scripted import ScriptedModel, calls, calls_many, says
+from nanoclaude.testing.scripted import ScriptedModel, calls, calls_many, cut_off, says
 
 # A static check, not a runtime one: mypy --strict verifies ScriptedModel's shape
 # (the model_id property, the signature of complete() including async and the
@@ -84,3 +84,51 @@ async def test_calls_many_defaults_usage_to_zero():
 async def test_calls_many_accepts_explicit_token_usage():
     reply = calls_many(("Read", {}, "t1"), input_tokens=10, output_tokens=3)
     assert reply.usage == Usage(10, 3)
+
+
+async def test_a_reply_is_streamed_to_on_text_in_a_few_pieces_that_join_to_its_text():
+    # In one piece, a double would hide what streaming exists to expose: a front end that
+    # copes with the first piece and nothing after it.
+    model = ScriptedModel([says("hello there")])
+    pieces: list[str] = []
+    reply = await model.complete(request(), on_text=pieces.append)
+    assert len(pieces) > 1
+    assert all(pieces)  # an empty piece is no text, and a front end may take it for the first
+    assert "".join(pieces) == "hello there"
+    assert reply == says("hello there")  # the reply itself is as scripted
+
+
+async def test_every_text_block_is_streamed_in_order_and_a_tool_call_is_not_text():
+    model = ScriptedModel([calls("Read", {"path": "src/app.py"}, preamble="reading it")])
+    pieces: list[str] = []
+    await model.complete(request(), on_text=pieces.append)
+    assert "".join(pieces) == "reading it"
+
+
+async def test_a_reply_with_no_text_streams_nothing():
+    model = ScriptedModel([calls("Read", {"path": "a.py"})])
+    pieces: list[str] = []
+    await model.complete(request(), on_text=pieces.append)
+    assert pieces == []
+
+
+async def test_a_text_block_with_nothing_in_it_streams_nothing():
+    model = ScriptedModel([says("")])
+    pieces: list[str] = []
+    await model.complete(request(), on_text=pieces.append)
+    assert pieces == []
+
+
+async def test_a_model_that_is_not_asked_to_stream_hands_over_the_reply_all_the_same():
+    model = ScriptedModel([says("hello there")])
+    assert await model.complete(request()) == says("hello there")
+
+
+def test_cut_off_is_an_error_that_is_not_retryable_and_holds_the_text_that_arrived():
+    error = cut_off("half an ans", input_tokens=40, output_tokens=3)
+    assert isinstance(error, ModelError)
+    assert error.retryable is False
+    assert error.partial is not None
+    assert error.partial.blocks == (TextBlock("half an ans"),)
+    assert error.partial.usage == Usage(40, 3)
+    assert error.partial.stop is StopKind.CUT_OFF

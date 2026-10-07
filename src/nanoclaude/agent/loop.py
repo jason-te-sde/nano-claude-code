@@ -141,6 +141,13 @@ def resume(state: LoopState, prompt: str) -> LoopState:
 
 
 def step(state: LoopState, reply: ModelReply) -> StepOutcome:
+    if reply.stop is StopKind.CUT_OFF:
+        # What arrived of a stream that broke is kept by whoever caught the error, as a
+        # message that says so, and the turn stops. Taken for the model's answer here it
+        # would end the turn as completed, and a call it held would be run.
+        raise LoopError(
+            "a reply that was cut off is not an answer: the turn stops, it does not go on"
+        )
     if not reply.blocks:
         raise LoopError("model returned an empty reply")
 
