@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -77,6 +78,17 @@ def nanoclaude_home() -> Path:
 
 class UsageError(Exception):
     """``ncc`` was invoked wrongly. The message is the person's line, as spec 17.9 words it."""
+
+
+class StoreOpenError(Exception):
+    """The session store could not be opened. The message names the file and the reason."""
+
+    def __init__(self, path: Path, cause: Exception) -> None:
+        reason = (cause.strerror if isinstance(cause, OSError) else None) or str(cause)
+        super().__init__(
+            f"cannot open the session store at {path} ({reason or type(cause).__name__}) "
+            "— check that the directory exists and that you can write to it"
+        )
 
 
 def _turns(text: str) -> int:
@@ -177,9 +189,17 @@ def main(argv: list[str] | None = None) -> int:
     except ModelError as exc:
         show_error(err, _with_advice(str(exc), _PROVIDER_ADVICE))
         return EXIT_CODES["provider"]
+    except StoreOpenError as exc:
+        show_error(err, str(exc))
+        return EXIT_CODES["stopped"]
     except KeyboardInterrupt:
         show_notice(err, "interrupted")
         return EXIT_CODES["interrupted"]
+    except Exception as exc:
+        # Last, after every exception that has a line and a code of its own. A script reads
+        # the exit code and the first line of stderr, and a traceback is neither.
+        show_error(err, _unexpected(exc))
+        return EXIT_CODES["stopped"]
 
 
 def _settings(args: argparse.Namespace) -> _Settings:
@@ -292,6 +312,22 @@ def _stderr_console(args: argparse.Namespace) -> Console:
     )
 
 
+def _is_busy(exc: BaseException) -> bool:
+    """A store that another process holds a lock on: not a bug, and gone by itself."""
+    return isinstance(exc, sqlite3.OperationalError) and any(
+        word in str(exc).lower() for word in ("locked", "busy")
+    )
+
+
+def _unexpected(exc: Exception) -> str:
+    """What a person is told of an exception nobody planned for, as spec 17.9 words it."""
+    if _is_busy(exc):
+        return "the session store is busy — another ncc may be using it; try again"
+    detail = " ".join(str(exc).split())
+    what = f"{type(exc).__name__}: {detail}" if detail else type(exc).__name__
+    return f"unexpected error ({what}) — this is a bug; please report it"
+
+
 def _with_advice(message: str, advice: str) -> str:
     """``message`` as spec 17.9 words an error: what happened, an em dash, what to do.
 
@@ -347,8 +383,8 @@ def _build_session(
     )
     state_dir = home / CONFIG_DIRNAME
     store = Store(state_dir / "sessions.db")
-    store.open()
     try:
+        _open(store)
         session_id, resume = _which_session(args, store, settings.root)
         router = Router(config, CapabilityCache(state_dir / "capabilities.json"))
         todo = TodoState()
@@ -374,6 +410,19 @@ def _build_session(
         # No session exists to close the store, and nobody else has it.
         store.close()
         raise
+
+
+def _open(store: Store) -> None:
+    """Open the store. What cannot be opened is reported with where it was looked for.
+
+    A store that is only busy is left for the general handler, which words that for itself.
+    """
+    try:
+        store.open()
+    except (OSError, sqlite3.Error) as exc:
+        if _is_busy(exc):
+            raise
+        raise StoreOpenError(store.path, exc) from exc
 
 
 def _ui(console: Console | None, root: str, router: Router) -> UI:
