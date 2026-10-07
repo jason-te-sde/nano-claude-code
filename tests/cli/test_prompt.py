@@ -506,6 +506,10 @@ def test_what_was_typed_before_the_echo_was_silenced_is_still_there_to_be_read()
     try:
         os.write(master, b"abc\n")
         assert readable(slave, wait=ARRIVES_WITHIN_S)
+        # What the terminal echoed is read, as a screen reads it. A change that waits for the
+        # terminal's output to drain would otherwise wait for ever, here, and not fail.
+        assert readable(master, wait=ARRIVES_WITHIN_S)
+        os.read(master, 100)
         restore = silence_echo(stream)
         assert readable(slave)  # not flushed by switching the echo off
         restore()
