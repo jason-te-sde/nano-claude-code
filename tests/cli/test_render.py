@@ -323,6 +323,17 @@ def test_code_that_holds_html_is_shown_as_it_always_was():
     assert "&lt;" not in text  # nothing is escaped on the way in
 
 
+def test_a_table_in_model_prose_is_drawn_as_a_table():
+    text = capture(render_markdown("| name | size |\n|---|---|\n| a.py | 12 |"))
+    assert "name" in text and "a.py" in text and "12" in text
+    assert "|---|" not in text  # the row of dashes is syntax, and is not shown
+
+
+def test_struck_through_text_in_model_prose_is_not_shown_with_its_marks():
+    text = capture(render_markdown("this is ~~gone~~ now"))
+    assert "gone" in text and "~~" not in text
+
+
 def test_an_autolink_still_shows_its_address():
     assert "http://example.org/a" in capture(render_markdown("<http://example.org/a>"))
 
