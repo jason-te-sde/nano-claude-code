@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import io
 import re
+import time
 import unicodedata
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -64,6 +65,7 @@ from tests.cli.helpers import (
     unstyled,
     write_request,
 )
+from tests.cli.screen import cursor_is_hidden, foreign_controls, on_screen
 from tests.fifo import call_without_blocking, make_fifo
 
 ALLOW = PermissionResult(Decision.ALLOW, "rule.allow", "allowed")
@@ -1544,3 +1546,318 @@ _conforms: UI = ConsoleUI(Console())
 
 def test_the_console_ui_is_a_ui():
     assert isinstance(_conforms, UI)
+
+
+# --------------------------------------------------------------------------
+# A reply as it arrives (spec 8): the indicator, the live region, and the plain fallback
+# --------------------------------------------------------------------------
+
+MODELS = {"main": "claude-sonnet-5", "compact": "claude-haiku-4-5"}
+
+
+def rows(text: str) -> list[str]:
+    """The lines of what a plain console printed, without the blanks Markdown pads them with."""
+    return [line.rstrip() for line in text.splitlines()]
+
+
+class Display:
+    """A ConsoleUI on a console that is a colour terminal, and what it has put on the screen.
+
+    ``raw`` is every byte it wrote, frame after frame. ``seen`` is what a person looking at
+    a terminal of this height would see: the lines that scrolled off and then the screen.
+    """
+
+    def __init__(
+        self,
+        *,
+        width: int = 60,
+        height: int = 30,
+        model_of: Callable[[str], str] | None = MODELS.__getitem__,
+        answers: tuple[str, ...] = (),
+    ) -> None:
+        self.console, self._buffer = terminal_console(width, height=height, no_color=False)
+        self.height = height
+        self.prompter = ScriptedPrompter(*answers)
+        self.ui = ConsoleUI(self.console, prompter=self.prompter, model_of=model_of)
+
+    @property
+    def raw(self) -> str:
+        return self._buffer.getvalue()
+
+    @property
+    def seen(self) -> str:
+        return on_screen(self.raw, self.height)
+
+    def stream(self, *pieces: str) -> None:
+        """A request, answered with ``pieces`` in turn, and ended: what the session does."""
+        self.ui.on_request_start("main")
+        for piece in pieces:
+            self.ui.on_text(piece)
+        self.ui.on_request_end()
+
+
+@pytest.fixture
+def display_for() -> Iterator[Callable[..., Display]]:
+    """Build displays, and end whatever request is still on screen when the test is over.
+
+    A test that fails halfway must not leave a thread drawing into a console nobody reads.
+    """
+    made: list[Display] = []
+
+    def make(**options: object) -> Display:
+        made.append(Display(**options))  # type: ignore[arg-type]
+        return made[-1]
+
+    yield make
+    for display in made:
+        display.ui.on_request_end()
+
+
+def until(condition: Callable[[], bool], what: str) -> None:
+    """Wait for ``condition``, and fail by name if it never holds.
+
+    For what a live display draws by itself: it repaints on its own thread, a tenth of a
+    second apart, and a test waits for the condition, with a limit, and not for a guess at
+    the time. Nothing else runs on the loop that it would be holding up.
+    """
+    deadline = time.monotonic() + 5
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"never became true: {what}")
+        time.sleep(0.01)
+
+
+def test_the_indicator_names_the_model_until_the_first_text_arrives(display_for):
+    display = display_for()
+    display.ui.on_request_start("main")
+    assert "waiting for claude-sonnet-5" in display.seen
+    assert len(display.seen.splitlines()) == 1
+
+
+def test_a_request_that_is_not_the_main_ones_says_which_role_it_is_for(display_for):
+    # Compaction runs by itself before a prompt, and a model nobody asked for is named.
+    display = display_for()
+    display.ui.on_request_start("compact")
+    assert "waiting for claude-haiku-4-5 (compact)" in display.seen
+
+
+def test_with_no_way_to_name_the_model_the_indicator_names_the_role(display_for):
+    display = display_for(model_of=None)
+    display.ui.on_request_start("main")
+    assert "waiting for the main model" in display.seen
+
+
+def test_a_model_name_is_text_and_not_markup(display_for):
+    display = display_for(model_of=lambda _role: "local/qwen[/x] [bold]3[/bold]")
+    display.ui.on_request_start("main")
+    assert "waiting for local/qwen[/x] [bold]3[/bold]" in display.seen
+
+
+def test_the_indicator_gives_way_to_the_text_the_moment_it_arrives(display_for):
+    display = display_for()
+    display.ui.on_request_start("main")
+    display.ui.on_text("Hel")
+    assert display.seen == "Hel"  # the indicator's line is gone, and the text is drawn
+
+
+def test_whitespace_alone_does_not_end_the_wait(display_for):
+    # Models open a reply with blank lines. There is nothing to read yet.
+    display = display_for()
+    display.ui.on_request_start("main")
+    display.ui.on_text("\n\n")
+    assert "waiting for claude-sonnet-5" in display.seen
+    display.ui.on_text("Hi")
+    assert display.seen == "Hi"
+
+
+def test_a_streamed_reply_appears_on_the_screen_exactly_once(display_for):
+    display = display_for()
+    display.stream("It was the ", "**best** of ", "times.")
+    # Every frame drew it again, and the screen holds the last: not twice, and not none.
+    display.ui.on_reply(reply("It was the **best** of times."))
+    assert display.seen == "It was the best of times.\n"
+
+
+def test_a_burst_of_text_is_drawn_a_few_times_and_not_once_for_every_piece(display_for):
+    # Redrawn after every piece, a reply that is written in two hundred pieces would parse
+    # and paint itself as Markdown two hundred times. At most ten times a second.
+    display = display_for()
+    display.stream(*(f"w{number} " for number in range(200)))
+    drawn = display.raw.count("w0 ")
+    assert 2 <= drawn <= 5, f"the first words were drawn {drawn} times"
+
+
+def test_a_reply_taller_than_the_screen_shows_its_newest_text_as_it_arrives(display_for):
+    # Rich would show the top of it and hide the end, which is the part being written, and
+    # drawn without limit it would leave a copy of the top behind in every frame.
+    display = display_for(width=40, height=10)
+    display.ui.on_request_start("main")
+    for number in range(1, 26):
+        display.ui.on_text(f"Paragraph {number}\n\n")
+    until(lambda: "Paragraph 25" in display.seen, "the newest paragraph is on screen")
+    assert "Paragraph 1" not in display.seen.splitlines()  # the top has scrolled out of the way
+    assert len(display.seen.splitlines()) <= 10
+
+
+def test_a_reply_taller_than_the_screen_ends_as_all_of_itself_exactly_once(display_for):
+    display = display_for(width=40, height=10)
+    display.stream(*(f"Paragraph {number}\n\n" for number in range(1, 26)))
+    shown = [line for line in display.seen.splitlines() if line.startswith("Paragraph")]
+    assert shown == [f"Paragraph {number}" for number in range(1, 26)]
+
+
+@pytest.mark.parametrize(
+    ("pieces", "shown"),
+    [
+        (["a", "\x1b[2J", "b"], "ab"),
+        (["a\x1b[3", "1mb"], "ab"),  # an escape sequence split between two pieces
+        (["a\x1b]0;TI", "TLE\x07b"], "ab"),  # a window title split between two
+        (["a\x9b2Jb"], "a2Jb"),  # the one-byte form of a CSI is removed, and its tail is text
+        (["a\x07b\r"], "ab"),
+    ],
+    ids=["whole", "split csi", "split title", "c1", "bell"],
+)
+def test_escape_sequences_in_streamed_text_are_not_acted_on(display_for, pieces, shown):
+    display = display_for()
+    display.stream(*pieces)
+    # What the terminal was sent holds nothing but the display's own drawing, and what the
+    # person reads is the text with the sequence taken out of the whole, not out of its
+    # pieces: taken out of each piece alone, the split ones would show as "[31m".
+    assert foreign_controls(display.raw) == []
+    assert display.seen == shown + "\n"
+
+
+def test_markup_in_streamed_text_is_printed_as_it_is_and_never_parsed(display_for):
+    text = "see [/] and [bold]x[/bold] and [link=https://evil.example]y[/link]"
+    display = display_for(width=100)
+    display.stream(text[:20], text[20:])  # must not raise MarkupError, at any point
+    assert display.seen == text + "\n"
+
+
+def test_a_link_in_streamed_text_shows_where_it_goes(display_for):
+    display = display_for(width=80)
+    display.stream("See [the docs](https://example.com/docs) now.")
+    assert "the docs" in display.seen and "https://example.com/docs" in display.seen
+    assert "\x1b]8;" not in display.raw  # no terminal hyperlink, which hides the address
+
+
+@pytest.mark.parametrize("streamed", [[], ["Partial answer"]], ids=["no text", "text"])
+def test_ending_a_request_clears_the_indicator_or_stops_the_live_region_whatever_became_of_it(
+    display_for, streamed
+):
+    # What the session does after an error and after Ctrl+C: it ends the request, and does
+    # not report a reply. The text that arrived stays; nothing else does.
+    display = display_for()
+    display.ui.on_request_start("main")
+    for piece in streamed:
+        display.ui.on_text(piece)
+    display.ui.on_request_end()
+    assert cursor_is_hidden(display.raw) is False
+    assert display.seen == ("Partial answer\n" if streamed else "")
+    # The console is the caller's again: what is printed next lands below, as ordinary text.
+    display.console.print("error: it broke")
+    assert display.seen == ("Partial answer\n" if streamed else "") + "error: it broke\n"
+
+
+def test_ending_a_request_that_is_not_on_screen_is_harmless(display_for):
+    display = display_for()
+    display.ui.on_request_end()
+    display.ui.on_request_end()
+    assert display.raw == ""
+
+
+def test_a_request_that_is_started_again_ends_the_one_before(display_for):
+    display = display_for()
+    display.ui.on_request_start("main")
+    display.ui.on_request_start("main")
+    assert len(display.seen.splitlines()) == 1  # one indicator, not two
+    display.ui.on_request_end()
+    assert cursor_is_hidden(display.raw) is False
+
+
+async def test_a_confirmation_is_never_asked_while_something_is_on_the_screen(display_for):
+    display = display_for(answers=("y",))
+    when_asked: list[tuple[bool, str]] = []
+    display.prompter.on_ask = lambda _message: when_asked.append(
+        (cursor_is_hidden(display.raw), display.seen)
+    )
+    display.ui.on_request_start("main")
+    display.ui.on_text("I will run it.")
+    call = ToolUseBlock("c1", "Bash", {"command": "ls"})
+    assert await display.ui.confirm(call, write_request("Bash", "ls"), ASK) is Approval.ONCE
+    [(hidden, seen)] = when_asked
+    assert hidden is False  # nothing is drawing any more
+    assert seen.startswith("I will run it.\n")  # and what it had drawn is there to read
+
+
+def test_a_retry_notice_is_printed_above_the_indicator_which_stays_up(display_for):
+    display = display_for()
+    display.ui.on_request_start("main")
+    display.ui.on_retry(1, 2.0, "overloaded_error")
+    lines = display.seen.splitlines()
+    assert lines[0] == "provider busy, retry 1 in 2.0s overloaded_error"
+    assert "waiting for claude-sonnet-5" in lines[-1]
+
+
+def test_a_console_that_is_not_a_terminal_prints_the_text_once_at_the_end():
+    screen = Screen()
+    screen.ui.on_request_start("main")
+    screen.ui.on_text("It was ")
+    screen.ui.on_text("**bold**.")
+    assert screen.text == ""  # no indicator, no live region, and nothing until the end
+    screen.ui.on_request_end()
+    assert rows(screen.text) == ["It was bold."]
+    screen.ui.on_reply(reply("It was **bold**."))
+    assert rows(screen.text) == ["It was bold."]  # not again
+
+
+def test_text_streamed_to_a_plain_console_is_printed_when_the_request_ends_early():
+    # An error, or Ctrl+C: the request ends with no reply, and the text that arrived is shown.
+    screen = Screen()
+    screen.ui.on_request_start("main")
+    screen.ui.on_text("Partial answer")
+    screen.ui.on_request_end()
+    assert rows(screen.text) == ["Partial answer"]
+
+
+def test_no_color_in_the_environment_means_no_live_region_and_no_indicator_on_a_terminal(
+    monkeypatch,
+):
+    monkeypatch.setenv("NO_COLOR", "1")
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=60, force_terminal=True, legacy_windows=False)
+    ui = ConsoleUI(console, prompter=ScriptedPrompter(), model_of=MODELS.__getitem__)
+    ui.on_request_start("main")
+    ui.on_text("It was ")
+    ui.on_text("**bold**.")
+    assert buffer.getvalue() == ""
+    ui.on_request_end()
+    assert rows(unstyled(buffer.getvalue())) == ["It was bold."]
+    assert colour_codes(buffer.getvalue()) == []
+    assert "\x1b[?25" not in buffer.getvalue()  # the cursor was never touched
+
+
+def test_a_dumb_terminal_gets_plain_output_as_well(monkeypatch):
+    monkeypatch.setenv("TERM", "dumb")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=60, force_terminal=True, legacy_windows=False)
+    assert console.is_dumb_terminal  # the premise: it cannot move the cursor
+    ui = ConsoleUI(console, prompter=ScriptedPrompter(), model_of=MODELS.__getitem__)
+    ui.on_request_start("main")
+    ui.on_text("It was bold.")
+    assert buffer.getvalue() == ""
+    ui.on_request_end()
+    assert rows(buffer.getvalue()) == ["It was bold."]
+
+
+def test_a_reply_that_did_not_stream_is_printed_by_on_reply_and_the_next_one_is_not_skipped():
+    screen = Screen()
+    screen.ui.on_request_start("main")
+    screen.ui.on_text("first")
+    screen.ui.on_request_end()
+    screen.ui.on_reply(reply("first"))  # streamed: already shown
+    screen.ui.on_request_start("main")  # a text-protocol request: nothing streams
+    screen.ui.on_request_end()
+    screen.ui.on_reply(reply("second"))
+    assert rows(screen.text) == ["first", "second"]

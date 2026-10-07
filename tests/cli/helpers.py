@@ -22,11 +22,25 @@ def plain_console(width: int = 100) -> tuple[Console, io.StringIO]:
     return Console(file=buffer, width=width, no_color=True, force_terminal=False), buffer
 
 
-def terminal_console(width: int = 100) -> tuple[Console, io.StringIO]:
-    """A console that believes it is a colour terminal, and the bytes it has written."""
+def terminal_console(
+    width: int = 100, *, height: int | None = None, no_color: bool | None = None
+) -> tuple[Console, io.StringIO]:
+    """A console that believes it is a colour terminal, and the bytes it has written.
+
+    ``height`` is the number of lines it believes the screen has: left out, Rich takes
+    it from the environment (``LINES``), and a test about the screen should not. ``no_color``
+    left out is Rich's own default, which reads ``NO_COLOR``; a test about what a terminal
+    shows says ``False``, so that it does not depend on whose environment it runs in.
+    """
     buffer = io.StringIO()
     console = Console(
-        file=buffer, width=width, force_terminal=True, color_system="standard", legacy_windows=False
+        file=buffer,
+        width=width,
+        height=height,
+        force_terminal=True,
+        color_system="standard",
+        legacy_windows=False,
+        no_color=no_color,
     )
     return console, buffer
 
