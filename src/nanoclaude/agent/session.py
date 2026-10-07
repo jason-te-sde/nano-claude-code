@@ -186,6 +186,9 @@ class Session:
     # _next_audit_turn is the first number no batch has used: the base of the next prompt.
     _audit_turn_base: int = field(default=0, init=False, repr=False)
     _next_audit_turn: int = field(default=0, init=False, repr=False)
+    # The text the last prompt's reply left when it was cut off midway, as kept in the
+    # conversation without the marker; None when it was not, or left none.
+    _cut_off_text: str | None = field(default=None, init=False, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -245,6 +248,17 @@ class Session:
         """Dollars spent so far, or None when any model used has no price."""
         return self.router.total_cost()
 
+    @property
+    def cut_off_text(self) -> str | None:
+        """What the last prompt's reply had said when its stream broke, or None.
+
+        The text :meth:`_keep_cut_off` kept in the conversation, without the marker the
+        model is shown, for a front end that does not stream: the error that ended the
+        prompt says the text is kept and not what it is. None when the last prompt was not
+        cut off, left no text, or the conversation has been cleared since.
+        """
+        return self._cut_off_text
+
     async def run(self, prompt: str) -> Done:
         """Start a new conversation with ``prompt`` and drive it until the model stops."""
         self.state = loop.start(self._expand(prompt), max_turns=self.config.limits.max_turns)
@@ -271,6 +285,7 @@ class Session:
         return text
 
     async def _drive(self) -> Done:
+        self._cut_off_text = None
         failures = 0  # replies in a row that held tool calls we could not parse, and no usable one
         while True:
             self._persist()
@@ -489,6 +504,7 @@ class Session:
             return ModelError(f"{what} \u2014 ask the model to continue", retryable=False)
         marked = assistant_text(f"{text}\n\n{_CUT_OFF_REPLY}")
         self.state = replace(self.state, transcript=self.state.transcript.append(marked))
+        self._cut_off_text = text
         self._persist()
         self.ui.on_reply(partial)
         return ModelError(
@@ -711,6 +727,7 @@ class Session:
         What was there stays in the archive.
         """
         self.state = LoopState(Transcript(), turn=0, max_turns=self.config.limits.max_turns)
+        self._cut_off_text = None
         self._persist()
 
     async def aclose(self) -> None:
