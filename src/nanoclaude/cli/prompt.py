@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Protocol
 
@@ -98,7 +98,7 @@ def new_prompter(*, input: Input | None = None, output: Output | None = None) ->
 
 
 class _Descriptor(Protocol):
-    """What ``discard_pending_input`` asks of a stream: whether it is a terminal, and where."""
+    """What the terminal helpers ask of a stream: whether it is a terminal, and where."""
 
     def isatty(self) -> bool: ...
 
@@ -125,6 +125,54 @@ def discard_pending_input(stream: _Descriptor | None = None) -> None:
             termios.tcflush(stream.fileno(), termios.TCIFLUSH)
     except (AttributeError, OSError, ValueError, termios.error):
         return
+
+
+def _nothing_to_put_back() -> None:
+    """What ``silence_echo`` returns where it changed nothing."""
+
+
+def silence_echo(stream: _Descriptor | None = None) -> Callable[[], None]:
+    """Stop the terminal echoing what is typed, and return what puts the echo back.
+
+    For as long as a live display is on the screen the echo is a second writer. A key typed
+    ahead, or the ``^C`` of Ctrl+C, is printed at the cursor, and the cursor is at the right
+    edge of the display's last line, so it lands on the line below. The display counts its
+    lines from where it believes the cursor to be, so every frame after that erases one line
+    too few and leaves a copy of itself behind: a cancelled reply is on the screen twice.
+
+    Without the echo what is typed is still queued, for the next prompt to read, and Ctrl+C
+    still signals. Only the printing stops. Only the echo is touched, and only the echo is put
+    back: a setting somebody else changes in between is not written over, and a terminal that
+    was already silent stays so. Only a terminal echoes, so on anything else, a pipe, a file,
+    no standard input at all, this changes nothing and what it returns does nothing.
+    ``stream`` is standard input unless given.
+    """
+    try:
+        import termios  # not on every platform: only where there is a terminal to change
+    except ImportError:
+        return _nothing_to_put_back
+    stream = sys.stdin if stream is None else stream
+    try:
+        if not stream.isatty():
+            return _nothing_to_put_back
+        fd = stream.fileno()
+        attributes = termios.tcgetattr(fd)
+        if not attributes[3] & termios.ECHO:
+            return _nothing_to_put_back
+        attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(fd, termios.TCSANOW, attributes)
+    except (AttributeError, OSError, ValueError, termios.error):
+        return _nothing_to_put_back
+
+    def put_back() -> None:
+        try:
+            now = termios.tcgetattr(fd)
+            now[3] |= termios.ECHO
+            termios.tcsetattr(fd, termios.TCSANOW, now)
+        except (OSError, ValueError, termios.error):
+            return  # the terminal has gone, and there is nothing left to put back
+
+    return put_back
 
 
 def wants_vi_mode(environ: Mapping[str, str]) -> bool:

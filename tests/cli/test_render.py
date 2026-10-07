@@ -1560,11 +1560,31 @@ def rows(text: str) -> list[str]:
     return [line.rstrip() for line in text.splitlines()]
 
 
+class Echo:
+    """Stands in for the echo of a terminal, which a live display switches off while it draws."""
+
+    def __init__(self) -> None:
+        self.silent = False
+        self.silenced = 0
+        self.restored = 0
+
+    def silence(self) -> Callable[[], None]:
+        self.silent = True
+        self.silenced += 1
+
+        def restore() -> None:
+            self.silent = False
+            self.restored += 1
+
+        return restore
+
+
 class Display:
     """A ConsoleUI on a console that is a colour terminal, and what it has put on the screen.
 
     ``raw`` is every byte it wrote, frame after frame. ``seen`` is what a person looking at
     a terminal of this height would see: the lines that scrolled off and then the screen.
+    ``echo`` says whether the terminal is echoing what is typed.
     """
 
     def __init__(
@@ -1578,7 +1598,10 @@ class Display:
         self.console, self._buffer = terminal_console(width, height=height, no_color=False)
         self.height = height
         self.prompter = ScriptedPrompter(*answers)
-        self.ui = ConsoleUI(self.console, prompter=self.prompter, model_of=model_of)
+        self.echo = Echo()
+        self.ui = ConsoleUI(
+            self.console, prompter=self.prompter, model_of=model_of, silence=self.echo.silence
+        )
 
     @property
     def raw(self) -> str:
@@ -1895,3 +1918,51 @@ def test_a_console_that_is_not_a_terminal_gets_no_live_region_even_where_colour_
     ui.on_request_end()
     assert rows(buffer.getvalue()) == ["It was bold."]
     assert "\x1b" not in buffer.getvalue()
+
+
+def test_the_terminal_does_not_echo_what_is_typed_while_a_request_is_on_screen(display_for):
+    # Echoed, a key typed ahead or the ^C of Ctrl+C is printed at the cursor, which is at the
+    # right edge of the display's last line: on the line below it. The display counts its
+    # lines from where it believes the cursor is, so every frame after that leaves one copy
+    # of itself behind.
+    display = display_for()
+    assert not display.echo.silent
+    display.ui.on_request_start("main")
+    assert display.echo.silent  # while the indicator is up
+    display.ui.on_text("Hello")
+    assert display.echo.silent  # and while the live region is
+    display.ui.on_request_end()
+    assert not display.echo.silent
+    assert (display.echo.silenced, display.echo.restored) == (1, 1)
+
+
+async def test_the_echo_is_back_before_a_question_is_asked(display_for):
+    display = display_for(answers=("y",))
+    when_asked: list[bool] = []
+    display.prompter.on_ask = lambda _message: when_asked.append(display.echo.silent)
+    display.ui.on_request_start("main")
+    display.ui.on_text("I will run it.")
+    call = ToolUseBlock("c1", "Bash", {"command": "ls"})
+    await display.ui.confirm(call, write_request("Bash", "ls"), ASK)
+    assert when_asked == [False]
+
+
+def test_a_request_that_is_started_again_puts_the_echo_back_before_it_takes_it_away_again(
+    display_for,
+):
+    display = display_for()
+    display.ui.on_request_start("main")
+    display.ui.on_request_start("main")
+    display.ui.on_request_end()
+    assert (display.echo.silenced, display.echo.restored) == (2, 2)
+    assert not display.echo.silent
+
+
+def test_a_console_that_draws_nothing_live_leaves_the_echo_alone():
+    echo = Echo()
+    console, _ = plain_console()
+    ui = ConsoleUI(console, prompter=ScriptedPrompter(), silence=echo.silence)
+    ui.on_request_start("main")
+    ui.on_text("It was bold.")
+    ui.on_request_end()
+    assert echo.silenced == 0  # there is no display to be thrown off by it

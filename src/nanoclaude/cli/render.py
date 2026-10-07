@@ -32,7 +32,9 @@ names the model, then the text so far as Markdown in a live region that is drawn
 ten times a second, and left on the screen when the request ends. Nothing live is drawn on a
 console that is not a terminal, that cannot move the cursor, or that has ``NO_COLOR`` set: the
 text is printed once, when the request ends. A question to the person is never asked with
-anything live on the screen.
+anything live on the screen. While a request is on the screen the terminal's own echo is off:
+a key typed ahead, or the ``^C`` of Ctrl+C, would be printed at the cursor and throw the
+display off by a line, which leaves a copy of its last frame behind.
 """
 
 from __future__ import annotations
@@ -55,7 +57,7 @@ from rich.text import Text
 from nanoclaude.agent.router import Router
 from nanoclaude.agent.session import Session
 from nanoclaude.agent.ui import Approval
-from nanoclaude.cli.prompt import Questioner, discard_pending_input, new_prompter
+from nanoclaude.cli.prompt import Questioner, discard_pending_input, new_prompter, silence_echo
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
@@ -348,6 +350,7 @@ class ConsoleUI:
         root: str | None = None,
         discard_input: Callable[[], None] | None = None,
         model_of: Callable[[str], str] | None = None,
+        silence: Callable[[], Callable[[], None]] | None = None,
     ) -> None:
         self._console = console
         self._auto = auto_approve
@@ -355,6 +358,11 @@ class ConsoleUI:
         # role and not a model, and which model plays a role changes with /model, so it asks
         # when a request starts. Without it the indicator names the role.
         self._model_of = model_of
+        # What stops the terminal echoing what is typed while a live display is on the screen,
+        # and returns what puts the echo back: the echo moves the cursor the display counts
+        # its lines from.
+        self._silence = silence if silence is not None else silence_echo
+        self._put_echo_back: Callable[[], None] | None = None
         # The project, so that a path inside it can be shown relative to it: "src/a.py" is
         # shorter than the resolved path and says the same. Resolved, like the paths of a
         # request are. Without it a path is shown whole.
@@ -596,6 +604,7 @@ class ConsoleUI:
         self.on_request_end()  # a request that never ended is over now
         self._streamed = False
         if self._animated():
+            self._put_echo_back = self._silence()
             self._waiting = self._display(
                 Spinner("dots", text=self._waiting_for(role)), transient=True
             )
@@ -618,6 +627,7 @@ class ConsoleUI:
         waiting, self._waiting = self._waiting, None
         live, self._live = self._live, None
         arriving, self._arriving = self._arriving, None
+        put_echo_back, self._put_echo_back = self._put_echo_back, None
         if waiting is not None:
             waiting.stop()  # transient: its line is erased
         if live is not None:
@@ -626,6 +636,8 @@ class ConsoleUI:
             live.stop()  # draws all of the reply, once, and leaves it there
         elif arriving is not None and self._streamed:
             self._console.print(render_markdown(arriving.text.strip()))
+        if put_echo_back is not None:
+            put_echo_back()
 
     def on_decision(
         self, call: ToolUseBlock, request: PermissionRequest, result: PermissionResult
