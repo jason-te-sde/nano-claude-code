@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, assert_never
@@ -38,8 +39,9 @@ from nanoclaude.agent.session import (
     UnknownSessionError,
     new_session_id,
 )
-from nanoclaude.agent.ui import AutoDecline
-from nanoclaude.cli.render import show_error, show_notice
+from nanoclaude.agent.ui import UI, AutoDecline
+from nanoclaude.cli.render import ConsoleUI, show_error, show_notice
+from nanoclaude.cli.repl import run_repl
 from nanoclaude.config.load import CONFIG_DIRNAME, ConfigError, expand_root, load_config
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.budget import ContextTooSmallError
@@ -150,15 +152,15 @@ def main(argv: list[str] | None = None) -> int:
     err = _stderr_console(args)
     home = nanoclaude_home()
     try:
-        if args.prompt is None:
-            raise UsageError("nothing to do — pass a prompt with -p, or run: ncc init")
-        if not args.prompt.strip():
+        if args.prompt is not None and not args.prompt.strip():
             raise UsageError(
                 "--print needs a prompt — pass the task as its argument, "
                 'as in: ncc -p "explain main.py"'
             )
         settings = _settings(args)
         _warn_about_switches(args, err)
+        if args.prompt is None:
+            return asyncio.run(_run_interactive(args, settings, home, _stdout_console(args)))
         outcome = asyncio.run(_run_headless(args, settings, home))
         _report(outcome, args.output_format, err)
         return outcome.code
@@ -267,6 +269,12 @@ def _no_color(args: argparse.Namespace) -> bool:
     return args.no_color or bool(os.environ.get("NO_COLOR"))
 
 
+def _stdout_console(args: argparse.Namespace) -> Console:
+    """What the REPL writes to. What it prints from outside is built as Text, which Rich never
+    parses as markup, so the console is left as Rich makes it."""
+    return Console(no_color=_no_color(args))
+
+
 def _stderr_console(args: argparse.Namespace) -> Console:
     """Where every complaint goes: stderr, never parsed as markup, never wrapped.
 
@@ -314,7 +322,9 @@ def _write_result(text: str) -> None:
     sys.stdout.write(shown if shown.endswith("\n") else shown + "\n")
 
 
-def _build_session(args: argparse.Namespace, settings: _Settings, home: Path) -> Session:
+def _build_session(
+    args: argparse.Namespace, settings: _Settings, home: Path, console: Console | None
+) -> Session:
     config = load_config(home=str(home), project=settings.root, env=dict(os.environ))
     if args.model:
         config = replace(config, roles=replace(config.roles, main=args.model))
@@ -350,7 +360,7 @@ def _build_session(args: argparse.Namespace, settings: _Settings, home: Path) ->
             router=router,
             registry=default_registry(todo),
             policy=policy,
-            ui=AutoDecline(),
+            ui=_ui(console, settings.root, router),
             store=store,
             audit=AuditLog(store, redactor),
             session_id=session_id,
@@ -363,6 +373,27 @@ def _build_session(args: argparse.Namespace, settings: _Settings, home: Path) ->
         # No session exists to close the store, and nobody else has it.
         store.close()
         raise
+
+
+def _ui(console: Console | None, root: str, router: Router) -> UI:
+    """The front end for the session: none that asks, for headless, and ConsoleUI for the REPL.
+
+    ConsoleUI is told where the project is, so that it shows ``src/a.py`` and not an absolute
+    path, and how to find the model behind a role, so that its waiting indicator names the
+    model and not the role.
+    """
+    if console is None:
+        return AutoDecline()
+    return ConsoleUI(console, root=root, model_of=_model_of(router))
+
+
+def _model_of(router: Router) -> Callable[[str], str]:
+    def model_of(role: str) -> str:
+        # Read when asked and not when built: /model changes which model plays a role.
+        config = router.config
+        return config.models[config.roles.alias_for(role)].model
+
+    return model_of
 
 
 def _which_session(args: argparse.Namespace, store: Store, root: str) -> tuple[str, bool]:
@@ -392,8 +423,18 @@ def _which_session(args: argparse.Namespace, store: Store, root: str) -> tuple[s
     return new_session_id(), False
 
 
+async def _run_interactive(
+    args: argparse.Namespace, settings: _Settings, home: Path, console: Console
+) -> int:
+    session = _build_session(args, settings, home, console)
+    try:
+        return await run_repl(session, console, str(home / CONFIG_DIRNAME / "history"))
+    finally:
+        await session.aclose()
+
+
 async def _run_headless(args: argparse.Namespace, settings: _Settings, home: Path) -> _Outcome:
-    session = _build_session(args, settings, home)
+    session = _build_session(args, settings, home, None)
     try:
         try:
             done = await session.follow_up(args.prompt)
