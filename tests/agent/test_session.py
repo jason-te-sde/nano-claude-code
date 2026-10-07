@@ -3431,3 +3431,19 @@ async def test_a_retryable_error_before_any_text_is_still_retried(tmp_repo, monk
     done = await session.run("hi")
     assert (asked, done.text) == (2, "Hello world")
     assert streamed(stage) == "Hello world"
+
+
+async def test_what_a_summary_that_was_cut_off_had_used_is_recorded_for_the_compact_role(tmp_repo):
+    # The half of a summary is not used, and what the provider billed for it is still spent.
+    session = build_session(
+        tmp_repo,
+        [says("never asked")],
+        compact_script=[cut_off("The conversation so f", input_tokens=50, output_tokens=3)],
+        compact_model="claude-haiku-4-5",
+    )
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    with pytest.raises(ModelError, match="could not summarise"):
+        await session.compact()
+    spent = session.router.by_role()["compact"]
+    assert spent.usage == Usage(50, 3)
+    assert spent.model == "claude-haiku-4-5"

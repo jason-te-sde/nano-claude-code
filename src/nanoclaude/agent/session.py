@@ -582,6 +582,11 @@ class Session:
         try:
             reply = await self._complete("compact", request)
         except ModelError as error:
+            if error.partial is not None:
+                # The half of a summary is of no use, and it was paid for all the same.
+                self.router.record(
+                    "compact", error.partial.usage, *self._adapter_and_model("compact")
+                )
             if error.context_overflow:
                 # The older history is what is being summarised, all of it in one
                 # request, and it does not fit that model's window either. With the
