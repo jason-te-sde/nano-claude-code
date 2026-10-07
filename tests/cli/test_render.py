@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
-from rich.console import Console
+from rich.console import Console, RenderableType
 from rich.live import Live
 
 from nanoclaude.agent.router import Router
@@ -30,6 +30,7 @@ from nanoclaude.cli import render
 from nanoclaude.cli.prompt import build_prompt_session, new_prompter
 from nanoclaude.cli.render import (
     ConsoleUI,
+    _Arriving,
     cost_panel,
     render_diff,
     render_markdown,
@@ -2140,3 +2141,76 @@ def test_the_text_is_still_printed_when_the_indicator_cannot_be_stopped(monkeypa
         ui.on_request_end()
     assert "Hello" in on_screen(buffer.getvalue(), 20)
     assert not echo.silent
+
+
+# --------------------------------------------------------------------------
+# A frame with nothing new in it is not rendered again
+# --------------------------------------------------------------------------
+
+
+def test_a_frame_with_nothing_new_in_it_does_no_markdown_work(monkeypatch):
+    # Parsing and laying out the whole reply costs 70 ms at 40 KB, which is longer than the
+    # tenth of a second between frames: counted, since a clock would only be a guess.
+    drawn: list[str] = []
+    real = render_markdown
+
+    def counting(text: str) -> RenderableType:
+        drawn.append(text)
+        return real(text)
+
+    monkeypatch.setattr("nanoclaude.cli.render.render_markdown", counting)
+    console, _ = terminal_console(60, height=20, no_color=False)
+    arriving = _Arriving()
+    arriving.add("Hello ")
+    for _ in range(5):
+        console.print(arriving)  # five frames, and nothing has arrived between them
+    assert len(drawn) == 1
+    arriving.add("world")
+    console.print(arriving)
+    console.print(arriving)
+    assert len(drawn) == 2  # what is new is rendered, once
+    arriving.settle()
+    console.print(arriving)  # the last frame, with the same text at the same size
+    assert len(drawn) == 2
+    narrow, _ = terminal_console(30, height=20, no_color=False)
+    narrow.print(arriving)
+    assert len(drawn) == 3  # another width is another layout
+
+
+def test_a_frame_from_the_cache_is_the_frame_that_was_drawn_before():
+    console, buffer = terminal_console(40, height=6, no_color=False)
+
+    def arrived() -> _Arriving:
+        arriving = _Arriving()
+        for number in range(1, 9):
+            arriving.add(f"line {number}\n\n")
+        return arriving
+
+    arriving = arrived()
+    console.print(arriving)
+    first = buffer.getvalue()
+    buffer.seek(0)
+    buffer.truncate()
+    console.print(arriving)  # from the cache
+    assert buffer.getvalue() == first
+    buffer.seek(0)
+    buffer.truncate()
+    console.print(arrived())  # drawn afresh
+    assert buffer.getvalue() == first
+    # and it is the tail of a tall reply, as the display shows it while the reply grows
+    assert [line.rstrip() for line in first.splitlines() if line.strip()][-1] == "line 8"
+    assert "line 1" not in first
+
+
+def test_the_last_frame_from_the_cache_holds_the_whole_reply():
+    console, buffer = terminal_console(40, height=6, no_color=False)
+    arriving = _Arriving()
+    for number in range(1, 9):
+        arriving.add(f"line {number}\n\n")
+    console.print(arriving)  # a frame, and so something in the cache
+    arriving.settle()
+    buffer.seek(0)
+    buffer.truncate()
+    console.print(arriving)
+    shown = [line.rstrip() for line in buffer.getvalue().splitlines() if line.strip()]
+    assert shown == [f"line {number}" for number in range(1, 9)]
