@@ -59,6 +59,15 @@ def test_role_overrides_parse_into_pairs():
     assert args.role == ["explore=local", "plan=big"]
 
 
+def test_dangerous_flag_requires_the_long_spelling():
+    parser = build_parser()
+    for spelling in ("--skip-permissions", "--dangerously-skip", "--dang"):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["-p", "x", spelling])
+    args = parser.parse_args(["-p", "x", "--dangerously-skip-permissions"])
+    assert args.dangerously_skip_permissions
+
+
 def test_print_mode_with_no_prompt_is_a_usage_error(capsys):
     code, out, err = run_ncc(capsys, "-p")
     assert code == EXIT_CODES["usage"]
