@@ -938,3 +938,15 @@ def test_a_stream_that_ends_cleanly_mid_tool_call_still_hands_over_the_text_befo
     assert caught.value.partial == ModelReply(
         (TextBlock("I'll read that file."),), StopKind.CUT_OFF, Usage(), "gpt-5"
     )
+
+
+async def test_only_the_visible_text_is_kept_when_the_stream_breaks_after_reasoning_and_text():
+    seen = [
+        {"choices": [{"delta": {"reasoning_content": "weighing it"}}]},
+        {"choices": [{"delta": {"content": "The answer"}}]},
+    ]
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
+    assert caught.value.partial == ModelReply(
+        (TextBlock("The answer"),), StopKind.CUT_OFF, Usage(), "gpt-5"
+    )

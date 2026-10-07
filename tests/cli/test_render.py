@@ -1861,3 +1861,37 @@ def test_a_reply_that_did_not_stream_is_printed_by_on_reply_and_the_next_one_is_
     screen.ui.on_request_end()
     screen.ui.on_reply(reply("second"))
     assert rows(screen.text) == ["first", "second"]
+
+
+def test_the_live_region_is_drawn_at_most_ten_times_a_second(display_for):
+    # A reply that arrives over about a third of a second, a piece every hundredth. Drawn on
+    # a clock of its own, a tenth of a second apart, it is drawn when its text first appears,
+    # when the request ends, and about three times between. This is the one test that lets
+    # time pass: a rate cannot be told from anything else.
+    display = display_for()
+    display.ui.on_request_start("main")
+    began = time.monotonic()
+    for number in range(30):
+        display.ui.on_text(f"w{number} ")
+        time.sleep(0.01)
+    seconds = time.monotonic() - began
+    display.ui.on_request_end()
+    drawn = display.raw.count("w0 ")
+    assert drawn <= 2 + 10 * seconds + 1, f"drawn {drawn} times in {seconds:.2f} seconds"
+
+
+def test_a_console_that_is_not_a_terminal_gets_no_live_region_even_where_colour_is_allowed():
+    # The plain console of these tests is told NO_COLOR as well, so it cannot say which of
+    # the two it is that keeps a live display away.
+    buffer = io.StringIO()
+    console = Console(
+        file=buffer, width=60, force_terminal=False, no_color=False, legacy_windows=False
+    )
+    assert not console.is_terminal and not console.no_color  # the premise
+    ui = ConsoleUI(console, prompter=ScriptedPrompter(), model_of=MODELS.__getitem__)
+    ui.on_request_start("main")
+    ui.on_text("It was bold.")
+    assert buffer.getvalue() == ""
+    ui.on_request_end()
+    assert rows(buffer.getvalue()) == ["It was bold."]
+    assert "\x1b" not in buffer.getvalue()

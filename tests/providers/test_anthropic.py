@@ -705,3 +705,53 @@ def test_a_stream_that_ends_cleanly_mid_tool_call_still_hands_over_the_text_befo
     assert caught.value.partial == ModelReply(
         (TextBlock("I'll read that file."),), StopKind.CUT_OFF, Usage(120, 0), "claude-sonnet-5"
     )
+
+
+async def test_only_the_visible_text_is_kept_when_the_stream_breaks_after_thinking_and_text():
+    seen = [
+        {"event": "message_start", "data": {"message": {"usage": {"input_tokens": 9}}}},
+        {
+            "event": "content_block_start",
+            "data": {"index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+        },
+        {
+            "event": "content_block_delta",
+            "data": {"index": 0, "delta": {"type": "thinking_delta", "thinking": "weighing it"}},
+        },
+        {"event": "content_block_stop", "data": {"index": 0}},
+        {
+            "event": "content_block_start",
+            "data": {"index": 1, "content_block": {"type": "text", "text": ""}},
+        },
+        {
+            "event": "content_block_delta",
+            "data": {"index": 1, "delta": {"type": "text_delta", "text": "The answer"}},
+        },
+    ]
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
+    assert caught.value.partial == ModelReply(
+        (TextBlock("The answer"),), StopKind.CUT_OFF, Usage(9, 0), "claude-sonnet-5"
+    )
+
+
+def test_a_partial_reply_keeps_each_text_block_in_order_and_leaves_the_calls_out():
+    accumulator = StreamAccumulator()
+    accumulator.handle("message_start", {"message": {"usage": {"input_tokens": 3}}})
+    for index, block, delta in (
+        (0, {"type": "text", "text": ""}, {"type": "text_delta", "text": "First. "}),
+        (
+            1,
+            {"type": "tool_use", "id": "t1", "name": "Read"},
+            {"type": "input_json_delta", "partial_json": '{"pa'},
+        ),
+        (2, {"type": "text", "text": ""}, {"type": "text_delta", "text": "Third."}),
+    ):
+        accumulator.handle("content_block_start", {"index": index, "content_block": block})
+        accumulator.handle("content_block_delta", {"index": index, "delta": delta})
+    assert accumulator.partial() == ModelReply(
+        (TextBlock("First. "), TextBlock("Third.")),
+        StopKind.CUT_OFF,
+        Usage(3, 0),
+        "claude-sonnet-5",
+    )

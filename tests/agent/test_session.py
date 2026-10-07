@@ -3219,6 +3219,7 @@ async def test_a_cut_off_stream_keeps_its_text_stores_it_and_stops_with_the_erro
     assert session.store.load_transcript(session.session_id) == session.state.transcript
     # What the provider reported by then is recorded, and the request is not asked again.
     assert session.usage == Usage(120, 7)
+    assert session.state.usage == Usage(120, 7)  # the loop's own count, as for any reply
     assert len(session.model.requests) == 1 and not session.model.exhausted
     assert kinds(stage) == ["start", "text", "text", "text", "end", "reply"]
     assert streamed(stage) == "The first half of an ans"
@@ -3307,3 +3308,28 @@ async def test_a_cut_off_summary_is_not_kept_and_is_the_compact_roles_failure(tm
     assert all(
         "cut off before it finished" not in m.text() for m in session.state.transcript.messages
     )
+
+
+async def test_the_request_asked_again_after_a_compaction_is_streamed_too(tmp_repo):
+    # The provider can say the conversation does not fit. The request is then asked again
+    # after a compaction, and it is that second one which is answered, and shown.
+    stage = Stage()
+    session = build_session(tmp_repo, [overflow(), says("SUMMARY"), says("answer")], ui=stage)
+    session.state = replace(session.state, transcript=tool_history(5, result_chars=400))
+    await session.follow_up("what next")
+    assert [event for event in stage.events if event[0] == "start"] == [
+        ("start", "main"),
+        ("start", "compact"),
+        ("start", "main"),
+    ]
+    assert streamed(stage) == "answer"
+    assert stage.open == 0
+
+
+async def test_a_stream_cut_off_after_only_blank_text_keeps_nothing(tmp_repo):
+    # Blank lines are not a reply: there is nothing to keep, and nothing is said to be kept.
+    session = build_session(tmp_repo, [cut_off("  \n")])
+    with pytest.raises(ModelError) as caught:
+        await session.run("question")
+    assert "kept" not in str(caught.value)
+    assert [m.text() for m in session.state.transcript.messages] == ["question"]
