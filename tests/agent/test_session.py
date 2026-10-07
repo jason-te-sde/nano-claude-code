@@ -3447,3 +3447,79 @@ async def test_what_a_summary_that_was_cut_off_had_used_is_recorded_for_the_comp
     spent = session.router.by_role()["compact"]
     assert spent.usage == Usage(50, 3)
     assert spent.model == "claude-haiku-4-5"
+
+
+# --------------------------------------------------------------------------
+# What ends a request is the error to report, and a frame is never left open
+# --------------------------------------------------------------------------
+
+
+class BreaksWhenEnded(Stage):
+    """A UI whose display fails to end a request."""
+
+    def on_request_end(self) -> None:
+        super().on_request_end()
+        raise RuntimeError("could not end the display")
+
+
+class BreaksWhenStarted(Stage):
+    def on_request_start(self, role: str) -> None:
+        super().on_request_start(role)
+        raise RuntimeError("could not start the display")
+
+
+async def test_a_cancellation_is_not_masked_by_a_display_that_fails_to_end(tmp_repo, monkeypatch):
+    stage = BreaksWhenEnded()
+    session = build_session(tmp_repo, [says("never")], ui=stage)
+    streaming = asyncio.Event()
+
+    async def stalls(
+        request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
+        assert on_text is not None
+        on_text("Once upon")
+        streaming.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the model was allowed to answer")
+
+    monkeypatch.setattr(session.model, "complete", stalls)
+    task = asyncio.create_task(session.run("tell me a story"))
+    await reached(streaming)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):  # not the RuntimeError of the display
+        await task
+    assert stage.open == 0
+
+
+async def test_a_provider_error_is_not_masked_by_a_display_that_fails_to_end(tmp_repo):
+    stage = BreaksWhenEnded()
+    session = build_session(
+        tmp_repo, [ModelError("bad key", retryable=False, status=401)], ui=stage
+    )
+    with pytest.raises(ModelError, match="bad key"):
+        await session.run("hello")
+
+
+async def test_a_request_whose_display_fails_to_start_is_ended_all_the_same(tmp_repo):
+    stage = BreaksWhenStarted()
+    session = build_session(tmp_repo, [says("never")], ui=stage)
+    with pytest.raises(RuntimeError, match="could not start"):
+        await session.run("hello")
+    assert stage.events == [("start", "main"), ("end",)]
+    assert session.model.requests == []  # and the request was not sent
+
+
+async def test_a_client_that_cannot_be_made_leaves_no_request_open(tmp_repo, monkeypatch):
+    # Nothing was sent, so nothing was started: a frame opened before the client was had
+    # would never be closed.
+    stage = Stage()
+    session = build_session(tmp_repo, [says("never")], ui=stage)
+
+    async def no_key(role: str) -> ScriptedClient:
+        raise ModelError("role 'main' uses model 'm', which needs a key", retryable=False)
+
+    monkeypatch.setattr(session.router, "client_for", no_key)
+    with pytest.raises(ModelError, match="needs a key"):
+        await session.run("hello")
+    assert stage.events == []
+    assert stage.open == 0

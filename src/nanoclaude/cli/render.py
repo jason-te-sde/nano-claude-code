@@ -615,8 +615,16 @@ class ConsoleUI:
         self.on_request_end()  # a request that never ended is over now
         self._streamed = False
         if self._animated():
-            self._put_echo_back = self._silence()
-            self._waiting = self._display(self._spinner(role), transient=True)
+            restore = self._silence()
+            self._put_echo_back = restore
+            try:
+                self._waiting = self._display(self._spinner(role), transient=True)
+            except BaseException:
+                # The display could not be started: nothing is on the screen to throw off,
+                # and the person must be able to see what they type.
+                self._put_echo_back = None
+                restore()
+                raise
 
     def on_text(self, delta: str) -> None:
         if self._arriving is None:
@@ -637,16 +645,23 @@ class ConsoleUI:
         live, self._live = self._live, None
         arriving, self._arriving = self._arriving, None
         put_echo_back, self._put_echo_back = self._put_echo_back, None
-        if waiting is not None:
-            waiting.stop()  # transient: its line is erased
-        if live is not None:
-            if arriving is not None:
-                arriving.settle()
-            live.stop()  # draws all of the reply, once, and leaves it there
-        elif arriving is not None and self._streamed:
-            self._console.print(render_markdown(arriving.text.strip()))
-        if put_echo_back is not None:
-            put_echo_back()
+        # Each thing that has to be undone is undone whatever the one before it did: a
+        # display that fails to stop must not leave the text unprinted, nor the echo off.
+        # The echo goes back last, once nothing is drawing, and in a finally of its own.
+        try:
+            try:
+                if waiting is not None:
+                    waiting.stop()  # transient: its line is erased
+            finally:
+                if live is not None:
+                    if arriving is not None:
+                        arriving.settle()
+                    live.stop()  # draws all of the reply, once, and leaves it there
+                elif arriving is not None and self._streamed:
+                    self._console.print(render_markdown(arriving.text.strip()))
+        finally:
+            if put_echo_back is not None:
+                put_echo_back()
 
     def on_decision(
         self, call: ToolUseBlock, request: PermissionRequest, result: PermissionResult

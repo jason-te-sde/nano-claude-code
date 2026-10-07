@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Sequence
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -455,11 +455,18 @@ class Session:
                     partial=partial_reply(["".join(streamed)], Usage(), client.model_id),
                 ) from error
 
-        self.ui.on_request_start(role)
         try:
-            return await with_retry(once, policy=self.retry, on_retry=self.ui.on_retry)
-        finally:
-            self.ui.on_request_end()
+            self.ui.on_request_start(role)
+            reply = await with_retry(once, policy=self.retry, on_retry=self.ui.on_retry)
+        except BaseException:
+            # The error that ended the request, a cancellation included, is the one to
+            # report. One from ending the request must not replace it, so it is not raised.
+            # Ended even when the start is what failed: the UI may have got half way.
+            with suppress(Exception):
+                self.ui.on_request_end()
+            raise
+        self.ui.on_request_end()
+        return reply
 
     def _keep_cut_off(self, partial: ModelReply, cause: ModelError) -> ModelError:
         """Keep what arrived of a reply whose stream broke midway, and say so (spec 7.4).

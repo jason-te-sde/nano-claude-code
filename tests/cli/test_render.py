@@ -22,6 +22,7 @@ import pytest
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
+from rich.live import Live
 
 from nanoclaude.agent.router import Router
 from nanoclaude.agent.ui import UI, Approval
@@ -1992,3 +1993,86 @@ def test_the_indicator_is_drawn_in_ascii_on_a_terminal_that_cannot_show_braille(
     ui.on_text("Hello")
     ui.on_request_end()
     assert "waiting for claude-sonnet-5" in raw.getvalue().decode("latin-1")
+
+
+# --------------------------------------------------------------------------
+# A display that fails, and the echo of the terminal it switched off
+# --------------------------------------------------------------------------
+
+
+class FailingFile(io.StringIO):
+    """A terminal's output that fails to be written to once it is told to."""
+
+    armed = False
+
+    def write(self, text: str, /) -> int:
+        if self.armed:
+            raise OSError("no space left on device")
+        return super().write(text)
+
+
+def console_on(file: io.StringIO | io.TextIOWrapper) -> Console:
+    return Console(file=file, width=60, force_terminal=True, no_color=False, legacy_windows=False)
+
+
+def test_the_echo_comes_back_when_the_text_cannot_be_written_to_the_terminal():
+    # A terminal writing latin-1 is shown "price — 5": the first frame of the live region
+    # raises, and so does the end of the request, which has the text to print.
+    echo = Echo()
+    file = io.TextIOWrapper(io.BytesIO(), encoding="latin-1", write_through=True)
+    ui = ConsoleUI(console_on(file), prompter=ScriptedPrompter(), silence=echo.silence)
+    ui.on_request_start("main")
+    assert echo.silenced == 1  # off, for the length of the request
+    with pytest.raises(UnicodeEncodeError):
+        ui.on_text("price \u2014 5")
+    with pytest.raises(UnicodeEncodeError):
+        ui.on_request_end()
+    assert not echo.silent  # whatever failed, the person can see what they type again
+    ui.on_request_end()  # and there is nothing left to end, nor to put back
+    assert (echo.silenced, echo.restored) == (1, 1)
+
+
+def test_the_echo_comes_back_when_the_display_cannot_be_started():
+    echo = Echo()
+    file = FailingFile()
+    file.armed = True
+    ui = ConsoleUI(console_on(file), prompter=ScriptedPrompter(), silence=echo.silence)
+    with pytest.raises(OSError, match="no space"):
+        ui.on_request_start("main")
+    assert not echo.silent
+    assert (echo.silenced, echo.restored) == (1, 1)
+
+
+class RaisesWhenStopped(Live):
+    """A live display that stops, and then says it failed to: what stopping one can do."""
+
+    def stop(self) -> None:
+        super().stop()
+        raise RuntimeError("could not stop the display")
+
+
+def test_the_echo_comes_back_when_a_display_cannot_be_stopped(monkeypatch):
+    monkeypatch.setattr("nanoclaude.cli.render.Live", RaisesWhenStopped)
+    echo = Echo()
+    console, _ = terminal_console(60, height=20, no_color=False)
+    ui = ConsoleUI(console, prompter=ScriptedPrompter(), silence=echo.silence)
+    ui.on_request_start("main")
+    with pytest.raises(RuntimeError, match="could not stop"):
+        ui.on_request_end()
+    assert not echo.silent
+    ui.on_request_end()  # a second end finds nothing to stop
+
+
+def test_the_text_is_still_printed_when_the_indicator_cannot_be_stopped(monkeypatch):
+    # The indicator is stopped first, and the reply that arrived is not lost for it.
+    monkeypatch.setattr("nanoclaude.cli.render.Live", RaisesWhenStopped)
+    echo = Echo()
+    console, buffer = terminal_console(60, height=20, no_color=False)
+    ui = ConsoleUI(console, prompter=ScriptedPrompter(), silence=echo.silence)
+    ui.on_request_start("main")
+    with pytest.raises(RuntimeError, match="could not stop"):
+        ui.on_text("Hello")  # the indicator gives way, and cannot
+    with pytest.raises(RuntimeError, match="could not stop"):
+        ui.on_request_end()
+    assert "Hello" in on_screen(buffer.getvalue(), 20)
+    assert not echo.silent
