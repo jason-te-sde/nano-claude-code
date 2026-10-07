@@ -17,7 +17,7 @@ retrying is also wrong.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -37,9 +37,10 @@ from nanoclaude.providers.base import (
     ToolSpec,
     Usage,
     new_call_id,
+    partial_reply,
 )
 from nanoclaude.providers.capabilities import CONSERVATIVE_DEFAULT, Capabilities
-from nanoclaude.providers.retry import classify_status
+from nanoclaude.providers.retry import classify_status, connection_lost
 
 DEFAULT_BASE_URL = "http://localhost:11434"
 
@@ -131,7 +132,9 @@ class OllamaClient:
             body["tools"] = encode_tools(request.tools)
         return body
 
-    async def complete(self, request: ModelRequest) -> ModelReply:
+    async def complete(
+        self, request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
         text: list[str] = []
         calls: list[ToolUseBlock] = []
         usage = Usage()
@@ -155,6 +158,8 @@ class OllamaClient:
                     message = chunk.get("message") or {}
                     if message.get("content"):
                         text.append(message["content"])
+                        if on_text is not None:
+                            on_text(message["content"])
                     for raw in message.get("tool_calls") or []:
                         function = raw.get("function") or {}
                         calls.append(
@@ -169,9 +174,14 @@ class OllamaClient:
                         usage = Usage(
                             chunk.get("prompt_eval_count") or 0, chunk.get("eval_count") or 0
                         )
-        except httpx.TimeoutException as exc:
-            raise ModelError(f"ollama timed out: {exc}", retryable=True) from exc
         except httpx.TransportError as exc:
+            if text or calls:
+                # Spec 7.4: some of the reply had arrived, so it is kept and not asked for
+                # again. The server was up and answering, so this is not "start ollama".
+                partial = partial_reply(["".join(text)], usage, self._model)
+                raise connection_lost(exc, partial, peer="ollama") from exc
+            if isinstance(exc, httpx.TimeoutException):
+                raise ModelError(f"ollama timed out: {exc}", retryable=True) from exc
             raise ModelError(
                 f"could not reach ollama at {self._base_url}: {exc} — start it with: ollama serve",
                 retryable=False,
@@ -189,6 +199,7 @@ class OllamaClient:
                 "the response stream ended before its tool calls were complete; the turn "
                 "may have partially executed, so it is not retried automatically",
                 retryable=False,
+                partial=partial_reply(["".join(text)], usage, self._model),
             )
 
         blocks: list[Block] = []

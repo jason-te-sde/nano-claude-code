@@ -30,10 +30,25 @@ servers send to close the stream; `tests/providers/test_openai_compat.py`'s
 the bare, unquoted `data: [DONE]` line when reconstructing real wire text for
 `OpenAICompatClient.complete()`.
 
+The Ollama cassettes (`ollama_text.jsonl`, `ollama_tool_use.jsonl`) are
+**synthetic** too, hand-written in the shape of Ollama's native `/api/chat`
+stream: one JSON chunk per line, which is also how the server sends them, so a
+cassette's lines are its wire text and nothing is wrapped or unwrapped. A chunk
+carries `message.content` and, for a call, `message.tool_calls[]` with the
+arguments as an object; the last line has `"done": true` and the token counts.
+`tests/providers/test_ollama.py` feeds them to `OllamaClient.complete()` over
+`httpx.MockTransport`, a line at a time.
+
+The tests of a stream that breaks midway (spec 7.4) take a prefix of a cassette,
+send it, and then raise `httpx.ReadError`, or a timeout, from the response body,
+which is how a dropped connection looks to the client. No cassette holds a broken
+stream, except `anthropic_truncated.jsonl`, which ends cleanly in the middle of a
+tool call.
+
 `scripts/record-cassettes.py` records the real thing: run it with a live
 `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` and it overwrites the matching files
-with actual recordings from the respective API, redacted on the way out.
-Nobody has run it yet -- all six files here are still the hand-written
-originals. When it is run for a given provider, replace this note's
-"synthetic" description of the affected files with where and when they were
-recorded.
+with actual recordings from the respective API, redacted on the way out. It
+does not record Ollama. Nobody has run it yet -- all eight files here are still
+the hand-written originals. When it is run for a given provider, replace this
+note's "synthetic" description of the affected files with where and when they
+were recorded.

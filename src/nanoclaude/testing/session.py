@@ -12,7 +12,7 @@ back-off, or reaches a network.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,7 +29,7 @@ from nanoclaude.permissions.sandbox import Sandbox
 from nanoclaude.providers.base import ModelClient, ModelError, ModelReply, ModelRequest
 from nanoclaude.providers.capabilities import Capabilities, CapabilityCache
 from nanoclaude.providers.retry import RetryPolicy
-from nanoclaude.testing.scripted import ScriptedModel
+from nanoclaude.testing.scripted import ScriptedModel, stream_text
 from nanoclaude.tools.registry import default_registry
 from nanoclaude.tools.todo import TodoState
 
@@ -47,7 +47,9 @@ class ScriptedClient(ScriptedModel):
     """A ScriptedModel whose script may hold a ModelError, raised in place of a reply.
 
     That is how a test plays a provider that is overloaded, or refuses a key,
-    at a chosen point in a conversation. The request is recorded either way.
+    at a chosen point in a conversation. The request is recorded either way. An
+    error that holds a partial reply (see :func:`~nanoclaude.testing.scripted.cut_off`)
+    streams its text first, as an adapter does before its connection drops.
     """
 
     def __init__(self, script: Sequence[ModelReply | ModelError]) -> None:
@@ -60,7 +62,9 @@ class ScriptedClient(ScriptedModel):
     def exhausted(self) -> bool:
         return not self._script
 
-    async def complete(self, request: ModelRequest) -> ModelReply:
+    async def complete(
+        self, request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
         self.requests.append(request)
         if not self._script:
             raise ModelError(
@@ -68,7 +72,11 @@ class ScriptedClient(ScriptedModel):
             )
         entry = self._script.pop(0)
         if isinstance(entry, ModelError):
+            if on_text is not None and entry.partial is not None:
+                stream_text(entry.partial, on_text)
             raise entry
+        if on_text is not None:
+            stream_text(entry, on_text)
         return entry
 
     async def aclose(self) -> None:

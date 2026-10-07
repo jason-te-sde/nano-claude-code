@@ -19,7 +19,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TypeVar
 
-from nanoclaude.providers.base import ModelError
+import httpx
+
+from nanoclaude.providers.base import ModelError, ModelReply
 
 T = TypeVar("T")
 
@@ -106,6 +108,38 @@ def classify_status(status: int, body: str) -> ModelError:
         # the session knows how to fix.
         context_overflow=status == 400 and _reports_overflow(body),
     )
+
+
+def describe(exc: BaseException) -> str:
+    """What a person is told of an exception: its message, or its name when it has none."""
+    return str(exc) or type(exc).__name__
+
+
+def connection_lost(
+    exc: BaseException, partial: ModelReply, *, peer: str = "the provider"
+) -> ModelError:
+    """Spec 7.4, a stream that breaks midway: keep what arrived, and do not ask again.
+
+    The request may already have had effects, and asking again would write the first half
+    of the reply a second time, so the error is not retryable and what to do next is left
+    to the person. ``partial`` is what the adapter had received when the connection went.
+    """
+    return ModelError(
+        f"the connection to {peer} was lost: {describe(exc)}", retryable=False, partial=partial
+    )
+
+
+def classify_transport(exc: httpx.TransportError, partial: ModelReply | None) -> ModelError:
+    """Spec 7.4 for a connection that failed, a timeout included.
+
+    Asked again, as before, unless some of the reply had arrived (``partial`` is not
+    None): then it is :func:`connection_lost`, and not retried.
+    """
+    if partial is not None:
+        return connection_lost(exc, partial)
+    if isinstance(exc, httpx.TimeoutException):
+        return ModelError(f"the provider timed out: {exc}", retryable=True)
+    return ModelError(f"could not reach the provider: {exc}", retryable=True)
 
 
 async def with_retry(

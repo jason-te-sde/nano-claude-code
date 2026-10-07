@@ -1,6 +1,7 @@
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -22,19 +23,74 @@ from nanoclaude.providers.anthropic import (
     encode_tools,
     iter_sse,
 )
-from nanoclaude.providers.base import ModelClient, ModelError, ModelRequest, StopKind, ToolSpec
+from nanoclaude.providers.base import (
+    ModelClient,
+    ModelError,
+    ModelReply,
+    ModelRequest,
+    StopKind,
+    ToolSpec,
+    Usage,
+)
 
 CASSETTES = Path(__file__).resolve().parents[1] / "cassettes"
 
 
-def replay(name: str) -> StreamAccumulator:
-    accumulator = StreamAccumulator()
-    for line in (CASSETTES / name).read_text().splitlines():
-        if not line.strip():
-            continue
-        event = json.loads(line)
+def events_of(name: str) -> list[dict[str, Any]]:
+    """The events a cassette holds, each ``{"event": ..., "data": ...}``, in order."""
+    lines = (CASSETTES / name).read_text().splitlines()
+    return [json.loads(line) for line in lines if line.strip()]
+
+
+def replay(name: str, on_text: Callable[[str], None] | None = None) -> StreamAccumulator:
+    accumulator = StreamAccumulator(on_text=on_text)
+    for event in events_of(name):
         accumulator.handle(event["event"], event["data"])
     return accumulator
+
+
+def wire(events: Sequence[Mapping[str, Any]]) -> bytes:
+    """The Server-Sent Events text a server sends for ``events``."""
+    return "".join(
+        f"event: {e['event']}\ndata: {json.dumps(e['data'])}\n\n" for e in events
+    ).encode()
+
+
+def arriving(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    log: list[str] | None = None,
+    then: Exception | None = None,
+) -> httpx.Response:
+    """A 200 response that sends ``events`` one at a time, and then fails with ``then``.
+
+    ``then`` is what a dropped connection looks like to the client: raised from the
+    body, after the response began. ``log`` hears each event as it is sent, so that a
+    test can tell what the client did before the next one went out.
+    """
+
+    async def body() -> AsyncIterator[bytes]:
+        for event in events:
+            if log is not None:
+                log.append(f"sent {event['event']}")
+            yield wire([event])
+        if then is not None:
+            raise then
+
+    return httpx.Response(200, content=body(), headers={"content-type": "text/event-stream"})
+
+
+def ask() -> ModelRequest:
+    return ModelRequest("s", Transcript((user_text("hi"),)), (), 10)
+
+
+async def complete_from(
+    response: httpx.Response, on_text: Callable[[str], None] | None = None
+) -> ModelReply:
+    """What ``AnthropicClient.complete`` makes of a response it was sent."""
+    transport = httpx.MockTransport(lambda _request: response)
+    async with httpx.AsyncClient(transport=transport) as http:
+        return await AnthropicClient("test-key", client=http).complete(ask(), on_text=on_text)
 
 
 def test_a_text_reply_decodes_to_one_text_block():
@@ -483,3 +539,169 @@ def test_the_tool_list_is_byte_stable_across_turns():
     second = client.payload(ModelRequest("sys", Transcript((user_text("b"),)), tools, 10))
     assert first["tools"]
     assert json.dumps(first["tools"]) == json.dumps(second["tools"])
+
+
+# -- streaming: on_text, and a stream that breaks midway (spec 7.4) --------------
+
+
+def test_text_deltas_reach_on_text_in_order_and_join_to_the_reply_text():
+    pieces: list[str] = []
+    reply = replay("anthropic_text.jsonl", on_text=pieces.append).result()
+    assert pieces == ["Hello! ", "The answer is 42."]
+    assert reply.blocks == (TextBlock("Hello! The answer is 42."),)
+
+
+def test_a_reply_with_a_tool_call_streams_its_text_and_none_of_its_arguments():
+    pieces: list[str] = []
+    reply = replay("anthropic_tool_use.jsonl", on_text=pieces.append).result()
+    assert pieces == ["I'll read that file."]
+    call = next(b for b in reply.blocks if isinstance(b, ToolUseBlock))
+    assert call.arguments == {"path": "src/app.py"}  # the arguments were still collected
+
+
+def test_thinking_text_never_reaches_on_text():
+    pieces: list[str] = []
+    accumulator = StreamAccumulator(on_text=pieces.append)
+    accumulator.handle("message_start", {"message": {"usage": {"input_tokens": 10}}})
+    accumulator.handle(
+        "content_block_start", {"index": 0, "content_block": {"type": "thinking", "thinking": ""}}
+    )
+    accumulator.handle(
+        "content_block_delta",
+        {"index": 0, "delta": {"type": "thinking_delta", "thinking": "weighing it"}},
+    )
+    accumulator.handle(
+        "content_block_delta",
+        {"index": 0, "delta": {"type": "signature_delta", "signature": "sig"}},
+    )
+    accumulator.handle("content_block_stop", {"index": 0})
+    accumulator.handle(
+        "content_block_start", {"index": 1, "content_block": {"type": "text", "text": ""}}
+    )
+    accumulator.handle(
+        "content_block_delta", {"index": 1, "delta": {"type": "text_delta", "text": "Done."}}
+    )
+    accumulator.handle("content_block_stop", {"index": 1})
+    accumulator.handle("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": {}})
+    accumulator.handle("message_stop", {})
+    assert pieces == ["Done."]
+    assert accumulator.result().blocks[0] == ThinkingBlock("weighing it", "sig")
+
+
+async def test_complete_hands_text_over_while_the_stream_is_still_arriving():
+    # Not after it: a person reads a reply that takes half a minute as it is written.
+    log: list[str] = []
+    reply = await complete_from(
+        arriving(events_of("anthropic_text.jsonl"), log=log),
+        on_text=lambda piece: log.append(f"text {piece!r}"),
+    )
+    assert reply.blocks == (TextBlock("Hello! The answer is 42."),)
+    assert log == [
+        "sent message_start",
+        "sent content_block_start",
+        "sent content_block_delta",
+        "text 'Hello! '",  # before the next delta was even sent
+        "sent content_block_delta",
+        "text 'The answer is 42.'",
+        "sent content_block_stop",
+        "sent message_delta",
+        "sent message_stop",
+    ]
+
+
+@pytest.mark.parametrize(
+    "dropped",
+    [
+        httpx.ReadError("connection reset by peer"),
+        httpx.RemoteProtocolError("peer closed connection without a complete message body"),
+        httpx.ReadTimeout("no bytes for 600 seconds"),
+    ],
+    ids=["read error", "protocol error", "timeout"],
+)
+async def test_a_connection_lost_after_text_is_not_retried_and_hands_over_what_arrived(dropped):
+    pieces: list[str] = []
+    seen = events_of("anthropic_text.jsonl")[:3]  # message_start, the block, "Hello! "
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=dropped), on_text=pieces.append)
+    error = caught.value
+    assert error.retryable is False
+    assert error.partial == ModelReply(
+        (TextBlock("Hello! "),), StopKind.CUT_OFF, Usage(15, 0), "claude-sonnet-5"
+    )
+    assert pieces == ["Hello! "]
+    assert str(dropped) in str(error)
+
+
+async def test_a_connection_lost_inside_a_tool_call_is_not_retried_either():
+    # Nothing to keep but what the provider billed: the half-received call is dropped, and
+    # asking again could run the call twice if an earlier one in the turn already ran.
+    seen = events_of("anthropic_parallel_tools.jsonl")[:3]  # message_start, a call, its start
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
+    error = caught.value
+    assert error.retryable is False
+    assert error.partial == ModelReply((), StopKind.CUT_OFF, Usage(150, 0), "claude-sonnet-5")
+
+
+@pytest.mark.parametrize(
+    "dropped", [httpx.ReadError("connection reset"), httpx.ReadTimeout("timed out")]
+)
+async def test_a_connection_lost_before_anything_arrived_is_retryable_as_before(dropped):
+    seen = events_of("anthropic_text.jsonl")[:1]  # message_start, and then nothing
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=dropped))
+    assert caught.value.retryable is True
+    assert caught.value.partial is None
+
+
+async def test_a_thinking_only_stream_that_breaks_is_still_retryable():
+    # Thinking is not shown and cannot have run anything, so asking again costs tokens
+    # and nothing else.
+    seen = [
+        {"event": "message_start", "data": {"message": {"usage": {"input_tokens": 9}}}},
+        {
+            "event": "content_block_start",
+            "data": {"index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+        },
+        {
+            "event": "content_block_delta",
+            "data": {"index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}},
+        },
+    ]
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
+    assert caught.value.retryable is True
+
+
+async def test_an_overloaded_error_after_text_is_not_retried_and_hands_over_what_arrived():
+    # An error the provider sends inside the stream, not a dropped connection: the same
+    # rule, because a retry would write the first half again.
+    fault = {
+        "event": "error",
+        "data": {"error": {"type": "overloaded_error", "message": "Overloaded"}},
+    }
+    with pytest.raises(ModelError, match="Overloaded") as caught:
+        await complete_from(arriving([*events_of("anthropic_text.jsonl")[:3], fault]))
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("Hello! "),), StopKind.CUT_OFF, Usage(15, 0), "claude-sonnet-5"
+    )
+
+
+async def test_an_overloaded_error_before_anything_arrived_is_retryable_as_before():
+    fault = {
+        "event": "error",
+        "data": {"error": {"type": "overloaded_error", "message": "Overloaded"}},
+    }
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving([*events_of("anthropic_text.jsonl")[:1], fault]))
+    assert caught.value.retryable is True
+    assert caught.value.partial is None
+
+
+def test_a_stream_that_ends_cleanly_mid_tool_call_still_hands_over_the_text_before_it():
+    with pytest.raises(ModelError, match="incomplete") as caught:
+        replay("anthropic_truncated.jsonl").result()
+    assert caught.value.partial == ModelReply(
+        (TextBlock("I'll read that file."),), StopKind.CUT_OFF, Usage(120, 0), "claude-sonnet-5"
+    )

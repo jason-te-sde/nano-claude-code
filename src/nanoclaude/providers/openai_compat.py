@@ -15,7 +15,7 @@ depending on who is serving.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -37,8 +37,9 @@ from nanoclaude.providers.base import (
     ToolSpec,
     Usage,
     new_call_id,
+    partial_reply,
 )
-from nanoclaude.providers.retry import classify_status
+from nanoclaude.providers.retry import classify_status, classify_transport
 
 _FINISH = {
     "stop": StopKind.END_TURN,
@@ -136,8 +137,15 @@ def encode_tools(specs: Sequence[ToolSpec]) -> list[dict[str, Any]]:
 
 
 class ChunkAccumulator:
-    def __init__(self, *, model: str) -> None:
+    """Folds chat-completion chunks into one reply.
+
+    ``on_text`` hears each piece of visible text as it arrives. Reasoning and tool
+    arguments are not text, and never reach it.
+    """
+
+    def __init__(self, *, model: str, on_text: Callable[[str], None] | None = None) -> None:
         self._model = model
+        self._on_text = on_text
         self._text: list[str] = []
         self._reasoning: list[str] = []
         self._calls: dict[int, dict[str, Any]] = {}
@@ -152,7 +160,9 @@ class ChunkAccumulator:
         if "error" in chunk:
             error = chunk["error"]
             message = error.get("message", error) if isinstance(error, Mapping) else error
-            raise ModelError(str(message))
+            # An error in the middle of the reply is the stream breaking, like a dropped
+            # connection: what arrived is kept (and is not asked for again).
+            raise ModelError(str(message), partial=self.partial())
         usage = chunk.get("usage")
         if usage:
             self._usage = Usage(
@@ -169,6 +179,8 @@ class ChunkAccumulator:
             delta = choice.get("delta") or {}
             if delta.get("content"):
                 self._text.append(delta["content"])
+                if self._on_text is not None:
+                    self._on_text(delta["content"])
             for key in _REASONING_KEYS:
                 if delta.get(key):
                     self._reasoning.append(delta[key])
@@ -188,6 +200,20 @@ class ChunkAccumulator:
                         arguments if isinstance(arguments, str) else json.dumps(arguments)
                     )
 
+    def partial(self) -> ModelReply | None:
+        """What had arrived, as a reply; None while nothing a person could have read has.
+
+        Visible text, or a tool call that had begun. Reasoning does not count: it is not
+        shown and cannot have run anything, so a stream that broke after nothing but
+        reasoning may be asked again. A call that had begun is not in the reply, whole or
+        not (see :func:`~nanoclaude.providers.base.partial_reply`), but it is why a stream
+        with no text yet is not asked again: an earlier call in the turn may have run.
+        """
+        text = "".join(self._text)
+        if not text and not self._calls:
+            return None
+        return partial_reply([text], self._usage, self._model)
+
     def result(self) -> ModelReply:
         blocks: list[Block] = []
         if self._reasoning:
@@ -199,6 +225,7 @@ class ChunkAccumulator:
                 "the response stream ended before its tool calls were complete; the turn "
                 "may have partially executed, so it is not retried automatically",
                 retryable=False,
+                partial=self.partial(),
             )
         for index in sorted(self._calls):
             slot = self._calls[index]
@@ -268,8 +295,10 @@ class OpenAICompatClient:
             body["tools"] = encode_tools(request.tools)
         return body
 
-    async def complete(self, request: ModelRequest) -> ModelReply:
-        accumulator = ChunkAccumulator(model=self._model)
+    async def complete(
+        self, request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+    ) -> ModelReply:
+        accumulator = ChunkAccumulator(model=self._model, on_text=on_text)
         url = f"{self._base_url}/chat/completions"
         try:
             async with self._client.stream(
@@ -285,8 +314,6 @@ class OpenAICompatClient:
                     if payload in ("", "[DONE]"):
                         continue
                     accumulator.handle(json.loads(payload))
-        except httpx.TimeoutException as exc:
-            raise ModelError(f"the provider timed out: {exc}", retryable=True) from exc
         except httpx.TransportError as exc:
-            raise ModelError(f"could not reach the provider: {exc}", retryable=True) from exc
+            raise classify_transport(exc, accumulator.partial()) from exc
         return accumulator.result()
