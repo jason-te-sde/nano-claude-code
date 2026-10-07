@@ -499,3 +499,21 @@ def test_a_turn_is_a_round_of_tools_and_a_prompt_answered_at_once_took_none(
     assert json.loads(out)["turns"] == 0
     _, out, _ = run_ncc(capsys, "--root", str(project), "-p", "b", "--output-format", "json")
     assert json.loads(out)["turns"] == 1
+
+
+def test_a_usage_error_is_one_line_with_nothing_in_it_for_a_terminal_to_act_on(
+    ncc_home, project, capsys
+):
+    # The directory named is the person's own text, and a line break in it must not start a
+    # line of its own.
+    code, out, err = run_ncc(
+        capsys, "--root", str(project), "--add-dir", "no\nwhere\x1b]0;t\x07", "-p", "hi"
+    )
+    assert code == EXIT_CODES["usage"] and out == ""
+    assert err == "error: --add-dir no where is not a directory \u2014 pass one that exists\n"
+
+
+def test_an_unknown_session_is_one_line_too(ncc_home, project, capsys):
+    code, out, err = run_ncc(capsys, "--root", str(project), "--resume", "a\nb", "-p", "hi")
+    assert code == EXIT_CODES["usage"] and out == ""
+    assert err.startswith('error: no stored session "a b" \u2014 ') and err.count("\n") == 1

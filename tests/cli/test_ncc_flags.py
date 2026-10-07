@@ -16,6 +16,7 @@ import pytest
 from nanoclaude.agent.session import Session
 from nanoclaude.cli.main import EXIT_CODES, build_parser
 from nanoclaude.config.schema import ROLES
+from nanoclaude.conversation.store import Store
 from nanoclaude.permissions.policy import PermissionMode
 from nanoclaude.providers.base import ModelReply
 from nanoclaude.testing.scripted import calls, says
@@ -457,12 +458,48 @@ def test_the_session_keeps_its_files_under_the_home_ncc_was_given(
 
 
 def test_instructions_in_the_home_that_ncc_was_given_reach_the_model(
-    ncc_home, project, serve, capsys
+    ncc_home, project, serve, capsys, tmp_path, monkeypatch
 ):
+    # A home that ncc was told to use is not necessarily the one the shell has.
+    monkeypatch.setenv("HOME", str(tmp_path / "somebody-elses-home"))
     (ncc_home / ".nanoclaude" / "NANO.md").write_text("Always answer in rhyme.\n")
     clients = serve(m=[says("ok")])
     run_ncc(capsys, "--root", str(project), "-p", "hi")
     assert "Always answer in rhyme." in clients["m"].requests[0].system
+
+
+def audited_arguments(home, session_id):
+    store = Store(home / ".nanoclaude" / "sessions.db")
+    store.open()
+    (row,) = store.db.execute(
+        "SELECT args_json FROM tool_calls WHERE session_id = ?", (session_id,)
+    ).fetchall()
+    return row["args_json"]
+
+
+@pytest.mark.parametrize(
+    ("flags", "kept"), [([], False), (["--allow-secrets"], True)], ids=["default", "allowed"]
+)
+def test_the_audit_records_a_secret_in_a_call_only_when_secrets_are_allowed(
+    ncc_home, project, serve, capsys, flags, kept
+):
+    write = calls("Write", {"path": "n.txt", "content": SECRET_NOTE}, call_id="w1")
+    serve(m=[write, says("done")])
+    _, out, _ = run_ncc(
+        capsys,
+        "--root",
+        str(project),
+        "--mode",
+        "accept-edits",
+        *flags,
+        "-p",
+        "write it",
+        "--output-format",
+        "json",
+    )
+    recorded = audited_arguments(ncc_home, json.loads(out)["session_id"])
+    assert ("AKIAIOSFODNN7EXAMPLE" in recorded) is kept
+    assert ("[redacted:aws-key]" in recorded) is not kept
 
 
 def test_the_parser_still_takes_every_flag_the_spec_lists():

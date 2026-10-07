@@ -206,14 +206,17 @@ def test_a_session_from_another_directory_is_refused_naming_both(
 def test_the_directory_of_a_session_is_compared_as_the_place_it_is_not_as_a_spelling(
     ncc_home, tmp_path, serve, capsys
 ):
-    # Reached through a symlink, it is still the directory the session was started in.
+    # A row written by another front end can hold the spelling that went through a symlink.
+    # It is still the directory the session was started in.
     real = tmp_path / "real"
     real.mkdir()
     link = tmp_path / "link"
     link.symlink_to(real)
-    serve(m=[says("a"), says("b")])
-    first = start(capsys, real)
-    code, out, _ = run_ncc(capsys, "--root", str(link), "-r", first, "-p", "again")
+    serve(m=[says("b")])
+    store = stored(ncc_home)
+    store.create_session("abc123abc123", cwd=str(link), roles={})
+    store.close()
+    code, out, _ = run_ncc(capsys, "--root", str(real), "-r", "abc123abc123", "-p", "again")
     assert (code, out) == (EXIT_CODES["completed"], "b\n")
 
 
@@ -296,4 +299,17 @@ def test_a_session_changed_by_another_process_is_reported_and_the_store_is_close
         f"error: session {holder[0]} was changed by another process "
         "— start a new session, or resume it again\n"
     )
+    assert_closed(stores[0])
+
+
+def test_ctrl_c_while_the_session_is_being_built_still_closes_the_store(
+    ncc_home, project, capsys, monkeypatch, stores
+):
+    def interrupted(_config: Config, _cache: CapabilityCache) -> Router:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(ncc_main, "Router", interrupted)
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hi")
+    assert code == EXIT_CODES["interrupted"]
+    assert out == "" and err == "interrupted\n"
     assert_closed(stores[0])
