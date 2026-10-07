@@ -114,7 +114,6 @@ class StreamAccumulator:
         # A thinking block's signature streams separately from its text and must
         # be sent back verbatim on the next turn, so it is kept per block.
         self._signature: dict[int, list[str]] = {}
-        self._closed: set[int] = set()
         self._stop = StopKind.END_TURN
         self._usage = Usage()
         self._saw_message_stop = False
@@ -157,8 +156,6 @@ class StreamAccumulator:
                 self._json.setdefault(index, []).append(delta["partial_json"])
             elif kind == "signature_delta":
                 self._signature.setdefault(index, []).append(delta["signature"])
-        elif event == "content_block_stop":
-            self._closed.add(int(data["index"]))
         elif event == "message_delta":
             reason = data.get("delta", {}).get("stop_reason")
             if reason is not None:
@@ -205,17 +202,20 @@ class StreamAccumulator:
         return partial_reply(texts, self._usage, self._model)
 
     def result(self) -> ModelReply:
+        if self._kinds and not self._saw_message_stop:
+            # message_stop is what says the reply is whole (spec 7.4: a stream that closes
+            # without it was interrupted midway, whatever closed it). A block that was
+            # stopped is no proof: a call that parses may be the first of several, and an
+            # earlier one in the turn may already have run, so nothing is handed over.
+            raise ModelError(
+                "the response stream ended incomplete, with no message_stop; the turn may "
+                "have partially executed, so it is not retried automatically",
+                retryable=False,
+                partial=self.partial(),
+            )
         blocks: list[Block] = []
         for index in sorted(self._kinds):
             kind, meta = self._kinds[index]
-            if index not in self._closed and not self._saw_message_stop:
-                raise ModelError(
-                    f"the response stream ended with content block {index} incomplete; "
-                    "the turn may have partially executed, so it is not retried "
-                    "automatically",
-                    retryable=False,
-                    partial=self.partial(),
-                )
             if kind == "text":
                 blocks.append(TextBlock("".join(self._text.get(index, ()))))
             elif kind == "thinking":

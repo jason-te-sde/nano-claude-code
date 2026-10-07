@@ -156,6 +156,10 @@ class ChunkAccumulator:
         # argument string must not be passed to a tool as if it were complete.
         self._finished = False
 
+    def end(self) -> None:
+        """The server said the stream is over (``[DONE]``), which is an end marker too."""
+        self._finished = True
+
     def handle(self, chunk: Mapping[str, Any]) -> None:
         if "error" in chunk:
             error = chunk["error"]
@@ -220,9 +224,15 @@ class ChunkAccumulator:
             blocks.append(ThinkingBlock("".join(self._reasoning)))
         if self._text:
             blocks.append(TextBlock("".join(self._text)))
-        if self._calls and not self._finished:
+        if (self._text or self._calls or self._reasoning) and not self._finished:
+            # No finish_reason and no [DONE]: the stream closed without saying the reply was
+            # whole (spec 7.4: interrupted midway, whatever closed it). Prose is held to it
+            # as well as calls: a reply that stops in the middle of a sentence has been cut
+            # off. A call must not be handed over either, whatever its arguments look like,
+            # for an earlier call in the turn may already have run.
+            what = "its tool calls were" if self._calls else "its reply was"
             raise ModelError(
-                "the response stream ended before its tool calls were complete; the turn "
+                f"the response stream ended before {what} complete; the turn "
                 "may have partially executed, so it is not retried automatically",
                 retryable=False,
                 partial=self.partial(),
@@ -311,9 +321,10 @@ class OpenAICompatClient:
                     if not line.startswith("data:"):
                         continue
                     payload = line.removeprefix("data:").strip()
-                    if payload in ("", "[DONE]"):
-                        continue
-                    accumulator.handle(json.loads(payload))
+                    if payload == "[DONE]":
+                        accumulator.end()
+                    elif payload:
+                        accumulator.handle(json.loads(payload))
         except httpx.TransportError as exc:
             raise classify_transport(exc, accumulator.partial()) from exc
         return accumulator.result()

@@ -755,3 +755,65 @@ def test_a_partial_reply_keeps_each_text_block_in_order_and_leaves_the_calls_out
         Usage(3, 0),
         "claude-sonnet-5",
     )
+
+
+# -- a stream that closes without its end marker was interrupted midway (spec 7.4) --
+
+
+async def test_a_stream_that_closes_after_a_finished_text_block_without_message_stop_was_cut_off():
+    # message_start, a text block and its deltas and its stop, and then the connection
+    # closes cleanly: nothing raised, and the reply is not whole.
+    seen = events_of("anthropic_text.jsonl")[:5]
+    pieces: list[str] = []
+    with pytest.raises(ModelError, match="incomplete") as caught:
+        await complete_from(arriving(seen), on_text=pieces.append)
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("Hello! The answer is 42."),), StopKind.CUT_OFF, Usage(15, 0), "claude-sonnet-5"
+    )
+    assert "".join(pieces) == "Hello! The answer is 42."
+
+
+async def test_a_stream_that_closes_after_a_finished_tool_call_without_message_stop_drops_it():
+    # The call is closed and its arguments parse, so it looks runnable. It must not run: it
+    # was not confirmed to be the whole of the reply, and an earlier call may already have.
+    seen = events_of("anthropic_tool_use.jsonl")[:8]  # the text, and the call, stopped
+    with pytest.raises(ModelError, match="incomplete") as caught:
+        await complete_from(arriving(seen))
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("I'll read that file."),), StopKind.CUT_OFF, Usage(120, 0), "claude-sonnet-5"
+    )
+
+
+async def test_a_stream_that_closes_before_anything_arrived_is_still_no_content():
+    with pytest.raises(ModelError, match="no content blocks") as caught:
+        await complete_from(arriving(events_of("anthropic_text.jsonl")[:1]))
+    assert caught.value.partial is None
+
+
+def test_a_stream_that_closes_inside_a_thinking_block_is_an_error_with_nothing_to_keep():
+    accumulator = StreamAccumulator()
+    accumulator.handle("message_start", {"message": {"usage": {"input_tokens": 4}}})
+    accumulator.handle(
+        "content_block_start", {"index": 0, "content_block": {"type": "thinking", "thinking": ""}}
+    )
+    with pytest.raises(ModelError, match="incomplete") as caught:
+        accumulator.result()
+    assert caught.value.retryable is False
+    assert caught.value.partial is None  # nothing a person could have read
+
+
+def test_thinking_alone_with_no_message_stop_is_not_a_reply():
+    accumulator = StreamAccumulator()
+    accumulator.handle("message_start", {"message": {"usage": {"input_tokens": 4}}})
+    accumulator.handle(
+        "content_block_start", {"index": 0, "content_block": {"type": "thinking", "thinking": ""}}
+    )
+    accumulator.handle(
+        "content_block_delta",
+        {"index": 0, "delta": {"type": "thinking_delta", "thinking": "hmm"}},
+    )
+    accumulator.handle("content_block_stop", {"index": 0})
+    with pytest.raises(ModelError, match="incomplete"):
+        accumulator.result()

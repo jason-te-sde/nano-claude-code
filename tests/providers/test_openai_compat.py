@@ -950,3 +950,42 @@ async def test_only_the_visible_text_is_kept_when_the_stream_breaks_after_reason
     assert caught.value.partial == ModelReply(
         (TextBlock("The answer"),), StopKind.CUT_OFF, Usage(), "gpt-5"
     )
+
+
+# -- a stream that closes without its end marker was interrupted midway (spec 7.4) --
+
+
+async def test_a_stream_that_closes_after_text_with_no_finish_reason_and_no_done_was_cut_off():
+    seen = payloads_of("openai_text.jsonl")[:3]  # the opening chunk, "hel", "lo"
+    pieces: list[str] = []
+    with pytest.raises(ModelError, match="complete") as caught:
+        await complete_from(arriving(seen), on_text=pieces.append)
+    assert caught.value.retryable is False
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hello"),), StopKind.CUT_OFF, Usage(), "gpt-5"
+    )
+    assert "".join(pieces) == "hello"
+
+
+async def test_done_without_a_finish_reason_still_ends_the_reply():
+    # Some servers close with [DONE] and never send a finish_reason.
+    seen = [*payloads_of("openai_text.jsonl")[:3], "[DONE]"]
+    reply = await complete_from(arriving(seen))
+    assert reply.blocks == (TextBlock("hello"),)
+    assert reply.stop is StopKind.END_TURN
+
+
+async def test_a_stream_that_closes_after_a_call_with_only_done_keeps_the_call_whole():
+    # The end marker is what makes a call safe to hand over, not its arguments looking whole.
+    seen = [*payloads_of("openai_tool_use.jsonl")[:7], "[DONE]"]  # no finish_reason chunk
+    reply = await complete_from(arriving(seen))
+    call = next(b for b in reply.blocks if isinstance(b, ToolUseBlock))
+    assert call.arguments == {"path": "README.md"}
+
+
+async def test_reasoning_alone_with_no_end_marker_is_not_a_reply():
+    seen = [{"choices": [{"delta": {"reasoning_content": "hmm"}}]}]
+    with pytest.raises(ModelError, match="complete") as caught:
+        await complete_from(arriving(seen))
+    assert caught.value.retryable is False
+    assert caught.value.partial is None  # nothing a person could have read
