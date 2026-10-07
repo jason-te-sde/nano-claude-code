@@ -365,8 +365,20 @@ class Store:
         ).fetchall()
         return [SessionRow(**dict(row)) for row in rows]
 
-    def latest_session_id(self) -> str | None:
-        row = self.db.execute(
-            "SELECT id FROM sessions ORDER BY started_at DESC, rowid DESC LIMIT 1"
-        ).fetchone()
+    def latest_session_id(self, *, cwd: str | None = None) -> str | None:
+        """The session started most recently: in the whole store, or with ``cwd`` in one directory.
+
+        ``cwd`` is compared whole, as the string the session recorded: a directory is not
+        a prefix, and the name of one is not a pattern.
+        """
+        if cwd is None:
+            row = self.db.execute(
+                "SELECT id FROM sessions ORDER BY started_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
+        else:
+            row = self.db.execute(
+                "SELECT id FROM sessions WHERE cwd = ? "
+                "ORDER BY started_at DESC, rowid DESC LIMIT 1",
+                (cwd,),
+            ).fetchone()
         return row["id"] if row else None

@@ -208,6 +208,36 @@ def test_latest_session_id_is_none_for_an_empty_database(tmp_path):
     assert store.latest_session_id() is None
 
 
+def test_latest_session_in_a_directory_ignores_sessions_started_elsewhere(tmp_path, monkeypatch):
+    _fixed_clock(monkeypatch, 1.0, 2.0, 3.0)
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("here-old", cwd="/p/here", roles={})
+    store.create_session("here-new", cwd="/p/here", roles={})
+    store.create_session("elsewhere", cwd="/p/elsewhere", roles={})  # the latest in the store
+    assert store.latest_session_id() == "elsewhere"
+    assert store.latest_session_id(cwd="/p/here") == "here-new"
+    assert store.latest_session_id(cwd="/p/elsewhere") == "elsewhere"
+
+
+def test_latest_session_in_a_directory_is_none_when_nothing_was_started_there(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p/here", roles={})
+    assert store.latest_session_id(cwd="/p/nowhere") is None
+
+
+def test_a_directory_is_matched_whole_and_not_as_a_prefix_or_a_pattern(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("deep", cwd="/p/here/deeper", roles={})
+    store.create_session("sibling", cwd="/p/here-too", roles={})
+    store.create_session("pattern", cwd="/p/h_re", roles={})
+    assert store.latest_session_id(cwd="/p/here") is None
+    assert store.latest_session_id(cwd="/p/h%") is None
+    assert store.latest_session_id(cwd="/p/h_re") == "pattern"
+
+
 def test_finishing_a_session_records_usage_and_cost(tmp_path):
     store = Store(tmp_path / "s.db")
     store.open()
