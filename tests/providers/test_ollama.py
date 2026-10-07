@@ -713,3 +713,13 @@ async def test_a_body_that_cannot_be_read_before_anything_arrived_raises_as_it_a
         await complete_from(arriving([], then=httpx.DecodingError("bad gzip")))
     with pytest.raises(json.JSONDecodeError):
         await complete_from(arriving(["{oops"]))
+
+
+async def test_the_counts_the_server_had_reported_are_in_the_partial_reply():
+    lines = lines_of("ollama_text.jsonl")
+    seen = [lines[0], lines[2]]  # "hel", and the closing line with the counts
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(11, 2), "qwen3-coder:30b"
+    )

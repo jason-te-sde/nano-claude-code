@@ -866,3 +866,16 @@ async def test_a_body_that_cannot_be_read_before_anything_arrived_raises_as_it_a
         await complete_from(
             raw_response(wire(events_of("anthropic_text.jsonl")[:1]), b"event: x\ndata: {oops\n\n")
         )
+
+
+async def test_the_model_the_server_reported_is_the_model_of_the_partial_reply():
+    # What answered is what the server says it was, which need not be the alias asked for.
+    start = {
+        "event": "message_start",
+        "data": {"message": {"model": "claude-sonnet-5-20261001", "usage": {"input_tokens": 9}}},
+    }
+    seen = [start, *events_of("anthropic_text.jsonl")[1:3]]
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
+    assert caught.value.partial is not None
+    assert caught.value.partial.model == "claude-sonnet-5-20261001"

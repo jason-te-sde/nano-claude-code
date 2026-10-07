@@ -496,3 +496,22 @@ def test_a_terminal_that_has_gone_by_the_time_the_echo_is_put_back_is_not_an_err
 def test_there_is_no_echo_to_silence_without_a_standard_input(monkeypatch):
     monkeypatch.setattr("sys.stdin", None)
     silence_echo()()
+
+
+def test_what_was_typed_before_the_echo_was_silenced_is_still_there_to_be_read():
+    # Changing the terminal's settings must not flush its input: a person who typed ahead
+    # before a reply began has typed it, and it waits for the next prompt.
+    master, slave = pty.openpty()
+    stream = os.fdopen(slave, "rb", buffering=0, closefd=False)
+    try:
+        os.write(master, b"abc\n")
+        assert readable(slave, wait=ARRIVES_WITHIN_S)
+        restore = silence_echo(stream)
+        assert readable(slave)  # not flushed by switching the echo off
+        restore()
+        assert readable(slave)  # nor by putting it back
+        assert os.read(slave, 10) == b"abc\n"
+    finally:
+        stream.close()
+        os.close(master)
+        os.close(slave)

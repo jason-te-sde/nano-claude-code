@@ -11,12 +11,14 @@ from __future__ import annotations
 import asyncio
 import io
 import re
+import sys
 import time
 import unicodedata
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any, ClassVar
 
 import pytest
 from prompt_toolkit.input import create_pipe_input
@@ -1633,12 +1635,19 @@ class Echo:
         self.silent = False
         self.silenced = 0
         self.restored = 0
+        #: Called as the echo is switched off and as it is put back, to see what else is true.
+        self.on_silence: Callable[[], None] | None = None
+        self.on_restore: Callable[[], None] | None = None
 
     def silence(self) -> Callable[[], None]:
+        if self.on_silence is not None:
+            self.on_silence()
         self.silent = True
         self.silenced += 1
 
         def restore() -> None:
+            if self.on_restore is not None:
+                self.on_restore()
             self.silent = False
             self.restored += 1
 
@@ -1660,13 +1669,18 @@ class Display:
         height: int = 30,
         model_of: Callable[[str], str] | None = MODELS.__getitem__,
         answers: tuple[str, ...] = (),
+        auto_approve: bool = False,
     ) -> None:
         self.console, self._buffer = terminal_console(width, height=height, no_color=False)
         self.height = height
         self.prompter = ScriptedPrompter(*answers)
         self.echo = Echo()
         self.ui = ConsoleUI(
-            self.console, prompter=self.prompter, model_of=model_of, silence=self.echo.silence
+            self.console,
+            auto_approve=auto_approve,
+            prompter=self.prompter,
+            model_of=model_of,
+            silence=self.echo.silence,
         )
 
     @property
@@ -2217,3 +2231,99 @@ def test_the_last_frame_from_the_cache_holds_the_whole_reply():
     console.print(arriving)
     shown = [line.rstrip() for line in buffer.getvalue().splitlines() if line.strip()]
     assert shown == [f"line {number}" for number in range(1, 9)]
+
+
+# --------------------------------------------------------------------------
+# What the display and the echo are promised to do, and in what order
+# --------------------------------------------------------------------------
+
+
+def test_a_request_that_did_not_stream_is_not_taken_for_one_that_did():
+    # The first request failed, or was cancelled: no reply was reported, so nothing took what
+    # it had streamed. The next request streams nothing, and its reply is still to be shown.
+    screen = Screen()
+    screen.ui.on_request_start("main")
+    screen.ui.on_text("first")
+    screen.ui.on_request_end()
+    screen.ui.on_request_start("main")
+    screen.ui.on_request_end()
+    screen.ui.on_reply(reply("second"))
+    assert rows(screen.text) == ["first", "second"]
+
+
+@pytest.mark.parametrize("streamed", [[], ["Hello"]], ids=["indicator", "live region"])
+def test_the_echo_goes_back_only_once_the_display_has_stopped(display_for, streamed):
+    # Put back while the display still draws, the echo of a key typed in the last moment
+    # would land on a frame that is about to be drawn again.
+    display = display_for()
+    drawing_when_restored: list[bool] = []
+    display.echo.on_restore = lambda: drawing_when_restored.append(cursor_is_hidden(display.raw))
+    display.ui.on_request_start("main")
+    for piece in streamed:
+        display.ui.on_text(piece)
+    display.ui.on_request_end()
+    assert drawing_when_restored == [False]
+
+
+def test_the_echo_is_off_before_the_first_frame_is_drawn(display_for):
+    display = display_for()
+    drawn_when_silenced: list[str] = []
+    display.echo.on_silence = lambda: drawn_when_silenced.append(display.raw)
+    display.ui.on_request_start("main")
+    assert drawn_when_silenced == [""]  # the first frame came after
+
+
+def test_the_display_leaves_standard_output_and_error_where_they_were(display_for):
+    # Rich would swap both for the length of the display, and a request that fails must not
+    # be able to leave a process-wide stream swapped.
+    out, err = sys.stdout, sys.stderr
+    display = display_for()
+    display.ui.on_request_start("main")
+    assert (sys.stdout, sys.stderr) == (out, err)  # while the indicator is up
+    display.ui.on_text("Hello")
+    assert (sys.stdout, sys.stderr) == (out, err)  # and the live region
+    display.ui.on_request_end()
+    assert (sys.stdout, sys.stderr) == (out, err)
+
+
+class RecordsItsRate(Live):
+    rates: ClassVar[list[float]] = []
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        RecordsItsRate.rates.append(kwargs["refresh_per_second"])
+        super().__init__(*args, **kwargs)
+
+
+def test_every_display_is_asked_for_at_most_ten_frames_a_second(display_for, monkeypatch):
+    # The configured rate, which is what Rich keeps to, besides the one test that lets time pass.
+    monkeypatch.setattr("nanoclaude.cli.render.Live", RecordsItsRate)
+    RecordsItsRate.rates.clear()
+    display = display_for()
+    display.ui.on_request_start("main")
+    display.ui.on_text("Hello")
+    display.ui.on_request_end()
+    assert len(RecordsItsRate.rates) == 2  # the indicator, and the live region
+    assert max(RecordsItsRate.rates) <= 10
+
+
+async def test_a_confirmation_is_not_asked_while_only_the_indicator_is_up(display_for):
+    display = display_for(answers=("y",))
+    when_asked: list[tuple[bool, bool, bool]] = []
+    display.prompter.on_ask = lambda _message: when_asked.append(
+        (cursor_is_hidden(display.raw), display.echo.silent, "waiting for" in display.seen)
+    )
+    display.ui.on_request_start("main")  # no text has arrived: only the indicator is up
+    call = ToolUseBlock("c1", "Bash", {"command": "ls"})
+    await display.ui.confirm(call, write_request("Bash", "ls"), ASK)
+    assert when_asked == [(False, False, False)]  # nothing drawing, echo on, indicator gone
+
+
+async def test_an_automatic_approval_ends_what_is_on_the_screen_too(display_for):
+    display = display_for(auto_approve=True)
+    display.ui.on_request_start("main")
+    display.ui.on_text("I will run it.")
+    call = ToolUseBlock("c1", "Bash", {"command": "ls"})
+    assert await display.ui.confirm(call, write_request("Bash", "ls"), ASK) is Approval.ONCE
+    assert not cursor_is_hidden(display.raw)  # the line that announces the call is not drawn over
+    assert (display.echo.silenced, display.echo.restored) == (1, 1)
+    assert display.seen.splitlines()[0] == "I will run it."

@@ -1019,3 +1019,13 @@ async def test_a_body_that_cannot_be_read_before_anything_arrived_raises_as_it_a
         await complete_from(arriving([], then=httpx.DecodingError("bad gzip")))
     with pytest.raises(json.JSONDecodeError):
         await complete_from(httpx.Response(200, content=b"data: {oops\n\n"))
+
+
+async def test_the_usage_the_server_had_reported_is_in_the_partial_reply():
+    chunks = payloads_of("openai_text.jsonl")
+    seen = [chunks[4], chunks[1]]  # the usage chunk, which some servers send first, and "hel"
+    with pytest.raises(ModelError) as caught:
+        await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
+    assert caught.value.partial == ModelReply(
+        (TextBlock("hel"),), StopKind.CUT_OFF, Usage(11, 2), "gpt-5"
+    )
