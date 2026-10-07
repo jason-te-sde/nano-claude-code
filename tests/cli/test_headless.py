@@ -24,6 +24,7 @@ from nanoclaude.cli.main import EXIT_CODES, build_parser, main
 from nanoclaude.conversation.store import Store
 from nanoclaude.conversation.transcript import TextBlock
 from nanoclaude.providers.base import ModelError, ModelReply, StopKind, Usage
+from nanoclaude.providers.retry import classify_status
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, cut_off, says
 from nanoclaude.testing.session import ScriptedClient
@@ -380,14 +381,48 @@ def test_a_provider_error_is_printed_whole_whatever_it_holds(ncc_home, project, 
     assert "\x1b" not in err and "\x07" not in err  # nothing for a terminal to act on
 
 
-def test_a_missing_key_is_a_provider_error_that_names_the_variable(
-    ncc_home, project, capsys, monkeypatch
+FORMATS = [[], ["--output-format", "json"]]
+
+
+@pytest.mark.parametrize("fmt", FORMATS, ids=["text", "json"])
+def test_a_missing_key_is_a_configuration_error_that_names_the_variable(
+    ncc_home, project, capsys, monkeypatch, fmt
 ):
+    # The real router and the real adapters: no key in the environment, nothing scripted.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello")
-    assert code == EXIT_CODES["provider"]
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
+    assert code == EXIT_CODES["config"]
     assert out == ""
-    assert "ANTHROPIC_API_KEY" in err
+    assert err == (
+        "error: role 'main' uses model 'm', which needs ANTHROPIC_API_KEY "
+        "\u2014 set it, or run: ncc init\n"
+    )
+
+
+@pytest.mark.parametrize("fmt", FORMATS, ids=["text", "json"])
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_key_the_provider_rejects_is_a_configuration_error_too(
+    ncc_home, project, serve, capsys, fmt, status
+):
+    serve(m=[classify_status(status, '{"error":{"message":"invalid x-api-key"}}')])
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
+    assert code == EXIT_CODES["config"]
+    assert out == ""
+    assert err == (
+        f"error: the provider rejected your credentials (HTTP {status}): invalid x-api-key "
+        "\u2014 check the key, or run: ncc init\n"
+    )
+
+
+@pytest.mark.parametrize("fmt", FORMATS, ids=["text", "json"])
+@pytest.mark.parametrize("status", [404, 500, 400])
+def test_any_other_provider_failure_is_still_a_provider_error(
+    ncc_home, project, serve, capsys, fmt, status
+):
+    serve(m=[classify_status(status, '{"error":{"message":"nope"}}')])
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
+    assert code == EXIT_CODES["provider"]
+    assert out == "" and err.startswith("error: ")
 
 
 def test_a_model_window_too_small_for_the_prompt_is_a_configuration_error(

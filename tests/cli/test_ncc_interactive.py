@@ -181,6 +181,32 @@ def test_a_reply_in_the_repl_is_shown_with_the_model_named_in_the_banner(
     assert "bye" in out
 
 
+def test_a_missing_key_is_reported_as_a_line_and_the_repl_carries_on(
+    ncc_home, project, capsys, monkeypatch
+):
+    # The real router and adapters: the first prompt finds no key, and so does the second.
+    # Neither ends the session, which is left by Ctrl+D.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    keyboard = ScriptedPrompter("first", "second")
+
+    async def with_keyboard(
+        session: Session, console: Console, history_path: str | None = None
+    ) -> int:
+        return await run_repl(session, console, history_path, prompt=keyboard)
+
+    monkeypatch.setattr(ncc_main, "run_repl", with_keyboard)
+    code, out, err = run_ncc(capsys, "--root", str(project))
+    assert (code, err) == (EXIT_CODES["completed"], "")
+    # The REPL's console wraps its lines at the width of a plain terminal, so read them joined.
+    flat = " ".join(out.split())
+    message = (
+        "error: role 'main' uses model 'm', which needs ANTHROPIC_API_KEY "
+        "\u2014 set it, or run: ncc init"
+    )
+    assert flat.count(message) == 2
+    assert out.rstrip().endswith("bye")
+
+
 # --------------------------------------------------------------------------
 # The same flags
 # --------------------------------------------------------------------------

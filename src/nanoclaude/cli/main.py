@@ -51,7 +51,7 @@ from nanoclaude.permissions.policy import PermissionMode, Policy
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.permissions.sandbox import Sandbox
-from nanoclaude.providers.base import ModelError
+from nanoclaude.providers.base import CredentialsError, ModelError
 from nanoclaude.providers.capabilities import CapabilityCache
 from nanoclaude.tools.base import sanitize
 from nanoclaude.tools.registry import default_registry
@@ -167,7 +167,8 @@ def main(argv: list[str] | None = None) -> int:
     except (UsageError, UnknownSessionError) as exc:
         show_error(err, str(exc))
         return EXIT_CODES["usage"]
-    except (ConfigError, ContextTooSmallError) as exc:
+    except (ConfigError, ContextTooSmallError, CredentialsError) as exc:
+        # A key that is missing or refused is mended in the configuration, as the rest are.
         show_error(err, str(exc))
         return EXIT_CODES["config"]
     except SessionChangedError as exc:

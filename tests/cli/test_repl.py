@@ -29,7 +29,14 @@ from nanoclaude.cli.render import ConsoleUI
 from nanoclaude.cli.repl import PROMPT, error_message, parse_command, run_repl
 from nanoclaude.conversation.budget import ContextTooSmallError
 from nanoclaude.conversation.transcript import TextBlock, TranscriptError
-from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, StopKind, Usage
+from nanoclaude.providers.base import (
+    CredentialsError,
+    ModelError,
+    ModelReply,
+    ModelRequest,
+    StopKind,
+    Usage,
+)
 from nanoclaude.providers.capabilities import Capabilities
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, cut_off, says
@@ -419,6 +426,10 @@ async def test_a_command_that_fails_is_reported_and_the_next_prompt_is_answered(
         (
             ModelError("rejected your credentials (HTTP 401): bad key — check the key"),
             "error: rejected your credentials (HTTP 401): bad key — check the key",
+        ),
+        (
+            CredentialsError("the provider rejected your credentials (HTTP 401) — check the key"),
+            "error: the provider rejected your credentials (HTTP 401) — check the key",
         ),
         (
             ContextTooSmallError("the prompt alone needs 9000 tokens. Use a larger window."),
