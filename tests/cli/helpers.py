@@ -6,11 +6,14 @@ import io
 import re
 from collections.abc import Callable
 
+import pytest
 from rich.console import Console, RenderableType
 from rich.style import Style
 
-from nanoclaude.conversation.transcript import ToolUseBlock
+from nanoclaude.cli.main import main
+from nanoclaude.conversation.transcript import ToolResultBlock, ToolUseBlock
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
+from nanoclaude.testing.session import ScriptedClient
 
 #: What the policy answers for a call that has to be confirmed.
 ASK = PermissionResult(Decision.ASK, "default.ask", "Edit needs confirmation")
@@ -152,3 +155,20 @@ def write_request(tool: str, subject: str) -> PermissionRequest:
     if tool == "Bash":
         return PermissionRequest(tool, subject)
     return PermissionRequest(tool, subject, (subject,), is_write=True)
+
+
+def tool_results(client: ScriptedClient, request: int = 1) -> list[ToolResultBlock]:
+    """The tool results the model was shown with its ``request``-th request (0-based)."""
+    last = client.requests[request].transcript.messages[-1]
+    return [block for block in last.blocks if isinstance(block, ToolResultBlock)]
+
+
+def run_ncc(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, str]:
+    """``ncc`` with ``argv``: its exit code, and what it wrote to stdout and to stderr."""
+    code = main(list(argv))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+#: What ncc says when it is stopped with Ctrl+C: one line on stderr, like every other.
+INTERRUPTED = "error: interrupted \u2014 nothing more was done; run again to retry\n"

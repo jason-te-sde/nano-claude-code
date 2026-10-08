@@ -11,7 +11,14 @@ from nanoclaude.agent.router import RoleUsage, Router
 from nanoclaude.config.load import ConfigError
 from nanoclaude.config.schema import ROLES, Config, ModelConfig, RolesConfig
 from nanoclaude.providers.anthropic import AnthropicClient
-from nanoclaude.providers.base import ModelClient, ModelError, ModelReply, ModelRequest, Usage
+from nanoclaude.providers.base import (
+    CredentialsError,
+    ModelClient,
+    ModelError,
+    ModelReply,
+    ModelRequest,
+    Usage,
+)
 from nanoclaude.providers.capabilities import CONSERVATIVE_DEFAULT, Capabilities, CapabilityCache
 from nanoclaude.providers.ollama import OllamaClient
 from nanoclaude.providers.openai_compat import OpenAICompatClient
@@ -290,7 +297,7 @@ async def test_each_model_is_given_the_key_from_its_own_variable(make, monkeypat
 async def test_a_missing_anthropic_key_names_the_role_the_model_and_the_variable(make):
     config = config_with()
     config.env.clear()
-    with pytest.raises(ModelError) as caught:
+    with pytest.raises(CredentialsError) as caught:
         await make(config).client_for("verify")
     assert str(caught.value) == (
         "role 'verify' uses model 'big', which needs ANTHROPIC_API_KEY — set it, or run: ncc init"
@@ -322,7 +329,7 @@ async def test_a_missing_openai_compatible_key_names_the_models_own_variable(mak
         )
     }
     config = Config(models=models, roles=roles_all("or"), env={"OPENAI_API_KEY": "someone-elses"})
-    with pytest.raises(ModelError) as caught:
+    with pytest.raises(CredentialsError) as caught:
         await make(config).client_for("main")
     assert "set OPENROUTER_API_KEY or run: ncc init" in str(caught.value)
     assert "OPENAI_API_KEY" not in str(caught.value)

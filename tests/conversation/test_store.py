@@ -17,6 +17,7 @@ from nanoclaude.conversation.store import (
     Store,
     decode_blocks,
     encode_blocks,
+    same_directory,
 )
 from nanoclaude.conversation.transcript import (
     Message,
@@ -206,6 +207,130 @@ def test_latest_session_id_is_none_for_an_empty_database(tmp_path):
     store = Store(tmp_path / "s.db")
     store.open()
     assert store.latest_session_id() is None
+
+
+def _talked(store: Store, session_id: str, cwd: str) -> None:
+    """A session started in ``cwd`` in which something was said."""
+    store.create_session(session_id, cwd=cwd, roles={})
+    store.append_message(session_id, 0, user_text("hello"))
+
+
+def _ticking(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fixed_clock(monkeypatch, *(float(n) for n in range(1, 100)))
+
+
+def test_latest_session_in_a_directory_ignores_sessions_started_elsewhere(tmp_path, monkeypatch):
+    _ticking(monkeypatch)
+    store = Store(tmp_path / "s.db")
+    store.open()
+    _talked(store, "here-old", "/p/here")
+    _talked(store, "here-new", "/p/here")
+    _talked(store, "elsewhere", "/p/elsewhere")  # the latest in the store
+    assert store.latest_session_id() == "elsewhere"
+    assert store.latest_session_id(cwd="/p/here") == "here-new"
+    assert store.latest_session_id(cwd="/p/elsewhere") == "elsewhere"
+
+
+def test_latest_session_in_a_directory_is_none_when_nothing_was_started_there(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    _talked(store, "s1", "/p/here")
+    assert store.latest_session_id(cwd="/p/nowhere") is None
+
+
+def test_a_directory_is_matched_whole_and_not_as_a_prefix_or_a_pattern(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    _talked(store, "deep", "/p/here/deeper")
+    _talked(store, "sibling", "/p/here-too")
+    _talked(store, "pattern", "/p/h_re")
+    assert store.latest_session_id(cwd="/p/here") is None
+    assert store.latest_session_id(cwd="/p/h%") is None
+    assert store.latest_session_id(cwd="/p/h_re") == "pattern"
+
+
+def test_a_session_nothing_was_said_in_is_not_the_one_to_continue(tmp_path, monkeypatch):
+    # A REPL left at once leaves a row with no conversation, and --continue landing on it
+    # would take the person back to nothing while their last real conversation sits behind it.
+    _ticking(monkeypatch)
+    store = Store(tmp_path / "s.db")
+    store.open()
+    _talked(store, "real", "/p/here")
+    store.create_session("abandoned", cwd="/p/here", roles={})
+    assert store.latest_session_id() == "abandoned"  # the whole store is as it was
+    assert store.latest_session_id(cwd="/p/here") == "real"
+
+
+def test_with_nothing_said_in_any_session_there_is_none_to_continue(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("abandoned", cwd="/p/here", roles={})
+    assert store.latest_session_id(cwd="/p/here") is None
+
+
+def test_a_conversation_that_was_cleared_has_nothing_left_to_continue(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    _talked(store, "s1", "/p/here")
+    store.replace_transcript("s1", Transcript())
+    assert store.latest_session_id(cwd="/p/here") is None
+
+
+def test_a_directory_is_the_same_place_however_it_was_spelled(tmp_path, monkeypatch):
+    _ticking(monkeypatch)
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    store = Store(tmp_path / "s.db")
+    store.open()
+    _talked(store, "by-link", str(link))
+    _talked(store, "by-real", str(real))
+    _talked(store, "elsewhere", str(tmp_path))
+    assert store.latest_session_id(cwd=str(real)) == "by-real"
+    assert store.latest_session_id(cwd=str(link)) == "by-real"  # the same place, the newest
+    # And the older spelling is found from the newer, as the only one there is.
+    only = Store(tmp_path / "t.db")
+    only.open()
+    _talked(only, "by-link", str(link))
+    assert only.latest_session_id(cwd=str(real)) == "by-link"
+
+
+def test_a_directory_with_another_capitalisation_is_the_same_place_where_the_disk_says_so(
+    tmp_path,
+):
+    (tmp_path / "Project").mkdir()
+    if not (tmp_path / "project").exists():
+        pytest.skip("this file system tells Project from project")
+    store = Store(tmp_path / "s.db")
+    store.open()
+    _talked(store, "s1", str(tmp_path / "Project"))
+    assert store.latest_session_id(cwd=str(tmp_path / "project")) == "s1"
+
+
+def test_a_directory_that_has_gone_is_still_compared_by_where_it_was(tmp_path):
+    gone = tmp_path / "gone"
+    store = Store(tmp_path / "s.db")
+    store.open()
+    _talked(store, "s1", str(gone))
+    assert store.latest_session_id(cwd=str(gone)) == "s1"
+    assert store.latest_session_id(cwd=str(tmp_path / "other")) is None
+
+
+def test_same_directory_is_the_comparison_resume_uses_too(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert same_directory(str(link), str(real))
+    assert not same_directory(str(real), str(tmp_path))
+    assert same_directory("/does/not/exist", "/does/not/exist")
+    # Gone, and reached through a link that is not: the place the link leads to.
+    assert same_directory(str(link / "gone"), str(real / "gone"))
+    assert not same_directory(str(link / "gone"), str(tmp_path / "gone"))
+    # Gone, and spelled differently: where each was, once the dots are resolved.
+    assert same_directory("/does/not/../not/exist", "/does/not/exist")
+    assert not same_directory("/does/not/exist", "/does/not/exist-too")
 
 
 def test_finishing_a_session_records_usage_and_cost(tmp_path):

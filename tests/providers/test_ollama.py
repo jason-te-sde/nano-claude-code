@@ -16,6 +16,7 @@ from nanoclaude.conversation.transcript import (
     validate,
 )
 from nanoclaude.providers.base import (
+    CredentialsError,
     ModelClient,
     ModelError,
     ModelReply,
@@ -496,6 +497,18 @@ async def test_a_404_is_classified_as_not_knowing_the_model():
                 ModelRequest("s", Transcript((user_text("hi"),)), (), 64)
             )
     assert not excinfo.value.retryable
+
+
+async def test_a_401_from_a_server_behind_a_proxy_is_a_credentials_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "unauthorized"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(CredentialsError, match="check the key") as excinfo:
+            await OllamaClient(model="m", client=http).complete(
+                ModelRequest("s", Transcript((user_text("hi"),)), (), 64)
+            )
+    assert excinfo.value.status == 401 and not excinfo.value.retryable
 
 
 async def test_a_429_is_classified_as_retryable():

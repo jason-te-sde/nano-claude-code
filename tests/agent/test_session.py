@@ -3335,6 +3335,59 @@ async def test_a_stream_cut_off_after_only_blank_text_keeps_nothing(tmp_repo):
     assert [m.text() for m in session.state.transcript.messages] == ["question"]
 
 
+async def test_the_text_a_cut_off_reply_left_is_there_for_a_front_end_without_the_marker(tmp_repo):
+    session = build_session(tmp_repo, [cut_off("The first half of an ans")])
+    assert session.cut_off_text is None  # nothing has been asked
+    with pytest.raises(ModelError):
+        await session.run("question")
+    assert session.cut_off_text == "The first half of an ans"
+
+
+async def test_a_cut_off_that_left_no_text_leaves_nothing_to_hand_over(tmp_repo):
+    session = build_session(tmp_repo, [cut_off("  \n")])
+    with pytest.raises(ModelError):
+        await session.run("question")
+    assert session.cut_off_text is None
+
+
+async def test_the_next_prompt_forgets_what_the_last_one_left_cut_off(tmp_repo):
+    session = build_session(tmp_repo, [cut_off("half"), says("whole"), cut_off("another half")])
+    with pytest.raises(ModelError):
+        await session.run("question")
+    await session.follow_up("continue")
+    assert session.cut_off_text is None
+    with pytest.raises(ModelError):
+        await session.follow_up("again")
+    assert session.cut_off_text == "another half"
+
+
+async def test_a_cleared_conversation_has_no_cut_off_text(tmp_repo):
+    session = build_session(tmp_repo, [cut_off("half")])
+    with pytest.raises(ModelError):
+        await session.run("question")
+    session.clear()
+    assert session.cut_off_text is None
+
+
+async def test_what_a_cut_off_reply_kept_keeps_the_indentation_it_began_with(tmp_repo):
+    # The first line of code is indented, and that indentation is code.
+    session = build_session(tmp_repo, [cut_off("\n\n    indented = 1\n    more   \n\n")])
+    with pytest.raises(ModelError):
+        await session.run("question")
+    assert session.cut_off_text == "    indented = 1\n    more"
+    assert session.state.transcript.messages[-1].text() == (
+        "    indented = 1\n    more\n\n[this reply was cut off before it finished]"
+    )
+
+
+async def test_a_reply_that_quotes_the_cut_off_marker_is_still_a_whole_reply(tmp_repo):
+    # What marks a kept reply is something the session did, and not words a model can write.
+    quoted = "It ends with [this reply was cut off before it finished]"
+    session = build_session(tmp_repo, [says(quoted)])
+    await session.run("question")
+    assert session.cut_off_text is None
+
+
 # --------------------------------------------------------------------------
 # A client written before streaming existed
 # --------------------------------------------------------------------------

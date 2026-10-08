@@ -9,6 +9,7 @@ import pytest
 
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock, Transcript, user_text
 from nanoclaude.providers.base import (
+    CredentialsError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -131,3 +132,19 @@ def test_a_partial_reply_with_no_text_is_a_reply_with_no_blocks():
     arrived = partial_reply([], Usage(7, 0), "m")
     assert arrived.blocks == ()
     assert arrived.usage == Usage(7, 0)
+
+
+def test_a_credentials_error_is_a_model_error_so_every_handler_of_one_still_catches_it():
+    error = CredentialsError("no key \u2014 set it", status=401)
+    assert isinstance(error, ModelError)
+    assert str(error) == "no key \u2014 set it"
+    assert error.status == 401
+    assert error.partial is None and error.context_overflow is False
+
+
+def test_a_credentials_error_is_never_retryable_and_cannot_be_made_so():
+    # Asking again with the same key says the same thing. The type refuses the argument
+    # that would say otherwise, so an adapter cannot build a retryable one by mistake.
+    assert CredentialsError("no key").retryable is False
+    with pytest.raises(TypeError):
+        CredentialsError("no key", retryable=True)  # type: ignore[call-arg]

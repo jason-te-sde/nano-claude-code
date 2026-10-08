@@ -18,6 +18,7 @@ from nanoclaude.conversation.transcript import (
     validate,
 )
 from nanoclaude.providers.base import (
+    CredentialsError,
     ModelClient,
     ModelError,
     ModelReply,
@@ -600,7 +601,7 @@ def test_a_malformed_base_url_is_left_for_the_request_to_report():
 def test_a_missing_api_key_names_the_adapter_and_the_fix():
     """Spec section 17.9, verbatim -- the exact wording and the em-dash both
     matter here, so this checks equality rather than a substring."""
-    with pytest.raises(ModelError) as excinfo:
+    with pytest.raises(CredentialsError) as excinfo:
         OpenAICompatClient("", model="gpt-5", base_url="https://x/v1")
     assert str(excinfo.value) == (
         'no API key for adapter "openai_compat" — set OPENAI_API_KEY or run: ncc init'
@@ -757,8 +758,19 @@ async def test_complete_streams_the_tool_use_cassette_over_real_wire_text():
     assert reply.usage.cache_read_tokens == 32
 
 
+async def test_a_rejected_key_is_a_credentials_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": {"message": "key not allowed"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        client = OpenAICompatClient("bad", model="m", base_url="https://x/v1", client=http)
+        with pytest.raises(CredentialsError, match="ncc init") as excinfo:
+            await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 10))
+    assert excinfo.value.status == 403 and not excinfo.value.retryable
+
+
 def test_the_missing_key_message_names_the_variable_the_config_says_to_use():
-    with pytest.raises(ModelError) as excinfo:
+    with pytest.raises(CredentialsError) as excinfo:
         OpenAICompatClient(
             "",
             model="deepseek/deepseek-v3",

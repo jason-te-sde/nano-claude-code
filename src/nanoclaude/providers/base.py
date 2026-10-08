@@ -156,6 +156,20 @@ class ModelError(RuntimeError):
         self.partial = partial
 
 
+class CredentialsError(ModelError):
+    """There is no key to send, or the provider refused the one that was sent.
+
+    Not a failure of the provider or the network: asking again says the same thing, and the
+    fix is a change to configuration (set the key, or run ``ncc init``), so a front end
+    that tells a script "misconfigured" from "the provider failed" needs to tell this apart.
+    It is a :class:`ModelError` so that whatever handles those still handles this, and it
+    takes no ``retryable``: it never is.
+    """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message, retryable=False, status=status)
+
+
 @runtime_checkable
 class ModelClient(Protocol):
     """Something that answers a :class:`ModelRequest`.

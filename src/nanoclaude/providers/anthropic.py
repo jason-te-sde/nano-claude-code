@@ -29,6 +29,7 @@ from nanoclaude.conversation.transcript import (
     Transcript,
 )
 from nanoclaude.providers.base import (
+    CredentialsError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -280,9 +281,8 @@ class AnthropicClient:
         cache: bool = True,
     ) -> None:
         if not api_key:
-            raise ModelError(
-                'no API key for adapter "anthropic" — set ANTHROPIC_API_KEY or run: ncc init',
-                retryable=False,
+            raise CredentialsError(
+                'no API key for adapter "anthropic" — set ANTHROPIC_API_KEY or run: ncc init'
             )
         self._model = model
         self._owns_client = client is None
