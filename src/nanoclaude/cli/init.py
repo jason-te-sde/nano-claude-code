@@ -12,10 +12,30 @@ dotfiles repository. The pasted key goes to one place only: the verification req
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import os
 import re
+from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
-from nanoclaude.config.schema import ROLES, LimitsConfig, PermissionsConfig
+from rich.console import Console
+from rich.markup import escape
+
+from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, ConfigError, load_config
+from nanoclaude.config.schema import ROLES, Config, LimitsConfig, PermissionsConfig
+from nanoclaude.providers.capabilities import CACHE_FILENAME, CapabilityCache
+from nanoclaude.tools.base import sanitize
+
+#: Asks one question and returns the answer, as ``ask(message, choices=..., default=...,
+#: password=...)``. ``choices`` are the answers that are accepted, ``default`` is what Enter
+#: gives, and ``password`` keeps the answer off the screen.
+Ask = Callable[..., str]
+
+#: Sends one small request with the model ``alias`` names and returns what is wrong, or None.
+Verifier = Callable[[Config, str], Coroutine[Any, Any, str | None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,3 +145,144 @@ deny  = ["Read(**/.env*)"]
 max_turns      = {limits.max_turns}
 bash_timeout_s = {limits.bash_timeout_s:g}
 """
+
+
+def _outside(text: str) -> str:
+    """Text that came from outside (a provider's error, a path), safe to put in a template.
+
+    Never read as markup, so ``[/]`` in a path cannot raise; stripped of anything a terminal
+    would act on; and one line, so that it cannot start a line of its own.
+    """
+    return escape(" ".join(sanitize(text).split()))
+
+
+def _say(console: Console, markup: str) -> None:
+    """One line. Not wrapped: a path cut in two at column 80 is a path nobody can copy."""
+    console.print(markup, soft_wrap=True, highlight=False)
+
+
+def _redact(text: str, key: str) -> str:
+    """``text`` without the key in it, wherever it appears.
+
+    A provider is free to say a key back in its error, and a library to put a header value
+    in an exception; this is the one place where what is shown is checked against the key.
+    An empty key is nothing to hide, and replacing it would put the marker between every
+    two characters.
+    """
+    return text.replace(key, "[hidden]") if key else text
+
+
+def _write_private(path: Path, text: str) -> None:
+    """Write ``text`` to ``path``, which exists with mode 0600 from the moment it does.
+
+    The file is made by ``os.open`` with the mode in its arguments, so that no other user
+    can read it between its being made and its being made private, and is then moved into
+    place: a file that was already there is replaced by one that is private, whatever its
+    own mode was, and one that was interrupted leaves no half of a config.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        temporary.replace(path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temporary.unlink()
+        raise
+
+
+def run_init(
+    console: Console,
+    *,
+    home: Path,
+    ask: Ask,
+    verify: Verifier,
+    env: Mapping[str, str] | None = None,
+) -> int:
+    """Ask which provider, which model and (if one is needed) the key; write the config.
+
+    ``home`` is the directory that holds ``.nanoclaude``. The key is used for one request
+    and kept nowhere: not in the file, not in this process's environment, not on the screen.
+    Returns the exit status: 0 when the setup was finished or left alone, even if the key
+    could not be verified, because the file is written and the key is the person's to fix.
+    Raises :class:`~nanoclaude.config.load.ConfigError` when the file cannot be written.
+    """
+    environment = dict(os.environ if env is None else env)
+    target = home / CONFIG_DIRNAME / CONFIG_FILENAME
+    if os.path.lexists(target):
+        _say(console, f"[yellow]{_outside(str(target))} already exists.[/yellow]")
+        if ask("overwrite?", choices=["y", "n"], default="n") != "y":
+            _say(console, "[dim]left alone[/dim]")
+            return 0
+
+    _say(console, "[bold]Which provider?[/bold]")
+    presets = list(PRESETS.values())
+    for number, offered in enumerate(presets, start=1):
+        _say(console, f"  {number}. {offered.label}")
+    picked = ask("choice", choices=[str(n) for n in range(1, len(presets) + 1)], default="1")
+    preset = presets[int(picked) - 1]
+
+    key = ""
+    if preset.needs_key:
+        key = environment.get(preset.key_env, "")
+        if key:
+            _say(console, f"[dim]{preset.key_env} is already set; using it[/dim]")
+        else:
+            key = ask("paste your key (hidden; it is checked once and never saved)", password=True)
+            key = key.strip()
+    model = ask("model", default=preset.default_model).strip() or preset.default_model
+
+    alias = preset.key
+    try:
+        _write_private(target, render_config(preset, alias, model))
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        raise ConfigError(
+            f"cannot write {target} ({reason}) — check that the directory exists and that you "
+            "can write to it"
+        ) from exc
+    _say(console, f"[green]wrote[/green] {_outside(str(target))}")
+    _forget_what_was_learned_about_models(console, target.parent / CACHE_FILENAME)
+
+    if key and not environment.get(preset.key_env):
+        _say(
+            console,
+            "\nncc reads the key from your environment, and init does not save it. Add this to "
+            "your shell profile, with your key in place of <your key>:\n"
+            f"  [bold]export {preset.key_env}='<your key>'[/bold]\n",
+        )
+
+    # What the check uses is what ncc will use: the file just written, loaded as ncc loads it,
+    # with the key it was given. It is added to this copy of the environment and nowhere else.
+    config = load_config(home=str(home), project=None, env={**environment, preset.key_env: key})
+    _say(console, "[dim]checking with one small request...[/dim]")
+    problem = asyncio.run(verify(config, alias))
+    if problem:
+        _say(console, f"[yellow]could not verify:[/yellow] {_outside(_redact(problem, key))}")
+    else:
+        _say(console, "[green]verified[/green] the provider answered")
+
+    _say(
+        console,
+        "\nTry it:\n  [bold]ncc[/bold]\n  [bold]ncc -p 'what does this project do?'[/bold]",
+    )
+    return 0
+
+
+def _forget_what_was_learned_about_models(console: Console, cache: Path) -> None:
+    """Clear the capability cache, so that every model is probed again on its next use.
+
+    A new setup is a reason to ask again what the models can do; a cache that cannot be
+    removed is said, with the file, and does not stop the setup.
+    """
+    try:
+        CapabilityCache(cache).clear()
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        _say(
+            console,
+            f"[yellow]could not remove {_outside(str(cache))}[/yellow] ({_outside(reason)}) "
+            "— delete it so that every model is probed again",
+        )
