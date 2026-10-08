@@ -477,8 +477,21 @@ class Interrupting(ScriptedClient):
         raise AssertionError("the interrupt did not end the run")
 
 
+@pytest.fixture
+def python_handles_ctrl_c():
+    """asyncio.run takes Ctrl+C over only where Python's own handler is the one installed.
+
+    A process started in the background of a non-interactive shell inherits SIGINT as ignored,
+    and then there is no handler to take over, so a test that sends the signal would wait out
+    its sleep. This puts Python's default back for the test, as a person's terminal has it.
+    """
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    yield
+    signal.signal(signal.SIGINT, previous)
+
+
 def test_ctrl_c_during_a_request_ends_the_run_and_closes_the_session(
-    ncc_home, project, capsys, monkeypatch
+    ncc_home, project, capsys, monkeypatch, python_handles_ctrl_c
 ):
     clients = {"m": Interrupting([])}
     monkeypatch.setattr(ncc_main, "Router", lambda config, cache: Router(config, cache, clients))
