@@ -605,6 +605,18 @@ def test_a_file_changing_tool_is_not_in_the_allowed_without_asking_set():
     assert result.decision is Decision.ASK
 
 
+@pytest.mark.parametrize("tool", ["Read", "Grep", "Glob", "TodoWrite"])
+def test_an_ask_rule_cannot_make_a_tool_that_is_allowed_without_asking_ask(tool):
+    """Row 10 comes before row 11, so the way to keep a read from happening is deny.
+
+    The shipped configuration lists TodoWrite among the tools it asks about, and it is
+    allowed all the same; this is the reason, and the configuration reference says so.
+    """
+    p = policy(rules=RuleSet.build(ask=[tool]))
+    result = evaluate(req(tool=tool, subject="x", paths=()), p, Grants())
+    assert (result.decision, result.rule) == (Decision.ALLOW, "tool.read-only")
+
+
 # The regex classifier's own verdicts, not hand-built ones: what it says about a
 # command it found nothing in is "nothing refused this", never a clearance.
 def test_the_regex_classifier_never_clears_a_command_it_found_nothing_in():
