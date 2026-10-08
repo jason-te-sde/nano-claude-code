@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 from collections.abc import Callable, Coroutine, Mapping, Sequence
@@ -234,6 +235,9 @@ async def verify(config: Config, alias: str) -> str | None:
         return f"no answer within {VERIFY_TIMEOUT_S:g} seconds — check your network connection"
     except EmptyReplyError:
         return None
+    except json.JSONDecodeError:
+        # What came back was read as a reply and was not one: a page where the stream goes.
+        return "the provider's answer was not a reply stream"
     except ModelError as exc:
         return _redact(str(exc), key)
     except Exception as exc:

@@ -146,7 +146,7 @@ class OllamaClient:
             async with self._client.stream(
                 "POST", f"{self._base_url}/api/chat", json=self.payload(request)
             ) as response:
-                if response.status_code >= 400:
+                if not response.is_success:
                     body = (await response.aread()).decode("utf-8", errors="replace")
                     raise classify_status(response.status_code, body)
                 async for line in response.aiter_lines():
@@ -232,6 +232,9 @@ class OllamaClient:
         blocks.extend(calls)
         stop = StopKind.TOOL_USE if calls else StopKind.END_TURN
         if not blocks:
+            if not done:
+                # No line said the reply was over, and none carried anything: an empty body.
+                raise ModelError("the provider's answer was not a reply stream")
             raise EmptyReplyError("ollama returned no content")
         return ModelReply(tuple(blocks), stop, usage, self._model)
 

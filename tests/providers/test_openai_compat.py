@@ -1042,3 +1042,64 @@ async def test_the_usage_the_server_had_reported_is_in_the_partial_reply():
     assert caught.value.partial == ModelReply(
         (TextBlock("hel"),), StopKind.CUT_OFF, Usage(11, 2), "gpt-5"
     )
+
+
+# -- an answer that is not a reply stream is not a reply ----------------------------------
+# A 200 proves only that something answered: a captive portal does, and so does a proxy
+# with nothing behind it. "Empty reply" is for a stream that said it was over; anything
+# else is not a reply stream at all, and a front end that reads the first as "the provider
+# answered" must not be handed the second as one.
+
+NOT_A_STREAM = {
+    "a page": lambda: httpx.Response(
+        200, content=b"<html>Sign in to the network</html>", headers={"content-type": "text/html"}
+    ),
+    "an empty body": lambda: httpx.Response(200, content=b""),
+    "a whole reply that was not streamed": lambda: httpx.Response(
+        200, json={"choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]}
+    ),
+}
+
+
+@pytest.mark.parametrize("answer", NOT_A_STREAM)
+async def test_a_200_that_is_not_a_reply_stream_is_an_error_and_not_an_empty_reply(answer):
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        await complete_from(NOT_A_STREAM[answer]())
+    assert not isinstance(caught.value, EmptyReplyError)
+    assert caught.value.retryable is False and caught.value.partial is None
+
+
+def test_no_chunks_at_all_is_not_a_reply_stream():
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        ChunkAccumulator(model="gpt-5").result()
+    assert not isinstance(caught.value, EmptyReplyError)
+
+
+def test_a_stream_that_carried_only_its_end_marker_is_an_empty_reply():
+    accumulator = ChunkAccumulator(model="gpt-5")
+    accumulator.end()  # data: [DONE]
+    with pytest.raises(EmptyReplyError, match="no content"):
+        accumulator.result()
+
+
+async def test_a_stream_that_carried_only_done_is_an_empty_reply_over_the_wire():
+    with pytest.raises(EmptyReplyError):
+        await complete_from(arriving(["[DONE]"]))
+
+
+async def test_a_usage_chunk_with_no_end_marker_is_not_a_reply_stream():
+    seen = [{"choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 0}}]
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        await complete_from(arriving(seen))
+    assert not isinstance(caught.value, EmptyReplyError)
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+async def test_a_redirect_is_an_error_and_its_page_is_not_read_as_a_reply(status):
+    response = httpx.Response(
+        status, headers={"location": "https://x/login"}, content=b"data: [DONE]\n\n"
+    )
+    with pytest.raises(ModelError, match=rf"redirect \(HTTP {status}\)") as caught:
+        await complete_from(response)
+    assert caught.value.status == status and caught.value.retryable is False
+    assert not isinstance(caught.value, EmptyReplyError)

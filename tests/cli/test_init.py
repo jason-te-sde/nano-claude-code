@@ -829,6 +829,51 @@ async def test_a_local_thinking_model_cut_at_the_cap_before_any_text_verifies_to
     assert await verify(config_for(tmp_path, "ollama", None), "ollama") is None
 
 
+# What answers where a provider should, and is not one: a captive portal's page, a proxy with
+# nothing behind it, a reply that was not streamed. A 200 proves something answered, not that
+# the key was accepted; "verified" is for a reply stream.
+NOT_REPLIES = {
+    "a captive portal's page": lambda _request: httpx.Response(
+        200, content=b"<html>Sign in to the network</html>", headers={"content-type": "text/html"}
+    ),
+    "an empty body": lambda _request: httpx.Response(200, content=b""),
+    "a whole reply that was not streamed": lambda _request: httpx.Response(
+        200, json={"choices": [{"message": {"content": "ok"}}], "content": [{"text": "ok"}]}
+    ),
+}
+WIRES = {"anthropic": "anthropic", "openai": "openai", "ollama": "ollama"}
+
+
+@pytest.mark.parametrize("answer", NOT_REPLIES)
+@pytest.mark.parametrize("name", WIRES)
+async def test_a_200_that_is_not_a_reply_stream_does_not_verify_a_key(
+    tmp_path, key, wire, name, answer
+):
+    wire.answer = NOT_REPLIES[answer]
+    problem = await verify(config_for(tmp_path, name, None if name == "ollama" else key), name)
+    assert problem is not None and "not a reply stream" in problem
+
+
+@pytest.mark.parametrize("name", WIRES)
+async def test_a_redirect_does_not_verify_a_key(tmp_path, key, wire, name):
+    wire.answer = lambda _request: httpx.Response(
+        302, headers={"location": "https://portal.example/login"}, content=b"<html></html>"
+    )
+    problem = await verify(config_for(tmp_path, name, None if name == "ollama" else key), name)
+    assert problem is not None and "redirect (HTTP 302)" in problem
+
+
+@pytest.mark.parametrize("name", WIRES)
+def test_a_captive_portal_page_is_reported_as_could_not_verify(tmp_path, key, wire, name):
+    wire.answer = NOT_REPLIES["a captive portal's page"]
+    answers = [choice_of(name)] + ([key] if PRESETS[name].needs_key else []) + [None]
+    console, buffer = plain_console(120)
+    assert run_init(console, home=tmp_path, ask=Answers(*answers), env={}) == 0
+    assert "could not verify" in buffer.getvalue()
+    assert "verified the provider" not in buffer.getvalue()
+    assert config_path(tmp_path).is_file()
+
+
 async def test_a_rejected_key_is_reported_in_the_providers_words(tmp_path, key, wire):
     wire.answer = lambda _request: httpx.Response(
         401, json={"error": {"type": "authentication_error", "message": "invalid x-api-key"}}

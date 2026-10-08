@@ -89,6 +89,16 @@ def classify_status(status: int, body: str) -> ModelError:
             "check the key, or run: ncc init",
             status=status,
         )
+    if 300 <= status < 400:
+        # httpx does not follow one, and the page behind it is not an answer. A captive
+        # portal sends one, and so does an address that has moved.
+        return ModelError(
+            f"the provider answered with a redirect (HTTP {status}) instead of a reply "
+            "\u2014 the address (base_url) is probably wrong, or something on the network is "
+            "answering in its place",
+            retryable=False,
+            status=status,
+        )
     if status == 404:
         return ModelError(
             f"the provider does not know that model or endpoint (HTTP 404): {detail}",

@@ -693,10 +693,12 @@ async def test_a_stream_that_ends_after_text_without_its_done_line_was_cut_off()
     )
 
 
-async def test_a_stream_that_ends_before_anything_arrived_is_still_no_content():
-    with pytest.raises(EmptyReplyError, match="no content") as caught:
+async def test_a_stream_that_ends_before_anything_arrived_is_not_a_reply_stream():
+    # Nothing, and no done line: an empty reply is one that said it was over.
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
         await complete_from(arriving([]))
-    assert caught.value.partial is None
+    assert not isinstance(caught.value, EmptyReplyError)
+    assert caught.value.partial is None and caught.value.retryable is False
 
 
 # -- a stream that cannot be read is a stream that broke, not only one that dropped --
@@ -737,3 +739,29 @@ async def test_the_counts_the_server_had_reported_are_in_the_partial_reply():
     assert caught.value.partial == ModelReply(
         (TextBlock("hel"),), StopKind.CUT_OFF, Usage(11, 2), "qwen3-coder:30b"
     )
+
+
+# -- an answer that is not a reply stream is not a reply ----------------------------------
+
+
+async def test_a_200_with_an_empty_body_is_not_a_reply_stream():
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        await complete_from(httpx.Response(200, content=b""))
+    assert not isinstance(caught.value, EmptyReplyError)
+
+
+async def test_a_chunk_with_no_done_line_and_no_content_is_not_a_reply_stream():
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        await complete_from(arriving(['{"message": {"role": "assistant", "content": ""}}']))
+    assert not isinstance(caught.value, EmptyReplyError)
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+async def test_a_redirect_is_an_error_and_its_page_is_not_read_as_a_reply(status):
+    response = httpx.Response(
+        status, headers={"location": "https://x/login"}, content=b'{"done": true}\n'
+    )
+    with pytest.raises(ModelError, match=rf"redirect \(HTTP {status}\)") as caught:
+        await complete_from(response)
+    assert caught.value.status == status and caught.value.retryable is False
+    assert not isinstance(caught.value, EmptyReplyError)

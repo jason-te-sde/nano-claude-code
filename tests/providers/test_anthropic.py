@@ -789,10 +789,13 @@ async def test_a_stream_that_closes_after_a_finished_tool_call_without_message_s
     )
 
 
-async def test_a_stream_that_closes_before_anything_arrived_is_still_no_content():
-    with pytest.raises(EmptyReplyError, match="no content blocks") as caught:
+async def test_a_stream_that_closes_before_anything_arrived_is_not_a_reply_stream():
+    # message_start and nothing after it: the stream never said it was over, so it is not an
+    # empty reply (which is what message_stop with no block in between is).
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
         await complete_from(arriving(events_of("anthropic_text.jsonl")[:1]))
-    assert caught.value.partial is None
+    assert not isinstance(caught.value, EmptyReplyError)
+    assert caught.value.partial is None and caught.value.retryable is False
 
 
 def test_a_stream_that_closes_inside_a_thinking_block_is_an_error_with_nothing_to_keep():
@@ -882,3 +885,53 @@ async def test_the_model_the_server_reported_is_the_model_of_the_partial_reply()
         await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
     assert caught.value.partial is not None
     assert caught.value.partial.model == "claude-sonnet-5-20261001"
+
+
+# -- an answer that is not a reply stream is not a reply ----------------------------------
+# A 200 proves only that something answered. "Empty reply" is for a stream that ran from
+# message_start to message_stop with nothing in it; anything else is not a reply stream.
+
+NOT_A_STREAM = {
+    "a page": lambda: httpx.Response(
+        200, content=b"<html>Sign in to the network</html>", headers={"content-type": "text/html"}
+    ),
+    "an empty body": lambda: httpx.Response(200, content=b""),
+    "a whole reply that was not streamed": lambda: httpx.Response(
+        200, json={"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"}
+    ),
+}
+
+
+@pytest.mark.parametrize("answer", NOT_A_STREAM)
+async def test_a_200_that_is_not_a_reply_stream_is_an_error_and_not_an_empty_reply(answer):
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        await complete_from(NOT_A_STREAM[answer]())
+    assert not isinstance(caught.value, EmptyReplyError)
+    assert caught.value.retryable is False and caught.value.partial is None
+
+
+def test_a_message_stop_with_no_message_start_is_not_a_reply_stream():
+    accumulator = StreamAccumulator()
+    accumulator.handle("message_stop", {})
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        accumulator.result()
+    assert not isinstance(caught.value, EmptyReplyError)
+
+
+def test_a_message_start_with_no_message_stop_is_not_an_empty_reply():
+    accumulator = StreamAccumulator()
+    accumulator.handle("message_start", {"message": {"usage": {"input_tokens": 5}}})
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        accumulator.result()
+    assert not isinstance(caught.value, EmptyReplyError)
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+async def test_a_redirect_is_an_error_and_its_page_is_not_read_as_a_reply(status):
+    response = httpx.Response(
+        status, headers={"location": "https://x/login"}, content=b"<html>moved</html>"
+    )
+    with pytest.raises(ModelError, match=rf"redirect \(HTTP {status}\)") as caught:
+        await complete_from(response)
+    assert caught.value.status == status and caught.value.retryable is False
+    assert not isinstance(caught.value, EmptyReplyError)

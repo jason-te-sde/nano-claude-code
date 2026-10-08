@@ -40,6 +40,16 @@ def test_the_retryable_set_matches_the_spec_table(status, retryable):
     assert classify_status(status, "body").retryable is retryable
 
 
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_a_redirect_is_not_a_reply_and_the_words_say_so(status):
+    # httpx does not follow it, and a captive portal or a mistyped address sends one.
+    error = classify_status(status, "<html>moved</html>")
+    assert type(error) is ModelError
+    assert error.retryable is False and error.status == status
+    assert str(error).startswith(f"the provider answered with a redirect (HTTP {status})")
+    assert "base_url" in str(error)
+
+
 def test_a_credentials_error_points_at_the_fix():
     error = classify_status(401, '{"error":{"message":"invalid x-api-key"}}')
     assert "ncc init" in str(error)
