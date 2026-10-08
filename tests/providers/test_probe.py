@@ -516,3 +516,30 @@ async def test_the_cache_keeps_what_the_probe_found_not_what_the_config_made_of_
     )
     assert (caps.context_window, caps.max_output) == (8_192, 2_048)
     assert cache.get("ollama", "m") == found
+
+
+def test_a_new_cache_makes_its_directory_and_file_private_from_the_start(
+    tmp_path, private_from_the_start
+):
+    from tests.conftest import mode_of
+
+    path = tmp_path / ".nanoclaude" / "capabilities.json"
+    CapabilityCache(path).put("ollama", "m", CONSERVATIVE_DEFAULT)
+    assert (mode_of(path.parent), mode_of(path)) == (0o700, 0o600)
+    assert CapabilityCache(path).get("ollama", "m") == CONSERVATIVE_DEFAULT
+
+
+def test_a_cache_that_was_open_to_others_is_private_once_it_is_written_again(tmp_path):
+
+    from tests.conftest import mode_of
+
+    path = tmp_path / "capabilities.json"
+    path.write_text("{}")
+    path.chmod(0o644)
+    CapabilityCache(path).put("ollama", "m", CONSERVATIVE_DEFAULT)
+    assert mode_of(path) == 0o600
+
+
+def test_a_cache_is_written_without_a_temporary_file_left_behind(tmp_path):
+    CapabilityCache(tmp_path / "capabilities.json").put("ollama", "m", CONSERVATIVE_DEFAULT)
+    assert [p.name for p in tmp_path.iterdir()] == ["capabilities.json"]

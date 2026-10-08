@@ -5,6 +5,7 @@ into the repository itself.
 """
 
 import json
+import os
 import sqlite3
 from collections.abc import Hashable
 from types import SimpleNamespace
@@ -790,3 +791,51 @@ def test_session_row_is_hashable():
     )
     assert isinstance(row, Hashable)
     assert hash(row) == hash(row)
+
+
+# ---- what ncc keeps under its home is private from the moment it exists
+
+
+def test_a_new_store_makes_its_directory_and_files_private_from_the_start(
+    tmp_path, private_from_the_start
+):
+    from tests.conftest import mode_of
+
+    store = Store(tmp_path / ".nanoclaude" / "sessions.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    assert mode_of(tmp_path / ".nanoclaude") == 0o700
+    assert mode_of(store.path) == 0o600
+    # The write-ahead log and its index are made by SQLite, with the database's own mode.
+    sidecars = [p for p in store.path.parent.iterdir() if p.name.startswith("sessions.db-")]
+    assert {p.name for p in sidecars} == {"sessions.db-wal", "sessions.db-shm"}
+    assert all(mode_of(p) == 0o600 for p in sidecars), [(p.name, oct(mode_of(p))) for p in sidecars]
+
+
+def test_a_new_store_is_private_and_works_under_a_restrictive_umask(tmp_path):
+    from tests.conftest import mode_of
+
+    previous = os.umask(0o277)
+    try:
+        store = Store(tmp_path / ".nanoclaude" / "sessions.db")
+        store.open()
+        store.create_session("s1", cwd="/p", roles={})
+    finally:
+        os.umask(previous)
+    assert (mode_of(tmp_path / ".nanoclaude"), mode_of(store.path)) == (0o700, 0o600)
+    assert store.session_row("s1") is not None
+
+
+def test_a_store_that_is_already_there_keeps_the_mode_it_has(tmp_path):
+    from tests.conftest import mode_of
+
+    home = tmp_path / ".nanoclaude"
+    home.mkdir(mode=0o755)
+    home.chmod(0o755)
+    first = Store(home / "sessions.db")
+    first.open()
+    first.close()
+    first.path.chmod(0o644)
+    again = Store(home / "sessions.db")
+    again.open()
+    assert (mode_of(home), mode_of(again.path)) == (0o755, 0o644)

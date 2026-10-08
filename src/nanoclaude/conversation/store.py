@@ -43,6 +43,7 @@ from nanoclaude.conversation.transcript import (
     ToolUseBlock,
     Transcript,
 )
+from nanoclaude.private import create_private_file, make_private_directories
 from nanoclaude.providers.base import Usage
 
 SCHEMA = """
@@ -222,7 +223,11 @@ class Store:
         self._db: sqlite3.Connection | None = None
 
     def open(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The file exists, and is private, before SQLite opens it: SQLite gives its
+        # write-ahead log and index the mode of the database, and the database holds the
+        # whole conversation, tool output included.
+        make_private_directories(self.path.parent)
+        create_private_file(self.path)
         self._db = sqlite3.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
