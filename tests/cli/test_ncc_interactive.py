@@ -23,7 +23,7 @@ from nanoclaude.cli.repl import run_repl
 from nanoclaude.conversation.store import Store
 from nanoclaude.permissions.policy import PermissionMode
 from nanoclaude.testing.scripted import says
-from tests.cli.helpers import ScriptedPrompter, run_ncc
+from tests.cli.helpers import INTERRUPTED, ScriptedPrompter, run_ncc
 
 
 class Repl:
@@ -305,7 +305,7 @@ def test_a_repl_that_is_interrupted_exits_130_and_still_closes_the_session(
     repl.body = interrupt
     code, out, err = run_ncc(capsys, "--root", str(project))
     assert code == EXIT_CODES["interrupted"]
-    assert out == "" and err == "interrupted\n"
+    assert out == "" and err == INTERRUPTED
     assert closed(stores[0]) and clients["m"].closed
 
 

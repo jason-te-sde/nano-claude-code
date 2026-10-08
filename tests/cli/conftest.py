@@ -155,3 +155,13 @@ def stores(monkeypatch: pytest.MonkeyPatch) -> list[Store]:
 
     monkeypatch.setattr(ncc_main, "Store", Recording)
     return opened
+
+
+@pytest.fixture(autouse=True)
+def _somebody_at_the_keyboard(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ncc starts the REPL only where stdin is a terminal, and under pytest it is not.
+
+    The tests that start the REPL are meant to; the one that is about there being nobody to
+    type says so itself.
+    """
+    monkeypatch.setattr(ncc_main, "_stdin_is_terminal", lambda: True)

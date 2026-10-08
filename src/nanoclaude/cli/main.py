@@ -18,15 +18,19 @@ empty.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
+import contextlib
 import json
 import os
+import re
+import shlex
 import sqlite3
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, assert_never
+from typing import Any, NoReturn, assert_never
 
 from rich.console import Console
 from rich.text import Text
@@ -41,12 +45,12 @@ from nanoclaude.agent.session import (
     new_session_id,
 )
 from nanoclaude.agent.ui import UI, AutoDecline
-from nanoclaude.cli.render import ConsoleUI, show_error, show_notice
+from nanoclaude.cli.render import ConsoleUI, show_error
 from nanoclaude.cli.repl import run_repl
 from nanoclaude.config.load import CONFIG_DIRNAME, ConfigError, expand_root, load_config
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.budget import ContextTooSmallError
-from nanoclaude.conversation.store import Store
+from nanoclaude.conversation.store import Store, same_directory
 from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import PermissionMode, Policy
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
@@ -65,6 +69,9 @@ EXIT_CODES = {
     "config": 3,
     "provider": 4,
     "interrupted": 130,
+    # Not a failure: whoever reads the output closed it before the end (``| head -1``). The
+    # shell's own number for a process killed by SIGPIPE, which is what this stands for.
+    "output_closed": 141,
 }
 
 #: Where a provider error that does not say what to do is sent.
@@ -97,12 +104,79 @@ def _turns(text: str) -> int:
     except ValueError:
         value = 0
     if value < 1:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number of at least 1")
+        raise UsageError(f"--max-turns needs a whole number of at least 1 — got {text!r}")
     return value
 
 
+#: What ``--mode`` may be set to by itself. Bypass is also a mode, but only with the flag
+#: whose name says so, and what is offered to someone who typed a mode wrongly is not that.
+_MODES = tuple(mode.value for mode in PermissionMode if mode is not PermissionMode.BYPASS)
+_OUTPUT_FORMATS = ("text", "json")
+
+_FLAGS_HELP = "run ncc --help for the flags there are"
+
+_EXPECTED_ONE = re.compile(r"argument (?P<flag>\S+): expected one argument")
+_INVALID_CHOICE = re.compile(
+    r"argument (?P<flag>\S+): invalid choice: (?P<value>.*?) \(choose from", re.DOTALL
+)
+_NOT_ALLOWED = re.compile(r"argument (?P<flag>\S+): not allowed with argument (?P<other>\S+)")
+
+
+def _long(flag: str) -> str:
+    """``--resume`` for argparse's ``-r/--resume``."""
+    return flag.rpartition("/")[2]
+
+
+def _flag_error(message: str) -> str:
+    """What argparse found wrong, as spec 17.9 words an error: what happened, a dash, what to do.
+
+    argparse words these for itself and puts what was typed into them as it was. The line is
+    printed through ``show_error``, which makes it one line without anything in it for a
+    terminal to act on; this gives it the form. What is not one of the cases it knows is
+    still said, with where to look.
+    """
+    if match := _EXPECTED_ONE.fullmatch(message):
+        flag = _long(match["flag"])
+        if flag == "--print":
+            return "-p needs a prompt — pass the task as its argument"
+        return f"{flag} needs a value — pass one"
+    if match := _INVALID_CHOICE.match(message):
+        flag = _long(match["flag"])
+        try:
+            value = ast.literal_eval(match["value"])
+        except (ValueError, SyntaxError):
+            value = match["value"]
+        what, choices = ("mode", _MODES) if flag == "--mode" else ("format", _OUTPUT_FORMATS)
+        return f"{flag} {value} is not a {what} — choose one of {', '.join(choices)}"
+    if match := _NOT_ALLOWED.fullmatch(message):
+        first, second = _long(match["flag"]), _long(match["other"])
+        return f"{first} and {second} cannot be combined — pass only one"
+    return f"{message} — {_FLAGS_HELP}"
+
+
+class _Parser(argparse.ArgumentParser):
+    """An argument parser that reports a mistake as :class:`UsageError`, and does not exit.
+
+    argparse prints its usage and ``ncc: error: ...`` and ends the process, with what was
+    typed echoed as it was. ``--help`` and ``--version`` are not mistakes and still print to
+    stdout and exit 0.
+    """
+
+    def error(self, message: str) -> NoReturn:
+        raise UsageError(_flag_error(message))
+
+    def parse_args(  # type: ignore[override]
+        self, args: Sequence[str] | None = None, namespace: argparse.Namespace | None = None
+    ) -> argparse.Namespace:
+        parsed, extra = self.parse_known_args(args, namespace)
+        if extra:
+            plural = "s" if len(extra) > 1 else ""
+            raise UsageError(f"unrecognized argument{plural} {' '.join(extra)} — {_FLAGS_HELP}")
+        return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="ncc",
         description=(
             "A terminal coding agent that works with Anthropic, OpenAI-compatible and local models."
@@ -112,7 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
     )
     parser.add_argument("-p", "--print", dest="prompt", metavar="PROMPT", help="run once and exit")
-    parser.add_argument("--output-format", choices=["text", "json"], default="text")
+    # No default: whether it was given at all is what says it has no use without a prompt.
+    parser.add_argument("--output-format", choices=_OUTPUT_FORMATS)
     parser.add_argument("--root", default=".", help="working directory (default: cwd)")
     parser.add_argument("--model", metavar="ALIAS", help="model to use for the main role")
     parser.add_argument("--role", action="append", default=[], metavar="ROLE=ALIAS")
@@ -158,23 +233,36 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
-        # argparse ends --help, --version and a mistake in the arguments by raising, and this
-        # function does not end the process: the console script does, with what it returns.
+        # argparse ends --help and --version by raising, and this function does not end the
+        # process: the console script does, with what it returns.
         return exc.code if isinstance(exc.code, int) else 1
-    err = _stderr_console(args)
+    except UsageError as exc:
+        # Nothing was parsed, so whether colour was asked off is read from what was typed.
+        flagged = "--no-color" in (sys.argv[1:] if argv is None else argv)
+        show_error(_stderr_console(flagged), str(exc))
+        return EXIT_CODES["usage"]
+    err = _stderr_console(args.no_color)
     home = nanoclaude_home()
     try:
         if args.prompt is not None and not args.prompt.strip():
+            raise UsageError("-p needs a prompt — pass the task as its argument")
+        if args.prompt is None and args.output_format is not None:
             raise UsageError(
-                "--print needs a prompt — pass the task as its argument, "
-                'as in: ncc -p "explain main.py"'
+                "--output-format needs -p — it shapes the answer to one prompt; "
+                "pass a prompt with -p"
+            )
+        if args.prompt is None and not _stdin_is_terminal():
+            raise UsageError(
+                "no prompt and no terminal — pass a prompt with -p, or run ncc in a terminal"
             )
         settings = _settings(args)
         _warn_about_switches(args, err)
         if args.prompt is None:
-            return asyncio.run(_run_interactive(args, settings, home, _stdout_console(args)))
+            return asyncio.run(
+                _run_interactive(args, settings, home, _stdout_console(args.no_color))
+            )
         outcome = asyncio.run(_run_headless(args, settings, home))
-        _report(outcome, args.output_format, err)
+        _report(outcome, args.output_format or "text", err)
         return outcome.code
     except (UsageError, UnknownSessionError) as exc:
         show_error(err, str(exc))
@@ -192,8 +280,11 @@ def main(argv: list[str] | None = None) -> int:
     except StoreOpenError as exc:
         show_error(err, str(exc))
         return EXIT_CODES["stopped"]
+    except BrokenPipeError:
+        _abandon_stdout()
+        return EXIT_CODES["output_closed"]
     except KeyboardInterrupt:
-        show_notice(err, "interrupted")
+        show_error(err, "interrupted \u2014 nothing more was done; run again to retry")
         return EXIT_CODES["interrupted"]
     except Exception as exc:
         # Last, after every exception that has a line and a code of its own. A script reads
@@ -205,6 +296,18 @@ def main(argv: list[str] | None = None) -> int:
 def _settings(args: argparse.Namespace) -> _Settings:
     mode = _permission_mode(args)
     roles = _role_overrides(args.role)
+    # Given and empty is not left out: "$UNSET" in a script says something went wrong, and a
+    # run that goes on as if the flag were not there does something else than was meant.
+    if args.resume is not None and not args.resume.strip():
+        raise UsageError("--resume needs a session id — pass one, or use --continue")
+    if args.model is not None and not args.model.strip():
+        raise UsageError("--model needs a model alias — pass one, or leave the flag out")
+    for role, alias in roles:
+        if role == "main" and args.model is not None and alias != args.model:
+            raise UsageError(
+                f"--model {args.model} and --role main={alias} say different things about the "
+                "main role — pass only one of them"
+            )
     root = _directory("--root", args.root)
     return _Settings(
         root=root,
@@ -257,6 +360,10 @@ def _directory(flag: str, raw: str) -> str:
     absolute, so the sandbox takes it without a word and the directory it was meant to
     open stays shut.
     """
+    if not raw.strip():
+        # expand_root("") is the working directory, and the sandbox would take it for one
+        # the person had named. An empty value is what an unset variable gives.
+        raise UsageError(f"{flag} needs a directory — pass one, or leave the flag out")
     try:
         path = expand_root(raw)
     except ConfigError as exc:
@@ -286,17 +393,28 @@ def _warn(err: Console, message: str) -> None:
     err.print(Text.assemble(("warning: ", "bold red"), message))
 
 
-def _no_color(args: argparse.Namespace) -> bool:
-    return args.no_color or bool(os.environ.get("NO_COLOR"))
+def _stdin_is_terminal() -> bool:
+    """Whether there is somebody to type at: stdin is a terminal, and not a pipe or a file.
+
+    A stdin that is closed, or not there at all, is not one.
+    """
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except ValueError:
+        return False
 
 
-def _stdout_console(args: argparse.Namespace) -> Console:
+def _colourless(flag: bool) -> bool:
+    return flag or bool(os.environ.get("NO_COLOR"))
+
+
+def _stdout_console(no_color: bool) -> Console:
     """What the REPL writes to. What it prints from outside is built as Text, which Rich never
     parses as markup, so the console is left as Rich makes it."""
-    return Console(no_color=_no_color(args))
+    return Console(no_color=_colourless(no_color))
 
 
-def _stderr_console(args: argparse.Namespace) -> Console:
+def _stderr_console(no_color: bool) -> Console:
     """Where every complaint goes: stderr, never parsed as markup, never wrapped.
 
     Rich wraps at 80 columns when its output is not a terminal, which would cut a path in
@@ -308,7 +426,7 @@ def _stderr_console(args: argparse.Namespace) -> Console:
         highlight=False,
         emoji=False,
         soft_wrap=True,
-        no_color=_no_color(args),
+        no_color=_colourless(no_color),
     )
 
 
@@ -352,18 +470,35 @@ def _write_result(text: str) -> None:
 
     Piped to a file it is what the model wrote. Shown on a terminal it is text from
     outside, and a terminal acts on the control sequences inside it, so those are removed.
+    It is written as UTF-8 bytes, so that a locale that cannot write a character does not
+    stop the reply; one that cannot be encoded at all (a lone surrogate) becomes ``?``.
     """
     shown = sanitize(text) if sys.stdout.isatty() else text
     if not shown:
         return
-    sys.stdout.write(shown if shown.endswith("\n") else shown + "\n")
+    data = (shown if shown.endswith("\n") else shown + "\n").encode("utf-8", errors="replace")
+    sys.stdout.flush()  # what was printed before is first
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+
+
+def _abandon_stdout() -> None:
+    """Point stdout at nowhere, after the reader closed it.
+
+    Python flushes stdout once more as it exits, finds the pipe closed and prints a complaint
+    of its own to stderr, with another exit status. What there was to write has been given up
+    on, so what is left over is written to the bit bucket.
+    """
+    # A stdout with no descriptor behind it has nothing to flush.
+    with contextlib.suppress(OSError, ValueError):
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
 def _build_session(
     args: argparse.Namespace, settings: _Settings, home: Path, console: Console | None
 ) -> Session:
     config = load_config(home=str(home), project=settings.root, env=dict(os.environ))
-    if args.model:
+    if args.model is not None:
         config = replace(config, roles=replace(config.roles, main=args.model))
     for role, alias in settings.roles:
         config = replace(config, roles=replace(config.roles, **{role: alias}))
@@ -455,12 +590,13 @@ def _which_session(args: argparse.Namespace, store: Store, root: str) -> tuple[s
     one project is not taken back into another's conversation. Resuming by id is held to the
     same rule, since a session's sandbox was the directory it began in.
     """
-    if args.resume:
+    if args.resume is not None:
         row = store.session_row(args.resume)
-        if row is not None and os.path.realpath(row.cwd) != root:
+        if row is not None and not same_directory(row.cwd, root):
+            there = shlex.quote(row.cwd)
             raise UsageError(
                 f"session {row.id} was started in {row.cwd}, not in {root} "
-                f"— run ncc from {row.cwd} (or pass --root {row.cwd}), or leave out --resume"
+                f"— run ncc from {there} (or pass --root {there}), or leave out --resume"
             )
         return args.resume, True
     if args.continue_last:
@@ -489,20 +625,37 @@ async def _run_headless(args: argparse.Namespace, settings: _Settings, home: Pat
         try:
             done = await session.follow_up(args.prompt)
         except ModelError as exc:
-            kept = session.cut_off_text
-            if kept is None:
+            cause = exc.__cause__
+            if not (isinstance(cause, ModelError) and cause.partial is not None):
                 raise
-            # The stream broke after text had arrived and the session kept it: that text is
-            # the result there is, and the run still failed.
+            # The stream broke midway. What arrived is kept by the session when there was any,
+            # and the advice it gives is for somebody at a prompt: a script is told how to go on.
+            kept = session.cut_off_text
+            line = _cut_off_line(exc, kept is not None)
+            if kept is None:
+                raise ModelError(line) from exc
+            # That text is the result there is, and the run still failed.
             return _Outcome(
                 payload=_payload(session, kept, "cut_off", session.state.turn, is_error=True),
                 text=kept,
-                error=_with_advice(str(exc), _PROVIDER_ADVICE),
+                error=line,
                 code=EXIT_CODES["provider"],
             )
         return _finished(session, done)
     finally:
         await session.aclose()
+
+
+def _cut_off_line(error: ModelError, kept: bool) -> str:
+    """The session's line about a reply that broke off, with what a script can do for its advice.
+
+    The line is "what happened — what to do", and what happened is the part before the last
+    dash: the cause may have a dash in it, and the advice is the part after.
+    """
+    happened, dash, _advice = str(error).rpartition(" \u2014 ")
+    happened = happened if dash else str(error)
+    rest = "what arrived is kept; " if kept else ""
+    return f'{happened} \u2014 {rest}run: ncc --continue -p "continue"'
 
 
 def _finished(session: Session, done: Done) -> _Outcome:
@@ -511,12 +664,20 @@ def _finished(session: Session, done: Done) -> _Outcome:
     # The words of the model are the result. The loop's closing line and the unsuitable-model
     # message are the program's own, and belong on stderr.
     models_words = reason in (StopReason.COMPLETED, StopReason.REFUSAL, StopReason.MAX_TOKENS)
+    result = _as_written(done) if models_words else done.text
     return _Outcome(
-        payload=_payload(session, done.text, reason.value, done.state.turn, is_error=not completed),
-        text=done.text if models_words else "",
+        payload=_payload(session, result, reason.value, done.state.turn, is_error=not completed),
+        text=result if models_words else "",
         error=_stop_line(session, done),
         code=EXIT_CODES["completed" if completed else "stopped"],
     )
+
+
+def _as_written(done: Done) -> str:
+    """The reply as the model wrote it. ``done.text`` is stripped, and the indentation of the
+    first line of a file is code."""
+    last = done.state.transcript.last()
+    return last.text() if last is not None and last.role == "assistant" else done.text
 
 
 def _stop_line(session: Session, done: Done) -> str | None:

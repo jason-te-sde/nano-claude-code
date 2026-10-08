@@ -168,3 +168,7 @@ def run_ncc(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, s
     code = main(list(argv))
     captured = capsys.readouterr()
     return code, captured.out, captured.err
+
+
+#: What ncc says when it is stopped with Ctrl+C: one line on stderr, like every other.
+INTERRUPTED = "error: interrupted \u2014 nothing more was done; run again to retry\n"

@@ -220,7 +220,9 @@ def test_the_limit_in_the_configuration_applies_when_no_flag_gives_one(
 def test_max_turns_must_be_a_whole_number_of_at_least_one(capsys, value):
     code, out, err = run_ncc(capsys, "--max-turns", value, "-p", "hi")
     assert code == EXIT_CODES["usage"]
-    assert out == "" and "--max-turns" in err and "at least 1" in err
+    assert out == ""
+    assert err == (f"error: --max-turns needs a whole number of at least 1 \u2014 got {value!r}\n")
+    assert "usage:" not in err
 
 
 # --------------------------------------------------------------------------
@@ -372,6 +374,16 @@ def test_the_default_mode_is_not_bypass_and_no_flag_leaves_it_so(
     assert sessions[0].policy.mode is PermissionMode.DEFAULT
 
 
+BYPASS_WARNING = (
+    "warning: permission prompts are off \u2014 tool calls run without asking. The sandbox, "
+    "credentials files, dangerous commands and your deny rules are still enforced\n"
+)
+ALLOW_SECRETS_WARNING = (
+    "warning: --allow-secrets is on \u2014 credentials files can be read, and what is read "
+    "goes to the model unredacted\n"
+)
+
+
 def test_turning_prompts_off_says_so_on_stderr_and_still_keeps_the_sandbox(
     ncc_home, project, serve, capsys
 ):
@@ -383,8 +395,7 @@ def test_turning_prompts_off_says_so_on_stderr_and_still_keeps_the_sandbox(
         capsys, "--root", str(project), "--dangerously-skip-permissions", "-p", "go"
     )
     assert (code, out) == (EXIT_CODES["completed"], "done\n")
-    assert err.startswith("warning: permission prompts are off ")
-    assert "sandbox" in err
+    assert err == BYPASS_WARNING
     assert not escape.exists()  # spec 6.2.1: bypass skips the asking, not the sandbox
     (result,) = tool_results(clients["m"])
     assert "sandbox.outside-root" in result.content
@@ -423,7 +434,7 @@ def test_allow_secrets_stops_the_redaction_and_the_refusal_of_credentials_files(
     (env,) = tool_results(clients["m"], 2)
     assert "AKIAIOSFODNN7EXAMPLE" in notes.content
     assert not env.is_error and "PLAIN=1" in env.content
-    assert err.startswith("warning: --allow-secrets is on ")
+    assert err == ALLOW_SECRETS_WARNING
 
 
 def test_without_allow_secrets_a_credentials_file_is_refused(ncc_home, project, serve, capsys):

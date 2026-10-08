@@ -23,7 +23,7 @@ from nanoclaude.cli.main import EXIT_CODES
 from nanoclaude.conversation.store import Store
 from nanoclaude.providers.base import ModelReply, StopKind, Usage
 from nanoclaude.testing.session import ScriptedClient
-from tests.cli.helpers import run_ncc
+from tests.cli.helpers import INTERRUPTED, run_ncc
 
 FORMATS = [[], ["--output-format", "json"]]
 
@@ -138,7 +138,7 @@ def test_an_interrupt_is_still_130_and_not_an_unexpected_error(
 
     monkeypatch.setattr(ncc_main, "_run_headless", interrupted)
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello")
-    assert (code, out, err) == (EXIT_CODES["interrupted"], "", "interrupted\n")
+    assert (code, out, err) == (EXIT_CODES["interrupted"], "", INTERRUPTED)
 
 
 def test_the_repl_is_covered_too(ncc_home, project, capsys, monkeypatch):
@@ -182,6 +182,26 @@ def test_a_store_another_ncc_holds_a_lock_on_is_busy_and_not_a_bug(
     other.execute("BEGIN IMMEDIATE")  # what another ncc does while it writes
     try:
         code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
+    finally:
+        other.rollback()
+        other.close()
+    assert (code, out, err) == (EXIT_CODES["stopped"], "", BUSY)
+    assert closed(stores[0])
+
+
+def test_a_connection_made_to_a_store_that_then_turns_out_busy_is_closed(
+    ncc_home, project, serve, capsys, impatient, stores
+):
+    # The database is one that has not been put into WAL mode yet, which takes a lock the
+    # other process holds: the connection is made, and what is done with it fails.
+    database = ncc_home / ".nanoclaude" / "sessions.db"
+    other = sqlite3.connect(database)
+    other.execute("CREATE TABLE early (x)")
+    other.commit()
+    other.execute("BEGIN EXCLUSIVE")
+    serve(m=[])
+    try:
+        code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello")
     finally:
         other.rollback()
         other.close()

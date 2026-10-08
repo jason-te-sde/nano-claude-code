@@ -20,7 +20,7 @@ import pytest
 
 from nanoclaude.agent.router import Router
 from nanoclaude.cli import main as ncc_main
-from nanoclaude.cli.main import EXIT_CODES, build_parser, main
+from nanoclaude.cli.main import EXIT_CODES, UsageError, build_parser, main
 from nanoclaude.conversation.store import Store
 from nanoclaude.conversation.transcript import TextBlock
 from nanoclaude.providers.base import ModelError, ModelReply, StopKind, Usage
@@ -28,7 +28,7 @@ from nanoclaude.providers.retry import classify_status
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, cut_off, says
 from nanoclaude.testing.session import ScriptedClient
-from tests.cli.helpers import run_ncc
+from tests.cli.helpers import INTERRUPTED, run_ncc
 
 BAD_CALL = '<tool name="Read">{"path": </tool>'
 
@@ -52,6 +52,7 @@ def test_the_exit_codes_are_documented_and_distinct():
         "config": 3,
         "provider": 4,
         "interrupted": 130,
+        "output_closed": 141,
     }
 
 
@@ -63,7 +64,7 @@ def test_role_overrides_parse_into_pairs():
 def test_dangerous_flag_requires_the_long_spelling():
     parser = build_parser()
     for spelling in ("--skip-permissions", "--dangerously-skip", "--dang"):
-        with pytest.raises(SystemExit):
+        with pytest.raises(UsageError):
             parser.parse_args(["-p", "x", spelling])
     args = parser.parse_args(["-p", "x", "--dangerously-skip-permissions"])
     assert args.dangerously_skip_permissions
@@ -73,7 +74,8 @@ def test_print_mode_with_no_prompt_is_a_usage_error(capsys):
     code, out, err = run_ncc(capsys, "-p")
     assert code == EXIT_CODES["usage"]
     assert out == ""
-    assert "expected one argument" in err
+    assert err == "error: -p needs a prompt \u2014 pass the task as its argument\n"
+    assert "usage:" not in err
 
 
 @pytest.mark.parametrize("prompt", ["", "   ", "\n\t"])
@@ -81,8 +83,7 @@ def test_print_mode_with_a_blank_prompt_is_a_usage_error_in_the_form_of_spec_17_
     code, out, err = run_ncc(capsys, "--print", prompt)
     assert code == EXIT_CODES["usage"]
     assert out == ""
-    assert err.startswith("error: --print needs a prompt — ")
-    assert err.count("error:") == 1 and err.endswith("\n") and err.count("\n") == 1
+    assert err == "error: -p needs a prompt — pass the task as its argument\n"
 
 
 # --------------------------------------------------------------------------
@@ -278,7 +279,7 @@ def test_a_reply_cut_off_midway_writes_what_arrived_and_fails_with_the_provider_
     assert out == "The first half of an ans\n"
     assert err == (
         "error: the reply was cut off (the connection to the provider was lost: connection "
-        "reset by peer) — what arrived is kept; ask the model to continue\n"
+        'reset by peer) — what arrived is kept; run: ncc --continue -p "continue"\n'
     )
 
 
@@ -465,7 +466,7 @@ def test_a_run_that_is_interrupted_exits_130_and_writes_nothing_to_stdout(
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello")
     assert code == EXIT_CODES["interrupted"]
     assert out == ""
-    assert err == "interrupted\n"
+    assert err == INTERRUPTED
 
 
 class Interrupting(ScriptedClient):
@@ -497,7 +498,7 @@ def test_ctrl_c_during_a_request_ends_the_run_and_closes_the_session(
     monkeypatch.setattr(ncc_main, "Router", lambda config, cache: Router(config, cache, clients))
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello")
     assert code == EXIT_CODES["interrupted"]
-    assert out == "" and err == "interrupted\n"
+    assert out == "" and err == INTERRUPTED
     assert clients["m"].closed  # the session was closed on the way out
 
 
@@ -534,7 +535,7 @@ def test_the_error_console_prints_what_it_is_given_as_it_is(capsys, monkeypatch)
     # stderr as a string is still not markup, not an emoji code, not coloured and not wrapped.
     monkeypatch.setenv("FORCE_COLOR", "1")
     monkeypatch.setenv("TERM", "xterm-256color")
-    console = ncc_main._stderr_console(build_parser().parse_args(["-p", "x"]))
+    console = ncc_main._stderr_console(False)
     line = "[bold]a[/] :smile: arr[0] 3.14 https://x.y/z " + "w" * 200
     console.print(line)
     assert capsys.readouterr().err == line + "\n"

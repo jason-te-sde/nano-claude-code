@@ -25,7 +25,7 @@ from nanoclaude.providers.base import ModelError, ModelRequest
 from nanoclaude.providers.capabilities import CapabilityCache
 from nanoclaude.testing.scripted import says
 from nanoclaude.testing.session import ScriptedClient
-from tests.cli.helpers import run_ncc
+from tests.cli.helpers import INTERRUPTED, run_ncc
 
 
 def start(capsys: pytest.CaptureFixture[str], root: Path, prompt: str = "first question") -> str:
@@ -223,7 +223,9 @@ def test_the_directory_of_a_session_is_compared_as_the_place_it_is_not_as_a_spel
 def test_continue_and_resume_together_are_a_usage_error(ncc_home, project, capsys):
     code, out, err = run_ncc(capsys, "--root", str(project), "-c", "-r", "abc", "-p", "hi")
     assert code == EXIT_CODES["usage"]
-    assert out == "" and "not allowed with argument" in err
+    assert out == ""
+    assert err == "error: --resume and --continue cannot be combined \u2014 pass only one\n"
+    assert "usage:" not in err
 
 
 # --------------------------------------------------------------------------
@@ -311,5 +313,20 @@ def test_ctrl_c_while_the_session_is_being_built_still_closes_the_store(
     monkeypatch.setattr(ncc_main, "Router", interrupted)
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hi")
     assert code == EXIT_CODES["interrupted"]
-    assert out == "" and err == "interrupted\n"
+    assert out == "" and err == INTERRUPTED
     assert_closed(stores[0])
+
+
+def test_the_advice_to_run_ncc_from_another_directory_quotes_it_for_a_shell(
+    ncc_home, tmp_path, serve, capsys
+):
+    here, there = tmp_path / "here", tmp_path / "the other one"
+    here.mkdir()
+    there.mkdir()
+    serve(m=[says("a")])
+    in_there = start(capsys, there)
+    _, _, err = run_ncc(capsys, "--root", str(here), "--resume", in_there, "-p", "hi")
+    assert err == (
+        f"error: session {in_there} was started in {there}, not in {here} "
+        f"\u2014 run ncc from '{there}' (or pass --root '{there}'), or leave out --resume\n"
+    )
