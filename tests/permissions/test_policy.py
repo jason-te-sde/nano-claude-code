@@ -686,3 +686,26 @@ def test_the_read_verdict_is_the_one_read_itself_gets():
         direct = evaluate(req(subject=path, paths=(path,)), p, Grants())
         refusal = read_refusal(p, path)
         assert (refusal is not None) == (direct.decision is Decision.DENY), path
+
+
+# ---- a newline in a name is not a way past a refusal
+
+ODD = "/p/odd\ndir"
+
+
+def test_a_newline_in_a_directory_name_does_not_hide_a_file_from_a_deny_rule():
+    """The leading ``**/`` of a glob needs ``.`` to match every character of a directory
+    name, and ``.`` does not match a newline: a name nobody would choose, and one a
+    repository can hold."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(**/vault.txt)"]))
+    refusal = read_refusal(p, f"{ODD}/vault.txt")
+    assert refusal is not None and refusal.rule == "rule.deny"
+
+
+def test_a_newline_in_a_directory_name_does_not_hide_a_credentials_file():
+    refusal = read_refusal(policy(), f"{ODD}/.env")
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
+def test_a_newline_in_a_name_does_not_make_an_ordinary_file_refused():
+    assert read_refusal(policy(), f"{ODD}/notes.txt") is None

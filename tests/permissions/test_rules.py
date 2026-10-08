@@ -1,6 +1,6 @@
 import pytest
 
-from nanoclaude.permissions.rules import Rule, RuleSet
+from nanoclaude.permissions.rules import Rule, RuleSet, glob_matches_any
 
 
 def test_a_bare_tool_name_matches_every_call_to_it():
@@ -85,3 +85,16 @@ def test_ruleset_is_hashable():
     one = RuleSet.build(allow=["Read"], ask=["Bash"], deny=["Read(**/.env*)"])
     other = RuleSet.build(allow=["Read"], ask=["Bash"], deny=["Read(**/.env*)"])
     assert hash(one) == hash(other)
+
+
+def test_a_newline_in_a_directory_name_does_not_stop_a_leading_double_star_matching():
+    assert glob_matches_any(("**/.env",), ("odd\ndir/.env",))
+    assert glob_matches_any(("**/.env",), ("a/odd\ndir/.env",))
+    assert Rule.parse("Read(**/vault.txt)").matches("Read", "/p/a\nb/vault.txt", "a\nb/vault.txt")
+
+
+def test_a_newline_does_not_make_a_glob_match_what_it_should_not():
+    assert not glob_matches_any(("**/.env",), ("odd\ndir/.envrc.txt",))
+    assert not glob_matches_any(("src/**/*.py",), ("src/odd\ndir/a.txt",))
+    # Two different names stay different: the newline is replaced, not dropped.
+    assert not glob_matches_any(("src/ab.txt",), ("src/a\nb.txt",))

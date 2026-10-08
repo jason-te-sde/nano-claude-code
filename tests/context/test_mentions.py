@@ -228,8 +228,14 @@ def test_a_link_named_like_a_credentials_file_is_not_inlined(tmp_repo):
 
 
 def test_the_note_is_one_line_however_odd_the_path_it_names(tmp_repo):
-    (tmp_repo / "secrets").mkdir()
-    (tmp_repo / "secrets" / "notes.txt").write_text("x\n")
-    text, _ = expand("@secrets/notes.txt", root=tmp_repo, deny=("Read(secrets/**)",))
+    """The refusal quotes the path the mention resolved to, and a name can hold a newline
+    or a terminal escape."""
+    odd = tmp_repo / "odd\ndir\x1b[2J"
+    odd.mkdir()
+    (odd / ".env").write_text("x\n")
+    (tmp_repo / "link.txt").symlink_to(odd / ".env")
+    text, paths = expand("@link.txt", root=tmp_repo)
+    assert paths == ()
     (note,) = [line for line in text.splitlines() if "not inlined" in line]
     assert note.startswith("[") and note.endswith("]")
+    assert "\x1b" not in text

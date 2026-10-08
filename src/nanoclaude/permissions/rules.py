@@ -115,7 +115,13 @@ def glob_matches_any(patterns: tuple[str, ...], candidates: tuple[str, ...]) -> 
     if not patterns:
         return False
     spec = _compiled(patterns)
-    return any(spec.match_file(c.lstrip("/")) or spec.match_file(c) for c in candidates)
+    # A newline becomes NUL, which no path holds and a glob treats as any other
+    # character. The regular expression a leading ``**/`` becomes starts with ``.+``,
+    # and ``.`` does not match a newline: without this a directory named ``a<newline>b``
+    # hid ``a<newline>b/.env`` from ``**/.env``, and so from the credentials list and from
+    # every deny rule written that way, with a name a repository can hold.
+    flattened = [c.replace("\n", "\0") for c in candidates]
+    return any(spec.match_file(c.lstrip("/")) or spec.match_file(c) for c in flattened)
 
 
 @dataclass(frozen=True, slots=True)
