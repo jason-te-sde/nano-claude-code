@@ -14,6 +14,7 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 
+from nanoclaude.context.git import run_git
 from nanoclaude.context.instructions import load_instructions
 from nanoclaude.context.projectmap import project_map
 
@@ -25,28 +26,19 @@ class AssembledContext:
 
 
 def git_state(root: str) -> str:
+    """The branch and how many files differ, or "" when there is nothing to say.
+
+    Nothing to say is also what a failed question is: a count of zero that only means
+    git could not answer would be a statement of fact the model would believe.
+    """
     try:
-        branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],  # noqa: S607
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        ).stdout.strip()
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],  # noqa: S607
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        ).stdout.strip()
+        branch = run_git(root, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        status = run_git(root, "status", "--porcelain")
     except (OSError, subprocess.SubprocessError):
         return ""
-    if not branch:
+    if not branch or status.returncode != 0:
         return ""
-    changed = len(status.splitlines())
+    changed = len(status.stdout.strip().splitlines())
     return f"git branch: {branch} ({changed} file(s) with uncommitted changes)"
 
 
