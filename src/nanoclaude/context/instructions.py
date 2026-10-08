@@ -1,4 +1,4 @@
-"""Project instructions: NANO.md, layered from the repository root downwards.
+"""Project instructions: NANO.md, layered from the repository's top level downwards.
 
 CLAUDE.md is read when NANO.md is absent, because most repositories that
 already have project instructions for an agent have them under that name and
@@ -11,7 +11,10 @@ conversation.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+
+from nanoclaude.context.git import run_git
 
 INSTRUCTION_FILENAMES = ("NANO.md", "CLAUDE.md")
 MAX_INSTRUCTION_BYTES = 32_000
@@ -32,14 +35,43 @@ def _read_one(directory: Path) -> str:
     return ""
 
 
+def _repository_top(root: Path) -> Path | None:
+    """The top-level directory of the repository ``root`` is in, or None when it is in none.
+
+    Asked of git through :func:`run_git`, which holds what keeps a repository somebody else
+    prepared from running anything. Not being able to ask (git is not installed, it did not
+    answer in time) is the same as not being in a repository: the answer is only ever more
+    instructions, and a root's own are always read.
+    """
+    try:
+        asked = run_git(str(root), "rev-parse", "--show-toplevel")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    top = asked.stdout.rstrip("\n")
+    return Path(top).resolve() if asked.returncode == 0 and top else None
+
+
+def _above_the_root(root: Path) -> list[Path]:
+    """The directories from the repository's top level down to, not including, ``root``."""
+    top = _repository_top(root)
+    if top is None:
+        return []
+    return [parent for parent in reversed(root.parents) if parent == top or top in parent.parents]
+
+
 def load_instructions(root: str, *, cwd: str, home: str | None) -> str:
-    """Global, then root, then each directory down to ``cwd``. Later wins."""
+    """Global, then the repository's top level down to the root, then down to ``cwd``.
+
+    Later wins. A root outside a repository, or one git cannot be asked about, reads its own
+    directory and below only. The configuration is not layered like this: it is read from
+    the root alone.
+    """
     parts: list[str] = []
     if home:
         parts.append(_read_one(Path(home) / ".nanoclaude"))
 
     root_path, cwd_path = Path(root).resolve(), Path(cwd).resolve()
-    chain = [root_path]
+    chain = [*_above_the_root(root_path), root_path]
     if cwd_path != root_path and root_path in cwd_path.parents:
         relative = cwd_path.relative_to(root_path)
         current = root_path

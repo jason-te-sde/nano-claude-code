@@ -1951,3 +1951,22 @@ def test_a_project_adapter_change_is_refused_however_it_is_spelled(tmp_path, pro
 def test_other_shapes_of_a_project_allow_are_refused_too(tmp_path, project_text):
     message = refusal(tmp_path, BASE, project_text)
     assert str(project_file(tmp_path)) in message
+
+
+def test_the_project_config_is_the_roots_own_and_is_not_looked_for_further_up(tmp_path):
+    # Instructions layer from the top of a repository down (spec 7.1); the configuration does
+    # not. A repository's file widens nothing for the directory below it that has none: a
+    # project's file is trusted by being the one the person ran ncc in.
+    home = tmp_path / "home" / ".nanoclaude"
+    home.mkdir(parents=True)
+    (home / "config.toml").write_text(
+        '[models.m]\nadapter = "anthropic"\nmodel = "claude-sonnet-5"\n'
+    )
+    top = tmp_path / "repo"
+    (top / ".nanoclaude").mkdir(parents=True)
+    (top / ".nanoclaude" / "config.toml").write_text("[limits]\nmax_turns = 3\n")
+    app = top / "app"
+    app.mkdir()
+    config = load_config(home=str(tmp_path / "home"), project=str(app), env={})
+    assert config.limits.max_turns == LimitsConfig().max_turns
+    assert load_config(home=str(tmp_path / "home"), project=str(top), env={}).limits.max_turns == 3

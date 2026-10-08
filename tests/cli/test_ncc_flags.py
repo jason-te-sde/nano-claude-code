@@ -9,6 +9,7 @@ show the difference (the roles a flag routed).
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ import pytest
 from nanoclaude.agent.session import Session
 from nanoclaude.cli.main import EXIT_CODES, build_parser
 from nanoclaude.config.schema import ROLES
+from nanoclaude.context.git import run_git
 from nanoclaude.conversation.store import Store
 from nanoclaude.permissions.policy import PermissionMode
 from nanoclaude.providers.base import ModelReply
@@ -478,6 +480,23 @@ def test_instructions_in_the_home_that_ncc_was_given_reach_the_model(
     clients = serve(m=[says("ok")])
     run_ncc(capsys, "--root", str(project), "-p", "hi")
     assert "Always answer in rhyme." in clients["m"].requests[0].system
+
+
+def test_a_project_inside_a_repository_gets_the_instructions_of_the_whole_repository(
+    ncc_home, tmp_path, serve, capsys, monkeypatch
+):
+    # Git is asked for real here: the suite's other tests are told the project is in none.
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", run_git)
+    repository = tmp_path / "repository"
+    app = repository / "services" / "app"
+    app.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)  # noqa: S607
+    (repository / "NANO.md").write_text("Rule for the whole repository.\n")
+    (app / "NANO.md").write_text("Rule for this service.\n")
+    clients = serve(m=[says("ok")])
+    run_ncc(capsys, "--root", str(app), "-p", "hi")
+    system = clients["m"].requests[0].system
+    assert system.index("Rule for the whole repository.") < system.index("Rule for this service.")
 
 
 def audited_arguments(home, session_id):

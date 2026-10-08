@@ -22,11 +22,12 @@ import asyncio
 import itertools
 import json
 import re
+import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -35,6 +36,7 @@ from nanoclaude.agent.router import Router
 from nanoclaude.agent.session import Session, new_session_id
 from nanoclaude.agent.ui import Approval, AutoApprove, AutoDecline
 from nanoclaude.config.schema import Config, LimitsConfig, ModelConfig, RolesConfig
+from nanoclaude.context.git import run_git
 from nanoclaude.conversation.budget import (
     Budget,
     ContextTooSmallError,
@@ -116,8 +118,17 @@ def _no_git(monkeypatch: pytest.MonkeyPatch) -> None:
     Which branch the repository is on has no bearing on anything tested here, and
     a temp directory that happened to sit inside another repository would change
     the system prompt from machine to machine. assemble() has its own tests.
+
+    The same goes for the question of which repository the project is in, which decides
+    whose instructions are read (spec 7.1): here it is none, and the tests that want one
+    ask for the ``repository`` fixture.
     """
     monkeypatch.setattr("nanoclaude.context.assemble.git_state", lambda _root: "")
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", _git_is_not_asked)
+
+
+def _git_is_not_asked(*_args: object, **_kwargs: object) -> NoReturn:
+    raise OSError("git is not run by these tests")
 
 
 class Watcher(AutoApprove):
@@ -3706,3 +3717,33 @@ def test_a_session_whose_compact_model_has_no_key_is_refused_before_anything_is_
     )
     # Refused first: a session that never started leaves no row behind to resume.
     assert store.session_row("abc123") is None
+
+
+# --------------------------------------------------------------------------
+# The instructions a session sends are the repository's, from its top level down to the root
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A real git repository, and git asked about it for real again.
+
+    The placeholder ``.git`` of ``tmp_repo`` is not one, and the autouse fixture above has
+    stopped the session asking.
+    """
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", run_git)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S607
+    return tmp_path
+
+
+async def test_a_session_whose_root_is_inside_a_repository_sends_the_repositorys_instructions(
+    repository,
+):
+    (repository / "NANO.md").write_text("Rule from the top of the repository.\n")
+    app = repository / "app"
+    app.mkdir()
+    (app / "NANO.md").write_text("Rule from the project.\n")
+    session = build_session(app, [says("ok")])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert system.index("Rule from the top") < system.index("Rule from the project")

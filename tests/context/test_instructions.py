@@ -1,3 +1,8 @@
+import subprocess
+from pathlib import Path
+
+import pytest
+
 from nanoclaude.context.instructions import (
     INSTRUCTION_FILENAMES,
     MAX_INSTRUCTION_BYTES,
@@ -96,3 +101,152 @@ def test_a_directory_without_instructions_contributes_nothing(tmp_repo):
     (nested / "NANO.md").write_text("leaf rule\n")
     loaded = load_instructions(str(tmp_repo), cwd=str(nested), home=None)
     assert loaded.index("root rule") < loaded.index("leaf rule")
+
+
+# --------------------------------------------------------------------------
+# Instructions layer from the repository's top level down to the project root (spec 7.1)
+# --------------------------------------------------------------------------
+
+
+def init_repository(path: Path) -> Path:
+    """A real repository at ``path``: the placeholder ``.git`` of ``tmp_repo`` is not one."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)  # noqa: S607
+    return path
+
+
+def write(directory: Path, text: str, name: str = "NANO.md") -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_text(text)
+
+
+def test_a_root_inside_a_repository_reads_every_directory_from_the_top_down(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "packages" / "app"
+    write(top, "top rule\n")
+    write(top / "packages", "packages rule\n")
+    write(app, "app rule\n")
+    loaded = load_instructions(str(app), cwd=str(app), home=None)
+    assert loaded.index("top rule") < loaded.index("packages rule") < loaded.index("app rule")
+
+
+def test_the_global_file_comes_first_and_the_directories_follow_it(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    write(tmp_path / "home" / ".nanoclaude", "global rule\n")
+    loaded = load_instructions(str(app), cwd=str(app), home=str(tmp_path / "home"))
+    assert loaded.index("global rule") < loaded.index("top rule") < loaded.index("app rule")
+
+
+def test_the_chain_stops_at_the_top_of_the_repository(tmp_path):
+    write(tmp_path, "above the repository\n")
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    loaded = load_instructions(str(app), cwd=str(app), home=None)
+    assert "top rule" in loaded and "above the repository" not in loaded
+
+
+def test_outside_a_repository_only_the_root_is_read(tmp_path):
+    write(tmp_path, "the parent's rule\n")
+    root = tmp_path / "plain"
+    write(root, "root rule\n")
+    loaded = load_instructions(str(root), cwd=str(root), home=None)
+    assert "root rule" in loaded and "the parent's rule" not in loaded
+
+
+def test_a_root_that_is_the_top_is_read_once(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    write(top, "top rule\n")
+    loaded = load_instructions(str(top), cwd=str(top), home=None)
+    assert loaded.count("top rule") == 1
+
+
+def test_a_directory_in_the_chain_with_nothing_in_it_contributes_nothing(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "packages" / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    loaded = load_instructions(str(app), cwd=str(app), home=None)
+    assert (
+        loaded.count("<!--") == 2
+    )  # a header each for the two files there are, none for packages/
+
+
+def test_each_directory_in_the_chain_may_keep_its_instructions_under_either_name(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top is a CLAUDE.md\n", name="CLAUDE.md")
+    write(app, "app is a NANO.md\n")
+    write(app, "and its CLAUDE.md is ignored\n", name="CLAUDE.md")
+    loaded = load_instructions(str(app), cwd=str(app), home=None)
+    assert "top is a CLAUDE.md" in loaded and "app is a NANO.md" in loaded
+    assert "its CLAUDE.md is ignored" not in loaded
+
+
+def test_a_root_reached_through_a_symlink_is_placed_in_the_repository_it_leads_to(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    link = tmp_path / "link"
+    link.symlink_to(app)
+    loaded = load_instructions(str(link), cwd=str(link), home=None)
+    assert loaded.index("top rule") < loaded.index("app rule")
+
+
+def test_the_top_is_found_through_the_one_safe_way_of_running_git(tmp_path, monkeypatch):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    asked: list[tuple[str, ...]] = []
+
+    def fail(root: str, *args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        asked.append((root, *args))
+        raise OSError("no git here")
+
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", fail)
+    loaded = load_instructions(str(app), cwd=str(app), home=None)
+    assert asked == [(str(app.resolve()), "rev-parse", "--show-toplevel")]
+    assert "app rule" in loaded and "top rule" not in loaded
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("git is not installed"), subprocess.TimeoutExpired("git", 5.0)],
+    ids=["no git", "timeout"],
+)
+def test_when_git_cannot_answer_only_the_root_is_read_and_nothing_is_raised(
+    tmp_path, monkeypatch, failure
+):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+
+    def cannot(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", cannot)
+    loaded = load_instructions(str(app), cwd=str(app), home=None)
+    assert "app rule" in loaded and "top rule" not in loaded
+
+
+def test_an_answer_from_a_git_that_failed_is_not_trusted_for_the_path_it_printed(
+    tmp_path, monkeypatch
+):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+
+    def failed_but_printed(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 128, stdout=f"{top}\n", stderr="fatal: oops")
+
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", failed_but_printed)
+    loaded = load_instructions(str(app), cwd=str(app), home=None)
+    assert "app rule" in loaded and "top rule" not in loaded
