@@ -709,3 +709,115 @@ def test_a_newline_in_a_directory_name_does_not_hide_a_credentials_file():
 
 def test_a_newline_in_a_name_does_not_make_an_ordinary_file_refused():
     assert read_refusal(policy(), f"{ODD}/notes.txt") is None
+
+
+# ---- sandbox.protected-path: files that make git or ncc run something
+
+
+def write_req(tool: str, path: str) -> PermissionRequest:
+    return PermissionRequest(tool, path, (path,), is_write=True)
+
+
+PROTECTED = [
+    "/p/.git/config",
+    "/p/.git/hooks/pre-commit",
+    "/p/sub/.git/config",  # a repository nested inside the project
+    "/p/.git",  # the pointer file a worktree or a submodule has in place of the directory
+    "/p/.nanoclaude/config.toml",
+    "/p/.nanoclaude/sessions.db",
+    "/p/sub/.nanoclaude/capabilities.json",
+    "/p/.GIT/config",  # one directory, on a filesystem that ignores case
+    "/p/.Nanoclaude/config.toml",
+]
+
+NOT_PROTECTED = [
+    "/p/src/.github/workflows/ci.yml",
+    "/p/.gitignore",
+    "/p/.gitattributes",
+    "/p/.gitmodules",
+    "/p/gitconfig",
+    "/p/dotgit/config",
+    "/p/a.git/config",
+    "/p/.nanoclaudex/config.toml",
+    "/p/nanoclaude/config.toml",
+    "/p/src/nanoclaude.py",
+]
+
+MODES = [
+    PermissionMode.DEFAULT,
+    PermissionMode.ACCEPT_EDITS,
+    PermissionMode.BYPASS,
+]
+
+
+@pytest.mark.parametrize("path", PROTECTED)
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+@pytest.mark.parametrize("mode", MODES, ids=lambda mode: mode.value)
+def test_a_write_to_a_protected_path_is_refused_in_every_mode(mode, tool, path):
+    result = evaluate(write_req(tool, path), policy(mode=mode), Grants())
+    assert (result.decision, result.rule) == (Decision.DENY, "sandbox.protected-path"), path
+    assert path in result.reason
+
+
+@pytest.mark.parametrize("path", PROTECTED)
+def test_an_always_grant_does_not_reach_a_protected_path(path):
+    result = evaluate(write_req("Write", path), policy(), Grants(tools=frozenset({"Write"})))
+    assert result.rule == "sandbox.protected-path", path
+
+
+@pytest.mark.parametrize("path", PROTECTED)
+def test_an_allow_rule_does_not_reach_a_protected_path(path):
+    p = policy(rules=RuleSet.build(allow=["Write", "Edit", "Write(**)"]))
+    assert evaluate(write_req("Write", path), p, Grants()).rule == "sandbox.protected-path", path
+
+
+def test_a_protected_path_is_refused_in_plan_mode_too_under_its_own_id():
+    result = evaluate(
+        write_req("Write", "/p/.git/config"), policy(mode=PermissionMode.PLAN), Grants()
+    )
+    assert result.rule == "sandbox.protected-path"
+
+
+@pytest.mark.parametrize("path", PROTECTED)
+@pytest.mark.parametrize("mode", [*MODES, PermissionMode.PLAN], ids=lambda mode: mode.value)
+def test_reading_a_protected_path_is_unaffected(mode, path):
+    result = evaluate(req("Read", path, (path,)), policy(mode=mode), Grants())
+    assert result.decision is Decision.ALLOW, (path, result)
+
+
+@pytest.mark.parametrize("path", NOT_PROTECTED)
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+def test_a_write_to_a_path_that_only_looks_like_a_protected_one_is_not_refused(tool, path):
+    accepting = policy(mode=PermissionMode.ACCEPT_EDITS)
+    result = evaluate(write_req(tool, path), accepting, Grants())
+    assert (result.decision, result.rule) == (Decision.ALLOW, "mode.accept-edits"), path
+    asking = evaluate(write_req(tool, path), policy(), Grants())
+    assert (asking.decision, asking.rule) == (Decision.ASK, "rule.ask"), path
+
+
+def test_a_deny_rule_of_the_users_is_still_the_reason_given_when_it_covers_the_path_too():
+    p = policy(rules=RuleSet.build(deny=["Write(**/config)"]))
+    assert evaluate(write_req("Write", "/p/.git/config"), p, Grants()).rule == "rule.deny"
+
+
+def test_the_protected_path_row_sits_with_the_hard_denials_and_before_every_mode_row():
+    """The ids a call that matches several rows is given, for the rows either side of
+    where this one belongs: after the sandbox rows and before the danger rows, the plan
+    row and the first of the rows that let a call through."""
+    outside = evaluate(write_req("Write", "/etc/.git/config"), policy(), Grants())
+    assert outside.rule == "sandbox.outside-root"  # row 3 answers first
+    classified = req(
+        "Bash",
+        "x",
+        ("/p/.git/config",),
+        is_write=True,
+        danger=DangerVerdict(DangerLevel.BLOCKED, ("test",), "regex", "blocked for the test"),
+    )
+    assert evaluate(classified, policy(), Grants()).rule == "sandbox.protected-path"
+
+
+def test_every_path_of_a_request_is_checked_not_only_the_first():
+    both = PermissionRequest("Write", "/p/a.py", ("/p/a.py", "/p/.git/config"), is_write=True)
+    assert evaluate(both, policy(mode=PermissionMode.BYPASS), Grants()).rule == (
+        "sandbox.protected-path"
+    )

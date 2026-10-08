@@ -47,6 +47,7 @@ from nanoclaude.conversation.store import Store
 from nanoclaude.conversation.transcript import ToolUseBlock
 from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
+from nanoclaude.permissions.policy import PermissionMode as Mode
 from nanoclaude.testing.scripted import calls as model_calls
 from nanoclaude.testing.scripted import calls_many
 from nanoclaude.tools.base import ToolArgumentError, ToolContext, ToolOutcome, ok
@@ -180,6 +181,34 @@ async def test_a_denied_call_is_never_executed(policy, tmp_repo):
     outcomes = await executor(policy).run_batch(calls, start("hi"))
     assert outcomes[0].is_error
     assert "sandbox.outside-root" in outcomes[0].content
+
+
+@pytest.mark.parametrize("mode", [Mode.DEFAULT, Mode.ACCEPT_EDITS, Mode.BYPASS], ids=str)
+async def test_an_edit_of_the_repositorys_own_config_is_refused_whatever_the_mode(
+    policy, tmp_repo, mode
+):
+    """What a tool call can reach is what makes the next git run something: an edit of
+    ``.git/config`` under accept-edits used to be applied without a question."""
+    config = tmp_repo / ".git" / "config"
+    config.write_text("[core]\n\tbare = false\n")
+    state = replace(start("hi"), read_state={})
+    batch = executor(replace(policy, mode=mode))
+    (read_outcome,) = await batch.run_batch(
+        (ToolUseBlock("t0", "Read", {"path": ".git/config"}),), state
+    )
+    assert not read_outcome.is_error  # reading it is fine
+    seen = dict(read_outcome.observed)
+    state = replace(state, read_state=seen)
+    edit = ToolUseBlock(
+        "t1",
+        "Edit",
+        {"path": ".git/config", "old_string": "bare = false", "new_string": "fsmonitor = x"},
+    )
+    write = ToolUseBlock("t2", "Write", {"path": ".nanoclaude/config.toml", "content": "x = 1\n"})
+    outcomes = await batch.run_batch((edit, write), state)
+    assert all(o.is_error and "sandbox.protected-path" in o.content for o in outcomes)
+    assert config.read_text() == "[core]\n\tbare = false\n"
+    assert not (tmp_repo / ".nanoclaude").exists()
 
 
 async def test_always_upgrades_the_rest_of_the_session(policy, tmp_repo):

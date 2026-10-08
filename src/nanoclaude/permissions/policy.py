@@ -5,6 +5,13 @@ sequence of early returns, in the order given in spec 6.2. The first five checks
 are the hard-denial band: no mode, no rule and no session grant can get past
 them, which is why ``BYPASS`` sits *after* them rather than at the top.
 
+One rule id is not in spec 17.4's table: ``sandbox.protected-path``. It is a sixth row
+of the hard-denial band, between the sandbox rows and the danger rows, and it refuses a
+write to any file git or ncc itself reads its behaviour from (see
+:data:`PROTECTED_DIRECTORIES`). The table is extended the way ``tool.internal-error``
+extended it, because the spec's sandbox rows answer where a path is and none of them
+answers what it is.
+
 Nothing here touches the filesystem. Paths arriving in a
 :class:`PermissionRequest` are already resolved -- following a symlink after the
 permission check is how sandboxes get escaped.
@@ -32,6 +39,29 @@ ALLOWED_WITHOUT_ASKING = READ_ONLY_TOOLS | {"TodoWrite"}
 
 #: Tools ACCEPT_EDITS mode auto-approves.
 EDIT_TOOLS = frozenset({"Edit", "Write"})
+
+#: Directories whose files make git or ncc run something, or change how they behave: git
+#: runs what ``.git/config`` and ``.git/hooks`` name (the next ``git status`` the context
+#: assembly makes, or the next commit the person makes), and ncc reads its own
+#: configuration, its capability cache and its session store from ``.nanoclaude``. A write
+#: to one is a way for a tool call to run code that no confirmation described, so it is
+#: refused whatever the mode. Names are compared without regard to case, since the
+#: filesystems people use most (macOS's default among them) treat ``.GIT`` as ``.git``;
+#: that errs towards refusing, which is the safe side for a refusal.
+PROTECTED_DIRECTORIES = (".git", ".nanoclaude")
+
+
+def protected_directory(path: str) -> str | None:
+    """The protected directory ``path`` is inside, or is, or None.
+
+    A ``.git`` that is a file (a worktree's or a submodule's pointer to its repository)
+    counts: rewriting it points git somewhere else. Components are compared whole, so
+    ``.github`` and ``.gitignore`` are nothing to do with it.
+    """
+    for part in PurePosixPath(path).parts:
+        if part.casefold() in PROTECTED_DIRECTORIES:
+            return part.casefold()
+    return None
 
 
 class PermissionMode(StrEnum):
@@ -265,6 +295,19 @@ def evaluate(
                     f"{path} is outside the working directory ({roots}). Use --add-dir to widen it."
                 )
             return PermissionResult(Decision.DENY, violation, message)
+
+    # 3b. sandbox.protected-path -- not in spec 17.4's table; see the module docstring.
+    if request.is_write:
+        for path in request.resolved_paths:
+            protected = protected_directory(path)
+            if protected is not None:
+                return PermissionResult(
+                    Decision.DENY,
+                    "sandbox.protected-path",
+                    f"{path} is inside {protected}, where git or ncc keeps files it runs or "
+                    "obeys. No mode or rule allows a write there. Make that change yourself, "
+                    "outside the agent.",
+                )
 
     # 4. bash.dangerous / bash.unparseable
     if request.danger is not None:
