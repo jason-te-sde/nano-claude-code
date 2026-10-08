@@ -6,11 +6,31 @@ goes wrong, since it is code that moves and the prose that stays.
 """
 
 import re
+import tomllib
+from dataclasses import fields
 from pathlib import Path
 
+import pytest
+
+from nanoclaude.cli.commands import COMMANDS
+from nanoclaude.cli.init import PRESETS
+from nanoclaude.cli.main import EXIT_CODES
+from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, load_config
+from nanoclaude.config.schema import ROLES, LimitsConfig, ModelConfig, PermissionsConfig, UiConfig
+from nanoclaude.providers.capabilities import CACHE_FILENAME, CONSERVATIVE_DEFAULT, capabilities_for
+
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src" / "nanoclaude"
 DOCS = ROOT / "docs"
 DESIGN = DOCS / "design"
+CONFIGURATION = DOCS / "configuration.md"
+ARCHITECTURE = DOCS / "architecture.md"
+TESTING = DOCS / "testing.md"
+
+#: The documents about the program as it is, as opposed to the design notes, which argue for
+#: decisions and may name things that are not built. Checks that a document names only what
+#: exists run over these.
+DOCUMENTS = (CONFIGURATION, ARCHITECTURE, TESTING)
 
 #: The design notes that exist. The ones the shell and the syntax-tree classifier need are
 #: written with them, so they are not in this list yet: 0008, 0009 and 0011 are left for
@@ -102,3 +122,338 @@ def test_the_scope_note_lists_what_v01_does_not_do():
     text = (DESIGN / "0001-scope.md").read_text().lower()
     for absent in ("mcp", "sub-agent", "checkpoint", "hook", "windows"):
         assert absent in text, f"0001-scope.md does not say that v0.1 lacks {absent}"
+
+
+# --------------------------------------------------------------------------
+# What a document names must exist, and what exists must be named
+# --------------------------------------------------------------------------
+
+#: A slash command in backticks: ``/help``, or ``/export [file]``. A path such as
+#: ``/api/show`` has more after its first word and is not one.
+_SLASH_COMMAND = re.compile(r"`/([a-z]+)(?=[`\s\[<])")
+
+
+def _text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _section(text: str, heading: str) -> str:
+    """The body under a ``## `` heading, up to the next one."""
+    found = re.search(
+        rf"^## {re.escape(heading)}\n(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL
+    )
+    assert found is not None, f"no section called {heading!r}"
+    return found.group(1)
+
+
+def _table_rows(text: str) -> list[list[str]]:
+    """The cells of every row of every markdown table in ``text``, without the header rule."""
+    rows = []
+    for line in text.splitlines():
+        if line.startswith("|") and not re.fullmatch(r"\|[ :|-]+\|", line):
+            rows.append([cell.strip() for cell in line.strip().strip("|").split("|")])
+    return rows
+
+
+def test_every_slash_command_a_document_names_exists():
+    for document in DOCUMENTS:
+        for name in _SLASH_COMMAND.findall(_text(document)):
+            assert name in COMMANDS, f"{document.name} names /{name}, which is not a command"
+
+
+def test_every_slash_command_is_in_the_configuration_reference():
+    text = _text(CONFIGURATION)
+    for name in COMMANDS:
+        assert f"`/{name}" in text, f"/{name} is a command and the reference does not describe it"
+
+
+def test_every_configuration_key_is_in_the_reference():
+    text = _text(CONFIGURATION)
+
+    def first_column(heading: str) -> set[str]:
+        rows = _table_rows(_section(text, heading))
+        return {row[0].strip("`") for row in rows if row[0].startswith("`")}
+
+    for heading, names in (
+        ("Models", [f.name for f in fields(ModelConfig)]),
+        ("Limits", [f.name for f in fields(LimitsConfig)]),
+    ):
+        missing = [name for name in names if name not in first_column(heading)]
+        assert missing == [], f"the {heading} table does not have a row for {missing}"
+    for heading, names in (
+        ("Roles", list(ROLES)),
+        ("Permissions", [f.name for f in fields(PermissionsConfig)]),
+        ("The `[ui]` section", [f.name for f in fields(UiConfig)]),
+    ):
+        body = _section(text, heading)
+        missing = [name for name in names if f"`{name}`" not in body]
+        assert missing == [], f"the section on {heading} does not name {missing}"
+
+
+def test_the_limits_in_the_reference_have_the_defaults_the_code_has():
+    rows = _table_rows(_section(_text(CONFIGURATION), "Limits"))
+    documented = {row[0].strip("`"): row[1] for row in rows if row[0].startswith("`")}
+    defaults = LimitsConfig()
+    for field in fields(LimitsConfig):
+        assert field.name in documented, f"the limits table has no row for {field.name}"
+        said = float(documented[field.name].replace(",", ""))
+        assert said == float(getattr(defaults, field.name)), (
+            f"the reference gives {field.name} as {documented[field.name]}; "
+            f"the code's default is {getattr(defaults, field.name)}"
+        )
+
+
+def test_the_permission_defaults_in_the_reference_are_the_code_s():
+    text = _text(CONFIGURATION)
+    defaults = PermissionsConfig()
+    for key in ("allow", "ask"):
+        listed = "[" + ", ".join(f'"{rule}"' for rule in getattr(defaults, key)) + "]"
+        assert f"{key} = {listed}" in text, (
+            f"the reference does not give the default {key} list {listed}"
+        )
+
+
+def test_the_exit_codes_in_the_reference_are_the_ones_the_program_returns():
+    rows = _table_rows(
+        _section(_text(CONFIGURATION), "The command line").split("**Exit codes.**")[1]
+    )
+    documented = {int(row[0].strip("`")) for row in rows if re.fullmatch(r"`\d+`", row[0])}
+    assert documented == set(EXIT_CODES.values()), (
+        f"the reference documents the exit codes {sorted(documented)}; "
+        f"the program returns {sorted(set(EXIT_CODES.values()))}"
+    )
+
+
+def test_the_environment_variables_are_the_ones_the_program_reads():
+    rows = _table_rows(_section(_text(CONFIGURATION), "Environment variables"))
+    source = "\n".join(path.read_text(encoding="utf-8") for path in SRC.rglob("*.py"))
+    documented = set(re.findall(r"`([A-Z][A-Z0-9_]{3,})`", " ".join(row[0] for row in rows)))
+    assert documented, "no environment variable was found in the reference's table"
+    for name in documented:
+        assert name in source, f"the reference documents {name} and nothing reads it"
+    for name in set(re.findall(r"NANOCLAUDE_[A-Z_]+", source)):
+        assert name in documented, f"the program reads {name} and the reference does not say so"
+
+
+def test_the_files_the_reference_says_ncc_keeps_are_the_ones_it_keeps():
+    text = _text(CONFIGURATION)
+    main = _text(SRC / "cli" / "main.py")
+    for name in (CONFIG_FILENAME, CACHE_FILENAME):
+        assert f"~/{CONFIG_DIRNAME}/{name}" in text, f"the reference does not say where {name} is"
+    for name in ("sessions.db", "history"):
+        assert f'"{name}"' in main, f"the program no longer keeps {name} where it was"
+        assert f"~/{CONFIG_DIRNAME}/{name}" in text, f"the reference does not say where {name} is"
+
+
+def test_the_presets_in_the_reference_are_the_ones_init_offers():
+    rows = _table_rows(_section(_text(CONFIGURATION), "ncc init"))
+    documented = {(row[2].strip("`"), row[3].strip("`")) for row in rows if row[0].isdigit()}
+    offered = {(preset.default_model, preset.key_env or "none") for preset in PRESETS.values()}
+    assert documented == offered, f"the reference lists {documented}; init offers {offered}"
+
+
+#: The ids of hosted models that the documents may use: the ones the capability table has a
+#: row for, which were checked against each provider's own list. A legacy id is not among them.
+CURRENT_ANTHROPIC = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-4-5", "claude-fable-5-1"}
+
+
+def test_every_hosted_model_id_in_the_documents_is_a_current_one_the_program_knows():
+    for document in DOCUMENTS:
+        text = _text(document)
+        for model in set(re.findall(r"\bclaude-(?:sonnet|opus|haiku|fable)-\d+(?:-\d+)*\b", text)):
+            assert model in CURRENT_ANTHROPIC, f"{document.name} uses {model}, which is not current"
+            assert capabilities_for("anthropic", model) is not CONSERVATIVE_DEFAULT
+        for model in set(re.findall(r"\bdeepseek/[a-z0-9.-]+", text)):
+            assert model == PRESETS["openrouter"].default_model, (
+                f"{document.name} uses {model}; the model checked against OpenRouter's list is "
+                f"{PRESETS['openrouter'].default_model}"
+            )
+
+
+# --------------------------------------------------------------------------
+# The examples are run
+# --------------------------------------------------------------------------
+
+#: A home configuration that defines every alias the examples refer to, so that an excerpt, or
+#: a project file that only chooses among models, has something to be laid over.
+EXAMPLE_HOME = """\
+[models.sonnet]
+adapter = "anthropic"
+model   = "claude-sonnet-5-5"
+
+[models.opus]
+adapter = "anthropic"
+model   = "claude-opus-5-5"
+
+[models.haiku]
+adapter = "anthropic"
+model   = "claude-haiku-4-5"
+
+[models.local]
+adapter = "ollama"
+model   = "qwen3-coder"
+
+[models.cheap]
+adapter     = "openai_compat"
+base_url    = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+model       = "deepseek/deepseek-v4-pro"
+"""
+
+EXAMPLE_KINDS = {
+    "# ~/.nanoclaude/config.toml": "home",
+    "# ~/.nanoclaude/config.toml (excerpt)": "excerpt",
+    "# .nanoclaude/config.toml (in the project)": "project",
+}
+
+
+def _fenced_blocks(text: str) -> list[tuple[str, str]]:
+    """Every fenced block of a document, as (the language after the fence, its lines)."""
+    blocks: list[tuple[str, str]] = []
+    language: str | None = None
+    lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("```"):
+            if language is None:
+                language, lines = line[3:].strip(), []
+            else:
+                blocks.append((language, "\n".join(lines)))
+                language = None
+        elif language is not None:
+            lines.append(line)
+    return blocks
+
+
+def _toml_examples() -> list[tuple[str, str, str]]:
+    """(document, kind, text) for each TOML block in the documents."""
+    found = []
+    for document in DOCUMENTS:
+        for language, body in _fenced_blocks(_text(document)):
+            if language == "toml":
+                found.append((document.name, body.splitlines()[0], body))
+    return found
+
+
+def test_there_are_toml_examples_to_check_and_each_kind_is_among_them():
+    kinds = {EXAMPLE_KINDS.get(first) for _, first, _ in _toml_examples()}
+    assert kinds == {"home", "excerpt", "project"}, f"found the kinds {kinds}"
+
+
+@pytest.mark.parametrize(("document", "first", "body"), _toml_examples())
+def test_every_toml_example_says_whose_file_it_is_and_loads(document, first, body, tmp_path):
+    assert first in EXAMPLE_KINDS, (
+        f"a TOML example in {document} must begin with a comment saying whose file it is, "
+        f"one of {sorted(EXAMPLE_KINDS)}; it begins {first!r}"
+    )
+    kind = EXAMPLE_KINDS[first]
+    tomllib.loads(body)  # a syntax error is named as one, before the loader gets to it
+    home, project = tmp_path / "home", tmp_path / "project"
+    (home / CONFIG_DIRNAME).mkdir(parents=True)
+    (project / CONFIG_DIRNAME).mkdir(parents=True)
+    home_file = home / CONFIG_DIRNAME / CONFIG_FILENAME
+    if kind == "home":
+        home_file.write_text(body)
+        load_config(home=str(home), project=None, env={})
+    elif kind == "excerpt":
+        home_file.write_text(EXAMPLE_HOME + "\n" + body)
+        load_config(home=str(home), project=None, env={})
+    else:
+        home_file.write_text(EXAMPLE_HOME)
+        (project / CONFIG_DIRNAME / CONFIG_FILENAME).write_text(body)
+        load_config(home=str(home), project=str(project), env={})
+
+
+# --------------------------------------------------------------------------
+# Links
+# --------------------------------------------------------------------------
+
+_LINK = re.compile(r"(?<!\!)\[[^\]]*\]\(([^)\s]+)\)")
+
+
+def _anchors(text: str) -> set[str]:
+    """The anchors GitHub makes for the headings of a document."""
+    found = set()
+    for heading in re.findall(r"^#{1,6} +(.+?) *$", text, re.MULTILINE):
+        slug = re.sub(r"[^a-z0-9 _-]", "", heading.replace("`", "").lower())
+        found.add(slug.replace(" ", "-"))
+    return found
+
+
+def test_the_anchor_of_a_heading_is_made_as_github_makes_it():
+    assert _anchors("## What v0.1 does not do\n## `ncc init` and more\n") == {
+        "what-v01-does-not-do",
+        "ncc-init-and-more",
+    }
+
+
+def _every_document() -> list[Path]:
+    top = [ROOT / name for name in ("README.md", "CHANGELOG.md", "CONTRIBUTING.md", "SECURITY.md")]
+    return [path for path in (*top, *sorted(DOCS.rglob("*.md"))) if path.exists()]
+
+
+def test_every_relative_link_in_the_documents_resolves():
+    checked = 0
+    for document in _every_document():
+        for target in _LINK.findall(_text(document)):
+            if re.match(r"[a-z]+:", target):
+                continue  # a web address, a mail address
+            path, _, anchor = target.partition("#")
+            resolved = (document.parent / path).resolve() if path else document
+            assert resolved.exists(), (
+                f"{document.relative_to(ROOT)} links to {target}, which is not there"
+            )
+            if anchor and resolved.suffix == ".md":
+                assert anchor in _anchors(_text(resolved)), (
+                    f"{document.relative_to(ROOT)} links to {target}, which has no such heading"
+                )
+            checked += 1
+    assert checked >= 5, f"only {checked} links were found, so the documents were barely checked"
+
+
+# --------------------------------------------------------------------------
+# The architecture and testing documents
+# --------------------------------------------------------------------------
+
+
+def test_the_rule_ids_in_the_architecture_document_are_the_ones_the_code_decides_with():
+    ids = set()
+    for name in ("permissions/policy.py", "permissions/sandbox.py", "agent/executor.py"):
+        ids |= set(
+            re.findall(
+                r'"((?:rule|secret|sandbox|bash|mode|grant|tool|default)\.[a-z-]+)"',
+                _text(SRC / name),
+            )
+        )
+    rows = _table_rows(_text(ARCHITECTURE))
+    documented = {row[0].strip("`") for row in rows if re.fullmatch(r"`[a-z]+\.[a-z-]+`", row[0])}
+    assert len(ids) >= 17, f"found only {sorted(ids)} in the source, so the pattern is wrong"
+    assert documented == ids, (
+        f"in the document and not the code: {sorted(documented - ids)}; "
+        f"in the code and not the document: {sorted(ids - documented)}"
+    )
+
+
+def test_the_architecture_document_states_the_two_extensions_of_the_plan():
+    text = _text(ARCHITECTURE)
+    assert "tool.internal-error" in text
+    assert "messages_archive(session_id, seq, role, blocks_json, created_at, archived_at)" in text
+
+
+def test_the_testing_document_says_what_the_tests_do_not_cover():
+    section = _section(_text(TESTING), "What these tests do not cover")
+    leads = [
+        match.group(1).lower() for match in re.finditer(r"^- \*\*(.+?)\*\*", section, re.MULTILINE)
+    ]
+    assert len(leads) >= 6, f"only {len(leads)} things are listed as not covered"
+    for topic in (
+        "provider",
+        "windows",
+        "concurrent",
+        "hostile",
+        "models",
+        "danger classifier",
+    ):
+        assert any(topic in lead for lead in leads), (
+            f"no item of the section is about {topic!r}; the items are {leads}"
+        )
+    assert "cassette" in section.lower(), "the section does not say what the cassettes are"
