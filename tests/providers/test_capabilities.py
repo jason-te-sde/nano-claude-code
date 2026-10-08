@@ -22,6 +22,9 @@ PUBLISHED = [
     ("claude-opus-5", 1_000_000, 128_000),
     ("claude-sonnet-5-5", 1_000_000, 128_000),
     ("claude-sonnet-5", 1_000_000, 128_000),
+    # Haiku 5.5, checked 2026-10-07 on the models overview: 1M window, 128K max output,
+    # adaptive thinking, and (as for every current model) image input and tool use.
+    ("claude-haiku-5-5", 1_000_000, 128_000),
     ("claude-haiku-4-5", 200_000, 64_000),
     ("claude-haiku-4-5-20251001", 200_000, 64_000),
 ]

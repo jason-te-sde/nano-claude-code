@@ -842,3 +842,17 @@ def test_a_client_that_was_handed_over_stands_in_for_the_key(make):
     # up for it, and refusing it for lacking a variable would refuse a model that works.
     router = make(keyed_config(compact="cheap"), {"cheap": FakeClient("haiku")})
     router.check_credentials()
+
+
+def test_each_call_is_priced_on_its_own_prompt_and_not_on_what_the_role_has_used(make):
+    # Two calls of 60,000 prompt tokens are two short prompts, not one of 120,000: the
+    # threshold of a model priced by prompt length is a property of a call.
+    router = make(config_with())
+    short = Usage(input_tokens=60_000)
+    router.record("main", short, "anthropic", "claude-haiku-5-5")
+    router.record("main", short, "anthropic", "claude-haiku-5-5")
+    assert router.by_role()["main"].cost == pytest.approx(2 * 60_000 * 0.10 / 1_000_000)
+    router.record("main", Usage(input_tokens=100_001), "anthropic", "claude-haiku-5-5")
+    assert router.by_role()["main"].cost == pytest.approx(
+        2 * 60_000 * 0.10 / 1_000_000 + 100_001 * 0.50 / 1_000_000
+    )
