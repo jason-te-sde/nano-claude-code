@@ -45,7 +45,7 @@ from nanoclaude.providers.retry import (
     classify_stream_error,
 )
 
-DEFAULT_MODEL = "claude-sonnet-5"
+DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 API_VERSION = "2023-06-01"
 
