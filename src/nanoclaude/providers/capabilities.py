@@ -15,6 +15,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+#: The cache's file, inside the directory ncc keeps its state in. Named once, so that the
+#: command that reads the cache and the one that clears it cannot disagree about where it is.
+CACHE_FILENAME = "capabilities.json"
+
 CacheStyle = Literal["explicit", "automatic", "none"]
 ReasoningStyle = Literal["none", "thinking", "opaque"]
 
@@ -103,6 +107,15 @@ class CapabilityCache:
             # missing file -- empty, not an error.
             return {}
         return data
+
+    def clear(self) -> None:
+        """Forget every model, so that the next run probes each one again.
+
+        A cache that was never written is already clear. A path that cannot be removed
+        raises ``OSError``, naming it: the stale answers would stay in force, and which
+        file to delete by hand is for the caller to say.
+        """
+        self.path.unlink(missing_ok=True)
 
     def get(self, adapter: str, model: str) -> Capabilities | None:
         raw = self._load().get(f"{adapter}/{model}")

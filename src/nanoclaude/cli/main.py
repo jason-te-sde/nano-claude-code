@@ -57,7 +57,7 @@ from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.permissions.sandbox import Sandbox
 from nanoclaude.providers.base import CredentialsError, ModelError
-from nanoclaude.providers.capabilities import CapabilityCache
+from nanoclaude.providers.capabilities import CACHE_FILENAME, CapabilityCache
 from nanoclaude.tools.base import sanitize
 from nanoclaude.tools.registry import default_registry
 from nanoclaude.tools.todo import TodoState
@@ -520,7 +520,7 @@ def _build_session(
     try:
         _open(store)
         session_id, resume = _which_session(args, store, settings.root)
-        router = Router(config, CapabilityCache(state_dir / "capabilities.json"))
+        router = Router(config, CapabilityCache(state_dir / CACHE_FILENAME))
         todo = TodoState()
         # One redactor for what the tools return and for what the audit records: with
         # --allow-secrets a credentials file is read, and the redactor must let it through.
