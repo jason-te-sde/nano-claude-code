@@ -228,6 +228,17 @@ def test_the_comment_above_the_roles_says_what_a_role_is_for():
     assert any(line.startswith("#") and "explore" in line for line in above)
 
 
+def test_the_comment_above_the_roles_says_which_are_routed_and_promises_no_saving():
+    # Only main and compact are routed to a model of their own in this version; the rest wait
+    # for sub-agents (spec 13, v0.3). A file that calls pointing `explore` at a cheap model
+    # "the easiest saving available" invites somebody to change a line that changes nothing.
+    lines = render_config(PRESETS["anthropic"], "a", "m").splitlines()
+    above = " ".join(line.lstrip("# ") for line in lines[: lines.index("[roles]")]).lower()
+    assert "saving" not in above and "easiest" not in above
+    assert "main" in above and "compact" in above
+    assert "v0.3" in above and "sub-agent" in above
+
+
 def test_the_rendered_config_names_the_variable_and_never_holds_a_key():
     entry = tomllib.loads(render_config(PRESETS["anthropic"], "sonnet", "claude-sonnet-5"))[
         "models"

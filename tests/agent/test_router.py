@@ -1,3 +1,4 @@
+import ast
 import dataclasses
 import datetime as dt
 from collections.abc import AsyncIterator, Callable, Hashable
@@ -7,6 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
+from nanoclaude.agent import router as router_module
 from nanoclaude.agent.router import RoleUsage, Router
 from nanoclaude.config.load import ConfigError
 from nanoclaude.config.schema import ROLES, Config, ModelConfig, RolesConfig
@@ -744,3 +746,36 @@ async def test_one_client_failing_to_close_does_not_leave_the_others_open(make):
     with pytest.raises(RuntimeError, match="stubborn would not close"):
         await router.aclose()
     assert sorted(log) == ["fine", "stubborn"]
+
+
+# --- What the comments say about which roles are routed, locked to what the code does -------
+
+#: The Router calls that name a role, and where in each the role is.
+_ROLE_CALLS = {"client_for", "capabilities_for", "record", "_complete", "_adapter_and_model"}
+
+
+def _roles_the_source_asks_for() -> set[str]:
+    """Every role named as a literal in a call to the router, anywhere under src."""
+    src = Path(router_module.__file__).resolve().parents[1]
+    named: set[str] = set()
+    for path in src.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr in _ROLE_CALLS and node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Constant) and first.value in ROLES:
+                    named.add(first.value)
+    return named
+
+
+def test_only_the_main_and_compact_roles_are_routed_in_this_version():
+    # The generated config and this module's docstring both say so. When sub-agents give
+    # `explore` a caller this fails, and the two places that say otherwise are due a rewrite.
+    assert _roles_the_source_asks_for() == {"main", "compact"}
+
+
+def test_the_router_does_not_promise_the_saving_it_cannot_yet_deliver():
+    doc = router_module.__doc__ or ""
+    assert "largest saving" not in doc
+    assert "v0.3" in doc and "main" in doc and "compact" in doc

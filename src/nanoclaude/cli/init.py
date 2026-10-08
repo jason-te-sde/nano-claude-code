@@ -135,9 +135,10 @@ def render_config(preset: Preset, alias: str, model: str) -> str:
 adapter     = {_toml_string(preset.adapter)}
 model       = {_toml_string(model)}
 {base_url}{key_env}
-# Roles let one session use different models for different jobs. Exploring a
-# codebase is most of the tokens and none of the difficulty, so pointing
-# `explore` at a cheap or local model is the easiest saving available.
+# Roles name the model for each job. In this version only `main` (the conversation) and
+# `compact` (the summary that replaces a long conversation) are routed to a model of their
+# own. `explore`, `plan`, `verify` and `title` are accepted so this file keeps working, but
+# nothing uses them until sub-agents arrive in v0.3.
 # Add another [models.<alias>] block and name it here.
 [roles]
 {roles}

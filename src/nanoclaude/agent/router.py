@@ -1,10 +1,12 @@
 """Which model plays which role, and what each of them cost.
 
 The reason this exists: exploring a codebase is most of the tokens in a coding
-session and almost none of the difficulty. Sending that to a cheap or local
-model while the main conversation stays on an expensive one is the single
-largest saving available, and it is only possible because the provider
-boundary is neutral.
+session and almost none of the difficulty, so it can be sent to a cheap or local
+model while the main conversation stays on an expensive one. That is only
+possible because the provider boundary is neutral. It is not yet a saving anyone
+can have: in v0.1 only the ``main`` and ``compact`` roles are routed, and
+``explore``, ``plan``, ``verify`` and ``title`` are accepted and checked but
+asked for by nothing until sub-agents arrive in v0.3 (spec 13).
 
 Cost is reported per role, and the total is ``None`` if any model in the
 session has no price. A partial total presented as a total is worse than no
