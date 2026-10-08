@@ -147,6 +147,8 @@ allow = {_list(permissions.allow)}
 ask   = {_list(permissions.ask)}
 deny  = ["Read(**/.env*)"]
 
+# Guard rails on one run: how many model turns it may take, and how long a shell command
+# may run, in seconds.
 [limits]
 max_turns      = {limits.max_turns}
 bash_timeout_s = {limits.bash_timeout_s:g}

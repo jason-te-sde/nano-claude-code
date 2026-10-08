@@ -47,7 +47,7 @@ from nanoclaude.providers.capabilities import (
     CapabilityCache,
     capabilities_for,
 )
-from tests.cli.helpers import INTERRUPTED, plain_console, run_ncc
+from tests.cli.helpers import INTERRUPTED, colour_codes, plain_console, run_ncc
 
 
 def write_home(home: Path, text: str) -> None:
@@ -177,6 +177,24 @@ def test_the_rendered_config_is_commented():
     rendered = render_config(PRESETS["anthropic"], "sonnet", "claude-sonnet-5")
     assert rendered.lstrip().startswith("#")
     assert "explore" in rendered
+
+
+@pytest.mark.parametrize("name", list(PRESETS))
+def test_every_section_of_the_rendered_config_is_introduced_by_a_comment(name):
+    # The file is the documentation: what init does not ask is a default read here.
+    preset = PRESETS[name]
+    lines = render_config(preset, preset.key, preset.default_model).splitlines()
+    headers = [i for i, line in enumerate(lines) if line.startswith("[")]
+    assert len(headers) == 4
+    for index in headers:
+        before = [line for line in lines[:index] if line.strip()]
+        assert before[-1].startswith("#"), f"no comment above {lines[index]}"
+
+
+def test_the_comment_above_the_roles_says_what_a_role_is_for():
+    lines = render_config(PRESETS["anthropic"], "a", "m").splitlines()
+    above = lines[: lines.index("[roles]")]
+    assert any(line.startswith("#") and "explore" in line for line in above)
 
 
 def test_the_rendered_config_names_the_variable_and_never_holds_a_key():
@@ -524,6 +542,15 @@ def test_a_cache_that_cannot_be_cleared_is_said_and_does_not_stop_the_setup(tmp_
     assert "probed again" in ran.out
 
 
+def test_the_reason_a_cache_cannot_be_removed_is_not_read_as_markup(tmp_path, key, monkeypatch):
+    def refuse(self: CapabilityCache) -> None:
+        raise OSError(5, "no [/] space [bold]left")
+
+    monkeypatch.setattr(CapabilityCache, "clear", refuse)
+    ran = init(tmp_path, "1", key, None)
+    assert "(no [/] space [bold]left)" in ran.out
+
+
 # --------------------------------------------------------------------------
 # The check
 # --------------------------------------------------------------------------
@@ -726,6 +753,21 @@ async def test_the_model_checked_is_the_one_the_alias_names(tmp_path, key, wire)
     wire.answer = says_ok
     config = config_for(tmp_path, "anthropic", key, "claude-haiku-4-5")
     await verify(config, "anthropic")
+    assert wire.body()["model"] == "claude-haiku-4-5"
+
+
+async def test_the_model_checked_is_the_one_asked_for_even_when_it_is_not_the_main_one(
+    tmp_path, key, wire
+):
+    write_home(
+        tmp_path,
+        '[models.big]\nadapter = "anthropic"\nmodel = "claude-sonnet-5-5"\n'
+        '[models.small]\nadapter = "anthropic"\nmodel = "claude-haiku-4-5"\n'
+        '[roles]\nmain = "big"\n',
+    )
+    config = load_config(home=str(tmp_path), project=None, env={"ANTHROPIC_API_KEY": key})
+    wire.answer = says_ok
+    assert await verify(config, "small") is None
     assert wire.body()["model"] == "claude-haiku-4-5"
 
 
@@ -971,7 +1013,9 @@ def test_something_that_is_not_a_choice_is_asked_again(terminal):
 
 
 def test_a_choice_typed_in_the_other_case_is_the_choice(terminal):
-    assert terminal.ask(f"Y{ENTER}", "overwrite?", choices=["y", "n"], default="n") == "y"
+    # The Ctrl+D is for a prompt that asks again: it ends the question and fails the test,
+    # where it would otherwise wait for a key that is never going to be typed.
+    assert terminal.ask(f"Y{ENTER}\x04", "overwrite?", choices=["y", "n"], default="n") == "y"
 
 
 def test_enter_at_a_question_with_choices_takes_the_default(terminal):
@@ -983,6 +1027,11 @@ def test_a_key_is_read_and_never_drawn(terminal, key):
     screen = terminal.screen.getvalue()
     assert key not in screen
     assert "paste your key:" in screen
+
+
+def test_a_hidden_question_neither_shows_nor_takes_a_default(terminal):
+    assert terminal.ask(ENTER, "paste your key", password=True, default="hunter2") == ""
+    assert "hunter2" not in terminal.screen.getvalue()
 
 
 def test_not_a_letter_of_the_key_is_drawn(terminal, key):
@@ -1140,6 +1189,16 @@ def test_init_takes_no_color(machine, monkeypatch, capsys, key, argv):
     code, out, _ = run_ncc(capsys, *argv)
     assert code == 0
     assert "\x1b[" not in out
+
+
+def test_init_is_in_colour_where_colour_is_wanted_and_in_none_where_it_is_not(
+    machine, monkeypatch, capsys, key
+):
+    monkeypatch.setenv("FORCE_COLOR", "1")  # as if the output were a colour terminal
+    scripted(monkeypatch, "1", key, None, verify=Verifier())
+    assert colour_codes(run_ncc(capsys, "init")[1]), "the premise: it is coloured"
+    scripted(monkeypatch, "1", key, None, verify=Verifier())
+    assert colour_codes(run_ncc(capsys, "init", "--no-color")[1]) == []
 
 
 def test_a_word_that_is_not_a_command_is_said_so_and_a_task_goes_with_p(machine, capsys):
