@@ -29,6 +29,7 @@ from rich.console import Console
 from rich.markup import escape
 
 from nanoclaude.agent.router import Router
+from nanoclaude.cli.render import show_error
 from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, ConfigError, load_config
 from nanoclaude.config.schema import ROLES, Config, LimitsConfig, PermissionsConfig
 from nanoclaude.conversation.transcript import Transcript, user_text
@@ -222,6 +223,11 @@ async def verify(config: Config, alias: str) -> str | None:
     config's models, as it is for ncc itself.
     """
     key = config.api_key_for(alias)
+    flaw = _key_flaw(key)
+    if flaw is not None:
+        return _flawed_key_line(
+            f"the key in {config.api_key_env_for(alias)}", flaw, config.api_key_env_for(alias)
+        )
     request = ModelRequest("Reply with: ok", Transcript((user_text("ping"),)), (), 8)
     # A router for its way of making the client. The cache is a path that is never read: no
     # capability is asked for, and if one ever were, a file under /dev/null cannot be made.
@@ -266,11 +272,57 @@ def _redact(text: str, key: str) -> str:
     """``text`` without the key in it, wherever it appears.
 
     A provider is free to say a key back in its error, and a library to put a header value
-    in an exception; this is the one place where what is shown is checked against the key.
-    An empty key is nothing to hide, and replacing it would put the marker between every
-    two characters.
+    in an exception, and a library writes one as a bytes literal: a line break in the key is
+    ``\\n`` there, which the key's own text is not found in. So the key is cut out as it is
+    and in the two escaped forms it can take. This is the one place where what is shown is
+    checked against the key. An empty key is nothing to hide, and replacing it would put the
+    marker between every two characters.
     """
-    return text.replace(key, "[hidden]") if key else text
+    if not key:
+        return text
+    for form in (key, repr(key)[1:-1], key.encode("unicode_escape").decode()):
+        text = text.replace(form, "[hidden]")
+    return text
+
+
+#: What a key may be made of: the printable ASCII characters but the space. A key is sent as
+#: the value of a header, and anything else is not one: a line break, which is a paste that
+#: took two lines; a space or a tab, which is a paste that took a word of the page around it;
+#: a character that is not ASCII, such as a zero-width space or a non-breaking space, which
+#: a page puts into text that is copied from it and which no one can see.
+_NOT_A_KEY_CHARACTER = re.compile(r"[^\x21-\x7e]")
+
+
+def _key_flaw(key: str) -> str | None:
+    """What is wrong with ``key`` as the value of a header, or None; without ever quoting it.
+
+    It says what kind of character, and where it is (counting from 1, in the key as it is):
+    what is said about a key is the one thing that may not hold the key. An empty key is not
+    a flaw here: it is a key that is missing, which has words of its own.
+    """
+    found = _NOT_A_KEY_CHARACTER.search(key)
+    if found is None:
+        return None
+    character = found.group()
+    if character == " ":
+        what = "a space"
+    elif character == "\t":
+        what = "a tab"
+    elif character in "\r\n":
+        what = "a line break"
+    elif ord(character) < 0x20 or ord(character) == 0x7F:
+        what = "a control character"
+    else:
+        what = "a character that is not plain ASCII"
+    return f"{what} at position {found.start() + 1}"
+
+
+def _flawed_key_line(whose: str, flaw: str, variable: str) -> str:
+    """The line for a key that was not sent, in the form of spec 17.9."""
+    return (
+        f"{whose} contains {flaw} \u2014 it was not sent anywhere; copy the key again, exactly "
+        f"as it was given and with nothing around it, and set {variable} to it"
+    )
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -328,10 +380,11 @@ def run_init(
     picked = ask("choice", choices=[str(n) for n in range(1, len(presets) + 1)], default="1")
     preset = presets[int(picked) - 1]
 
-    key = ""
+    key, whose = "", "the key you pasted"
     if preset.needs_key:
         key = environment.get(preset.key_env, "")
         if key:
+            whose = f"the key in {preset.key_env}"
             _say(console, f"[dim]{preset.key_env} is already set; using it[/dim]")
         else:
             key = ask("paste your key (hidden; it is checked once and never saved)", password=True)
@@ -362,18 +415,33 @@ def run_init(
     # with the key it was given. It is added to this copy of the environment and nowhere else.
     held = {preset.key_env: key} if key else {}
     config = load_config(home=str(home), project=None, env={**environment, **held})
-    _say(console, "[dim]checking with one small request...[/dim]")
-    problem = asyncio.run(verify(config, alias))
-    if problem:
-        _say(console, f"[yellow]could not verify:[/yellow] {_outside(_redact(problem, key))}")
-    else:
-        _say(console, "[green]verified[/green] the provider answered")
-
+    _check_the_key(console, verify, config, alias, key, whose)
     _say(
         console,
         "\nTry it:\n  [bold]ncc[/bold]\n  [bold]ncc -p 'what does this project do?'[/bold]",
     )
     return 0
+
+
+def _check_the_key(
+    console: Console, check: Verifier, config: Config, alias: str, key: str, whose: str
+) -> None:
+    """Look at the key, and send the check if it is one that can be sent; say what came of it.
+
+    A key that is not plain (see ``_key_flaw``) is not sent: the line says what is wrong and
+    where, and nothing else is done with it. A check that fails is a warning and not an error
+    of init's own: the file is written, and the key is the person's to fix.
+    """
+    flaw = _key_flaw(key)
+    if flaw is not None:
+        show_error(console, _flawed_key_line(whose, flaw, config.api_key_env_for(alias)))
+        return
+    _say(console, "[dim]checking with one small request...[/dim]")
+    problem = asyncio.run(check(config, alias))
+    if problem:
+        _say(console, f"[yellow]could not verify:[/yellow] {_outside(_redact(problem, key))}")
+    else:
+        _say(console, "[green]verified[/green] the provider answered")
 
 
 def _forget_what_was_learned_about_models(console: Console, cache: Path) -> None:

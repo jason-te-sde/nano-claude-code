@@ -24,10 +24,12 @@ import secrets
 import select
 import subprocess
 import sys
+import threading
 import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -38,15 +40,26 @@ from prompt_toolkit.output.plain_text import PlainTextOutput
 
 from nanoclaude.cli import init as init_module
 from nanoclaude.cli import main as ncc_main
-from nanoclaude.cli.init import PRESETS, ask_on_terminal, render_config, run_init, verify
+from nanoclaude.cli.init import (
+    PRESETS,
+    Preset,
+    _redact,
+    ask_on_terminal,
+    render_config,
+    run_init,
+    verify,
+)
 from nanoclaude.cli.main import EXIT_CODES
 from nanoclaude.config.load import ConfigError, load_config
 from nanoclaude.config.schema import ROLES, Config, PermissionsConfig
+from nanoclaude.conversation.transcript import Transcript, user_text
+from nanoclaude.providers.base import ModelRequest
 from nanoclaude.providers.capabilities import (
     CONSERVATIVE_DEFAULT,
     CapabilityCache,
     capabilities_for,
 )
+from nanoclaude.providers.openai_compat import OpenAICompatClient
 from tests.cli.helpers import INTERRUPTED, colour_codes, plain_console, run_ncc
 
 
@@ -1482,3 +1495,241 @@ def test_the_default_model_of_a_hosted_preset_is_one_the_program_knows(name):
 def test_the_default_openrouter_model_is_given_the_window_it_has():
     preset = PRESETS["openrouter"]
     assert capabilities_for(preset.adapter, preset.default_model).context_window == 1_024_000
+
+
+# --------------------------------------------------------------------------
+# A key the HTTP library refuses
+# --------------------------------------------------------------------------
+# The key reaches the check request and nothing else, and that has to hold for a key the
+# HTTP library will not send. What it says about one is a message with the header in it, in
+# the escaped form of a bytes literal, which no search for the key itself would find: so the
+# key is looked at before anything is sent, and what is shown is checked against every form
+# it can take. These tests use a real client against a socket on this machine, because a
+# transport made for tests never looks at a header.
+
+
+@dataclass
+class Server:
+    """A server on this machine that answers like a provider, and what it was sent."""
+
+    url: str
+    received: list[tuple[str, dict[str, str], bytes]]
+
+
+@pytest.fixture
+def server(monkeypatch: pytest.MonkeyPatch) -> Iterator[Server]:
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    seen: list[tuple[str, dict[str, str], bytes]] = []
+    reply = (
+        b'data: {"choices": [{"delta": {"content": "ok"}, "finish_reason": null}]}\n\n'
+        b'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers.get("content-length", "0")))
+            seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}, body))
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(reply)))
+            self.end_headers()
+            self.wfile.write(reply)
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield Server(f"http://127.0.0.1:{httpd.server_address[1]}", seen)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(5)
+
+
+@pytest.fixture
+def local_preset(server: Server, monkeypatch: pytest.MonkeyPatch) -> str:
+    """A provider on this machine, offered as the last choice in the menu."""
+    monkeypatch.setitem(
+        PRESETS,
+        "local",
+        Preset(
+            "local",
+            "A server on this machine",
+            "openai_compat",
+            "test-model",
+            "LOCAL_TEST_API_KEY",
+            base_url=f"{server.url}/v1",
+        ),
+    )
+    return choice_of("local")
+
+
+def forms_of(secret: str) -> list[str]:
+    """Every way a key can be written into a message: as it is, and escaped."""
+    return [secret, repr(secret)[1:-1], secret.encode("unicode_escape").decode()]
+
+
+async def refused_by_the_library(secret: str, url: str) -> str:
+    """What a real client says when it is given ``secret`` to send, as the check would see it."""
+    client = OpenAICompatClient(secret, model="m", base_url=f"{url}/v1")
+    try:
+        await client.complete(ModelRequest("s", Transcript((user_text("hi"),)), (), 8))
+    except Exception as exc:  # the message is what is looked at
+        return str(exc)
+    finally:
+        await client.aclose()
+    raise AssertionError("the library sent a key it should have refused")
+
+
+@pytest.mark.parametrize("flaw", ["\n", "\r", "\r\n"])
+async def test_the_http_library_refuses_a_key_with_a_line_break_and_says_it_back_escaped(
+    server, key, flaw
+):
+    # The premise of everything below: a message that holds the key, in a form the key's own
+    # text does not appear in.
+    secret = f"{key}{flaw}{key[:8]}"
+    message = await refused_by_the_library(secret, server.url)
+    assert secret not in message, "the premise: not in its own form"
+    assert any(form in message for form in forms_of(secret)[1:]), message
+    assert server.received == []
+
+
+@pytest.mark.parametrize("flaw", ["\n", "\r", "\r\n", "\u200b", "\u00a0", "\u00e9", "\x07"])
+def test_what_is_shown_has_the_key_cut_out_of_every_form_it_can_take(key, flaw):
+    secret = f"{key}{flaw}{key[:8]}"
+    for form in forms_of(secret):
+        shown = _redact(f"Illegal header value b'Bearer {form}' in the request", secret)
+        assert form not in shown
+        assert "Illegal header value" in shown
+
+
+@pytest.mark.parametrize("flaw", ["\n", "\r"])
+async def test_even_a_key_that_got_past_the_check_is_not_said_back_by_the_library(
+    tmp_path, server, key, flaw, monkeypatch
+):
+    # The backstop on its own: the check that looks at the key first is switched off, so the
+    # real client is handed the key, refuses it, and says it back in its own words.
+    monkeypatch.setattr(init_module, "_key_flaw", lambda _key: None)
+    secret = f"{key}{flaw}{key[:8]}"
+    write_home(
+        tmp_path,
+        f'[models.local]\nadapter = "openai_compat"\nmodel = "m"\n'
+        f'base_url = "{server.url}/v1"\napi_key_env = "LOCAL_TEST_API_KEY"\n',
+    )
+    config = load_config(home=str(tmp_path), project=None, env={"LOCAL_TEST_API_KEY": secret})
+    problem = await verify(config, "local")
+    assert problem is not None and "Illegal header value" in problem
+    assert not any(form in problem for form in forms_of(secret))
+    assert server.received == []
+
+
+BAD_KEYS = [
+    ("\n", "a line break"),
+    ("\r", "a line break"),
+    ("\r\n", "a line break"),
+    (" ", "a space"),
+    ("\t", "a tab"),
+    ("\x07", "a control character"),
+    ("\x7f", "a control character"),
+    ("\u200b", "a character that is not plain ASCII"),
+    ("\u00a0", "a character that is not plain ASCII"),
+    ("\u00e9", "a character that is not plain ASCII"),
+]
+
+
+@pytest.mark.parametrize(("flaw", "what"), BAD_KEYS)
+def test_a_pasted_key_with_something_inside_it_is_not_sent_and_the_line_says_where(
+    tmp_path, key, wire, flaw, what
+):
+    secret = f"{key}{flaw}{key[:8]}"
+    wire.answer = says_ok
+    console, buffer = plain_console(200)
+    code = run_init(console, home=tmp_path, ask=Answers("1", secret, None), env={})
+    out = buffer.getvalue()
+    assert code == 0 and config_path(tmp_path).is_file()
+    assert wire.requests == [], "nothing was sent"
+    assert f"error: the key you pasted contains {what} at position {len(key) + 1} \u2014" in out
+    assert "not sent anywhere" in out
+    assert "verified" not in out and "could not verify" not in out
+    for form in forms_of(secret):
+        assert form not in out
+    assert flaw.strip() == "" or flaw not in out  # the character itself is never shown
+
+
+def test_the_line_counts_from_the_first_character_that_is_wrong(tmp_path, key, wire):
+    console, buffer = plain_console(200)
+    run_init(console, home=tmp_path, ask=Answers("1", f"ab cd\ne{key}", None), env={})
+    assert "contains a space at position 3 \u2014" in buffer.getvalue()
+
+
+def test_a_key_already_in_the_environment_is_looked_at_the_same_way(tmp_path, key, wire):
+    secret = f"{key} {key[:4]}"
+    console, buffer = plain_console(200)
+    code = run_init(
+        console, home=tmp_path, ask=Answers("1", None), env={"ANTHROPIC_API_KEY": secret}
+    )
+    out = buffer.getvalue()
+    assert code == 0 and wire.requests == []
+    assert (
+        f"error: the key in ANTHROPIC_API_KEY contains a space at position {len(key) + 1} \u2014"
+        in out
+    )
+    assert not any(form in out for form in forms_of(secret))
+
+
+@pytest.mark.parametrize(("flaw", "what"), [("\n", "a line break"), (" ", "a space")])
+async def test_the_check_itself_will_not_send_a_key_that_is_not_plain(
+    tmp_path, key, wire, flaw, what
+):
+    # Whoever calls it: what is sent is looked at where it is sent.
+    secret = f"{key}{flaw}x"
+    problem = await verify(config_for(tmp_path, "anthropic", secret), "anthropic")
+    assert problem is not None
+    assert f"contains {what} at position {len(key) + 1}" in problem
+    assert "ANTHROPIC_API_KEY" in problem
+    assert not any(form in problem for form in forms_of(secret))
+    assert wire.requests == []
+
+
+@pytest.mark.parametrize("name", ["anthropic", "openai", "openrouter"])
+async def test_a_key_of_plain_characters_is_sent_whatever_it_looks_like(tmp_path, wire, name):
+    # Every printable ASCII character but the space: what a key may be made of.
+    secret = "".join(chr(c) for c in range(0x21, 0x7F))
+    wire.answer = says_ok
+    assert await verify(config_for(tmp_path, name, secret), name) is None
+    assert len(wire.requests) == 1
+
+
+def test_a_good_key_reaches_a_real_server_in_its_header_and_a_bad_one_never_does(
+    tmp_path, key, server, local_preset
+):
+    # The positive control, so that "nothing arrived" means something: the same run, with a
+    # key that is whole, reaches the socket.
+    console, buffer = plain_console(200)
+    code = run_init(console, home=tmp_path, ask=Answers(local_preset, key, None), env={})
+    assert code == 0 and "verified" in buffer.getvalue()
+    ((path, headers, _),) = server.received
+    assert path == "/v1/chat/completions"
+    assert headers["authorization"] == f"Bearer {key}"
+
+    server.received.clear()
+    bad = f"{key}\n{key[:8]}"
+    console, buffer = plain_console(200)
+    run_init(console, home=tmp_path, ask=Answers("y", local_preset, bad, None), env={})
+    assert server.received == []
+    out = buffer.getvalue()
+    assert f"contains a line break at position {len(key) + 1}" in out
+    assert not any(form in out for form in forms_of(bad))
