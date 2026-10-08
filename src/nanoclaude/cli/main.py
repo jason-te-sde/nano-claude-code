@@ -56,7 +56,7 @@ from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import PermissionMode, Policy
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
 from nanoclaude.permissions.rules import RuleSet
-from nanoclaude.permissions.sandbox import Sandbox
+from nanoclaude.permissions.sandbox import Sandbox, is_within
 from nanoclaude.providers.base import CredentialsError, ModelError
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CapabilityCache
 from nanoclaude.tools.base import sanitize
@@ -223,7 +223,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-p", "--print", dest="prompt", metavar="PROMPT", help="run once and exit")
     # No default: whether it was given at all is what says it has no use without a prompt.
     parser.add_argument("--output-format", choices=_OUTPUT_FORMATS)
-    parser.add_argument("--root", default=".", help="working directory (default: cwd)")
+    # No default: whether it was given at all is what says it was meant. Left out it is the
+    # working directory, and a working directory that would put a whole home directory in
+    # the sandbox is refused (see _refuse_a_root_that_is_too_wide).
+    parser.add_argument(
+        "--root",
+        default=None,
+        help="working directory (default: cwd, but never a home directory or / unless named)",
+    )
     parser.add_argument("--model", metavar="ALIAS", help="model to use for the main role")
     parser.add_argument("--role", action="append", default=[], metavar="ROLE=ALIAS")
     parser.add_argument("--mode", choices=[mode.value for mode in PermissionMode])
@@ -292,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
             raise UsageError(
                 "no prompt and no terminal — pass a prompt with -p, or run ncc in a terminal"
             )
-        settings = _settings(args)
+        settings = _settings(args, home)
         _warn_about_switches(args, err)
         if args.prompt is None:
             return asyncio.run(
@@ -361,7 +368,7 @@ def _init(args: argparse.Namespace, home: Path, err: Console, typed: Sequence[st
         return EXIT_CODES["stopped"]
 
 
-def _settings(args: argparse.Namespace) -> _Settings:
+def _settings(args: argparse.Namespace, home: Path) -> _Settings:
     mode = _permission_mode(args)
     roles = _role_overrides(args.role)
     # Given and empty is not left out: "$UNSET" in a script says something went wrong, and a
@@ -376,13 +383,47 @@ def _settings(args: argparse.Namespace) -> _Settings:
                 f"--model {args.model} and --role main={alias} say different things about the "
                 "main role — pass only one of them"
             )
-    root = _directory("--root", args.root)
+    root = _directory("--root", "." if args.root is None else args.root)
+    if args.root is None:
+        _refuse_a_root_that_is_too_wide(root, home)
     return _Settings(
         root=root,
         roots=(root, *(_directory("--add-dir", raw) for raw in args.add_dir)),
         mode=mode,
         roles=roles,
     )
+
+
+def _refuse_a_root_that_is_too_wide(root: str, home: Path) -> None:
+    """Stop, as a usage error, when the directory ncc was run in would put too much in reach.
+
+    The sandbox is whatever the root holds, and a root that holds a home directory holds the
+    session store (the whole conversation, tool output included), the shell's startup files
+    and every other project there is. That is never what running ``ncc`` somewhere means, so
+    it is refused unless ``--root`` names it, which says it was meant. Three cases, from the
+    widest: the filesystem root; a home directory, the person's own and the one ncc keeps its
+    files in, which are the same unless ``NANOCLAUDE_HOME`` says otherwise; and a directory
+    that holds one of them.
+    """
+    if root == "/":
+        raise UsageError(
+            "the current directory is the filesystem root — every file on this machine would "
+            "be in reach; run ncc from a project directory, or pass --root / if you mean it"
+        )
+    homes = [os.path.realpath(home)]
+    with contextlib.suppress(RuntimeError):  # no home can be found for this user at all
+        homes.append(os.path.realpath(Path.home()))
+    if root in homes:
+        raise UsageError(
+            "the current directory is your home directory — every file in it would be in "
+            "reach; run ncc from a project directory, or pass --root ~ if you mean it"
+        )
+    if any(is_within(root, held) for held in homes):
+        raise UsageError(
+            "the current directory contains your home directory — every file in it would be "
+            f"in reach; run ncc from a project directory, or pass --root {shlex.quote(root)} "
+            "if you mean it"
+        )
 
 
 def _permission_mode(args: argparse.Namespace) -> PermissionMode:
