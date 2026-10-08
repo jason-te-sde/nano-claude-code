@@ -30,6 +30,7 @@ from nanoclaude.conversation.transcript import (
 )
 from nanoclaude.providers.base import (
     CredentialsError,
+    EmptyReplyError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -230,7 +231,7 @@ class StreamAccumulator:
                 call_id, name = meta
                 blocks.append(ToolUseBlock(call_id, name, self._decode(index, name)))
         if not blocks:
-            raise ModelError("the provider returned no content blocks")
+            raise EmptyReplyError("the provider returned no content blocks")
         return ModelReply(tuple(blocks), self._stop, self._usage, self._model)
 
     def _decode(self, index: int, name: str) -> Mapping[str, Any]:

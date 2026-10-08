@@ -19,6 +19,7 @@ from nanoclaude.conversation.transcript import (
 )
 from nanoclaude.providers.base import (
     CredentialsError,
+    EmptyReplyError,
     ModelClient,
     ModelError,
     ModelReply,
@@ -430,7 +431,7 @@ def test_a_stream_with_no_content_at_all_is_a_usable_error():
     # the truncation ones above.
     accumulator = ChunkAccumulator(model="gpt-5")
     accumulator.handle({"choices": [{"delta": {}, "finish_reason": "stop"}]})
-    with pytest.raises(ModelError, match="no content"):
+    with pytest.raises(EmptyReplyError, match="no content"):
         accumulator.result()
 
 

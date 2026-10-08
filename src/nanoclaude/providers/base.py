@@ -170,6 +170,22 @@ class CredentialsError(ModelError):
         super().__init__(message, retryable=False, status=status)
 
 
+class EmptyReplyError(ModelError):
+    """The provider took the request and answered with nothing in it: no text, call or thinking.
+
+    Not a failure of the request. The key was accepted, the model exists, and the stream
+    ended as a stream does; there was simply nothing in it. A reasoning model that spends
+    its whole output cap on thinking nobody can see sends exactly this. A front end that
+    only wants to know whether the provider answers (``ncc init``'s key check) tells it
+    apart from a refusal, and from a connection that did not work. It is a
+    :class:`ModelError` so that whatever handles those still handles this, and it takes no
+    ``retryable``: asked again, the same model spends its cap the same way.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, retryable=False)
+
+
 @runtime_checkable
 class ModelClient(Protocol):
     """Something that answers a :class:`ModelRequest`.

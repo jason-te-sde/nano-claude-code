@@ -25,6 +25,7 @@ from nanoclaude.providers.anthropic import (
 )
 from nanoclaude.providers.base import (
     CredentialsError,
+    EmptyReplyError,
     ModelClient,
     ModelError,
     ModelReply,
@@ -158,7 +159,7 @@ def test_a_stream_with_no_content_blocks_at_all_is_a_usable_error():
     accumulator.handle("message_start", {"message": {"usage": {"input_tokens": 5}}})
     accumulator.handle("message_delta", {"delta": {"stop_reason": "end_turn"}, "usage": {}})
     accumulator.handle("message_stop", {})
-    with pytest.raises(ModelError, match="no content blocks"):
+    with pytest.raises(EmptyReplyError, match="no content blocks"):
         accumulator.result()
 
 
@@ -789,7 +790,7 @@ async def test_a_stream_that_closes_after_a_finished_tool_call_without_message_s
 
 
 async def test_a_stream_that_closes_before_anything_arrived_is_still_no_content():
-    with pytest.raises(ModelError, match="no content blocks") as caught:
+    with pytest.raises(EmptyReplyError, match="no content blocks") as caught:
         await complete_from(arriving(events_of("anthropic_text.jsonl")[:1]))
     assert caught.value.partial is None
 

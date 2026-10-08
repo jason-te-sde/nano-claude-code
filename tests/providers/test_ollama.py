@@ -17,6 +17,7 @@ from nanoclaude.conversation.transcript import (
 )
 from nanoclaude.providers.base import (
     CredentialsError,
+    EmptyReplyError,
     ModelClient,
     ModelError,
     ModelReply,
@@ -478,7 +479,7 @@ async def test_a_stream_with_no_content_at_all_is_a_usable_error():
         return stream_response([{"done": True, "done_reason": "stop"}])
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
-        with pytest.raises(ModelError, match="no content"):
+        with pytest.raises(EmptyReplyError, match="no content"):
             await OllamaClient(model="m", client=http).complete(
                 ModelRequest("s", Transcript((user_text("hi"),)), (), 64)
             )
@@ -693,7 +694,7 @@ async def test_a_stream_that_ends_after_text_without_its_done_line_was_cut_off()
 
 
 async def test_a_stream_that_ends_before_anything_arrived_is_still_no_content():
-    with pytest.raises(ModelError, match="no content") as caught:
+    with pytest.raises(EmptyReplyError, match="no content") as caught:
         await complete_from(arriving([]))
     assert caught.value.partial is None
 

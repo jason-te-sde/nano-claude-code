@@ -31,6 +31,7 @@ from nanoclaude.conversation.transcript import (
 )
 from nanoclaude.providers.base import (
     CredentialsError,
+    EmptyReplyError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -250,7 +251,7 @@ class ChunkAccumulator:
                 )
             )
         if not blocks:
-            raise ModelError("the provider returned no content")
+            raise EmptyReplyError("the provider returned no content")
         return ModelReply(tuple(blocks), self._stop, self._usage, self._model)
 
 

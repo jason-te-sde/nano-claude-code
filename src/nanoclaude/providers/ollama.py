@@ -32,6 +32,7 @@ from nanoclaude.conversation.transcript import (
     Transcript,
 )
 from nanoclaude.providers.base import (
+    EmptyReplyError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -231,7 +232,7 @@ class OllamaClient:
         blocks.extend(calls)
         stop = StopKind.TOOL_USE if calls else StopKind.END_TURN
         if not blocks:
-            raise ModelError("ollama returned no content")
+            raise EmptyReplyError("ollama returned no content")
         return ModelReply(tuple(blocks), stop, usage, self._model)
 
 
