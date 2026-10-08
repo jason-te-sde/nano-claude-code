@@ -1607,7 +1607,9 @@ async def test_the_http_library_refuses_a_key_with_a_line_break_and_says_it_back
     assert server.received == []
 
 
-@pytest.mark.parametrize("flaw", ["\n", "\r", "\r\n", "\u200b", "\u00a0", "\u00e9", "\x07"])
+@pytest.mark.parametrize(
+    "flaw", ["\n", "\r", "\r\n", "\u200b", "\u00a0", "\u00e9", "\x07", "'\"", "\\"]
+)
 def test_what_is_shown_has_the_key_cut_out_of_every_form_it_can_take(key, flaw):
     secret = f"{key}{flaw}{key[:8]}"
     for form in forms_of(secret):
