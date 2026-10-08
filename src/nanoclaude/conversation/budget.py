@@ -7,8 +7,8 @@ and a constant would be wrong for both.
 The fourth verdict is the one that matters. If the system prompt, tools and
 project map alone do not fit, compaction cannot help -- there is no
 conversation to compact -- and saying "compacting..." in a loop is the worst
-possible behaviour. The error names the fixed part that is too big and the
-flag that changes it.
+possible behaviour. The error says what is too big and what a person can change
+about it.
 """
 
 from __future__ import annotations
@@ -108,7 +108,8 @@ class Budget:
         fixed = self.fixed_cost(system, tools)
         raise ContextTooSmallError(
             f"the system prompt and tools alone need about {fixed} tokens, and this "
-            f"model's window is {self.capabilities.context_window}. Compacting cannot "
-            "help. Use a model with a larger window (--model), or reduce the project "
-            "map depth in your config."
+            f"model's window is {self.capabilities.context_window}, so compacting cannot "
+            "help \u2014 use a model with a larger window (--model), set context_window "
+            "for this model in your config if the server really has more, or shorten "
+            "your NANO.md"
         )

@@ -45,9 +45,10 @@ class FileTooLargeError(FileSystemError):
 
     def __init__(self, path: str, size: int) -> None:
         self.reason = f"{path} is {size} bytes, over the {MAX_READ_BYTES}-byte read limit"
-        super().__init__(
-            f"{self.reason}. Use Grep to search it, or Bash to slice out the part you need."
-        )
+        # Grep, not Read with an offset: Read refuses the whole file whatever window it is asked
+        # for, so offering it would send the model to the same refusal. There is no Bash tool to
+        # name either.
+        super().__init__(f"{self.reason}. Use Grep to search it.")
 
 
 class BinaryFileError(FileSystemError):

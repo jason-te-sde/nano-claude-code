@@ -224,3 +224,24 @@ def test_budget_is_hashable():
     budget = Budget(BIG)
     assert isinstance(budget, Hashable)
     assert hash(budget) == hash(Budget(BIG))
+
+
+def test_the_impossible_error_offers_only_what_a_person_can_change():
+    # It once said to reduce a "project map depth" in the config, which is not a setting.
+    # Each thing it names is checked against where that thing lives.
+    import dataclasses
+
+    from nanoclaude.cli.main import build_parser
+    from nanoclaude.config.schema import ModelConfig
+
+    with pytest.raises(ContextTooSmallError) as exc_info:
+        Budget(SMALL).require_fits(Transcript(), "word " * 20_000, "")
+    said = str(exc_info.value)
+    assert "depth" not in said and "project map" not in said
+    flags = {flag for action in build_parser()._actions for flag in action.option_strings}
+    assert "--model" in said and "--model" in flags
+    assert "context_window" in said
+    assert "context_window" in {field.name for field in dataclasses.fields(ModelConfig)}
+    assert "NANO.md" in said
+    # And it is in the form of spec 17.9: what happened, a dash, what to do.
+    assert " \u2014 " in said and said.split(" \u2014 ")[0].count("tokens") >= 1

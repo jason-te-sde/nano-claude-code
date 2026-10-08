@@ -53,9 +53,17 @@ from nanoclaude.conversation.transcript import (
     user_text,
     validate,
 )
+from nanoclaude.permissions.policy import PermissionRequest
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.prompts import SYSTEM_PROMPT
-from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, StopKind, Usage
+from nanoclaude.providers.base import (
+    ModelError,
+    ModelReply,
+    ModelRequest,
+    StopKind,
+    ToolSpec,
+    Usage,
+)
 from nanoclaude.providers.capabilities import (
     CONSERVATIVE_DEFAULT,
     Capabilities,
@@ -66,6 +74,7 @@ from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, calls_many, cut_off, says
 from nanoclaude.testing.session import ScriptedClient, ScriptedSession, build_session
 from nanoclaude.tools.base import ToolContext, ToolOutcome
+from nanoclaude.tools.registry import ToolRegistry, default_registry
 
 #: A model id neither the capability table nor the price book has heard of. Its
 #: cost is unknown, and it gets the conservative capabilities unless a test gives
@@ -959,7 +968,7 @@ async def test_the_context_is_assembled_once_for_each_request_and_shared_with_th
 
 async def test_a_window_smaller_than_the_fixed_prompt_cannot_be_compacted_and_says_so(tmp_repo):
     session = build_session(tmp_repo, [says("never asked")], context_window=2_000)
-    with pytest.raises(ContextTooSmallError, match="Compacting cannot help"):
+    with pytest.raises(ContextTooSmallError, match="compacting cannot help"):
         await session.run("hello")
     assert session.model.requests == []  # refused before anything was sent
 
@@ -3612,3 +3621,50 @@ async def test_a_client_that_cannot_be_made_leaves_no_request_open(tmp_repo, mon
         await session.run("hello")
     assert stage.events == []
     assert stage.open == 0
+
+
+# --------------------------------------------------------------------------
+# What the prompt says about running commands follows the tools the session has
+# --------------------------------------------------------------------------
+
+
+class _Shell:
+    """A tool named Bash, for a registry that has one. It runs nothing."""
+
+    name = "Bash"
+    read_only = False
+
+    def spec(self) -> ToolSpec:
+        return ToolSpec("Bash", "Run a command.", {"type": "object", "properties": {}})
+
+    def permission_request(
+        self,
+        ctx: ToolContext,  # noqa: ARG002 - the protocol's signature
+        arguments: Mapping[str, Any],  # noqa: ARG002 - the protocol's signature
+    ) -> PermissionRequest:
+        return PermissionRequest("Bash", "true")
+
+    async def run(
+        self,
+        ctx: ToolContext,  # noqa: ARG002 - the protocol's signature
+        call_id: str,
+        arguments: Mapping[str, Any],  # noqa: ARG002 - the protocol's signature
+    ) -> ToolOutcome:
+        return ToolOutcome(call_id, "")
+
+
+async def test_a_session_without_a_tool_that_runs_commands_is_not_told_to_run_tests(tmp_repo):
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert "After changing code, run the project's tests" not in system
+    assert "cannot run commands" in system
+
+
+async def test_a_session_whose_registry_has_bash_is_told_to_run_tests(tmp_repo):
+    session = build_session(tmp_repo, [says("ok")])
+    session.registry = ToolRegistry([*default_registry(), _Shell()])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert "After changing code, run the project's tests" in system
+    assert "cannot run commands" not in system

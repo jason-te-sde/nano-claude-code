@@ -12,6 +12,7 @@ Nothing here retrieves code. See spec 7.2.
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Collection
 from dataclasses import dataclass
 
 from nanoclaude.context.git import run_git
@@ -52,12 +53,25 @@ def environment_block(root: str, *, depth: int = 3) -> str:
 
 
 def assemble(
-    root: str, *, cwd: str, home: str | None, tool_protocol: str | None = None, depth: int = 3
+    root: str,
+    *,
+    cwd: str,
+    home: str | None,
+    tool_protocol: str | None = None,
+    depth: int = 3,
+    tools: Collection[str] = (),
 ) -> AssembledContext:
+    """The system prompt and the environment block, for a session that has ``tools``.
+
+    The names of the tools are what the prompt may say the session can do: it is told to
+    run the tests only when one of them runs commands.
+    """
     from nanoclaude.prompts import build_system_prompt
 
     instructions = load_instructions(root, cwd=cwd, home=home)
     return AssembledContext(
-        system=build_system_prompt(root, instructions=instructions, tool_protocol=tool_protocol),
+        system=build_system_prompt(
+            root, instructions=instructions, tool_protocol=tool_protocol, tools=tools
+        ),
         environment=environment_block(root, depth=depth),
     )
