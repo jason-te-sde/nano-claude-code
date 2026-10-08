@@ -325,25 +325,98 @@ def _flawed_key_line(whose: str, flaw: str, variable: str) -> str:
     )
 
 
-def _write_private(path: Path, text: str) -> None:
+class _TargetExists(Exception):
+    """The config is there, and the write was not told that replacing it was agreed to."""
+
+
+def _make_private_directories(directory: Path) -> None:
+    """Make ``directory`` and every part of it that is missing, each with mode 0700.
+
+    Only what is made here is touched: a directory that was already there keeps its mode.
+    ``mkdir`` filters its mode by the umask, so that with a umask of 0177 or tighter (any bit
+    of 0300) a new directory would lose its owner's write or search bit and nothing could be
+    made in it; the mode is set again after, and the directory that holds a private config
+    is private too.
+    """
+    missing = []
+    for candidate in (directory, *directory.parents):
+        if candidate.exists():
+            break
+        missing.append(candidate)
+    for candidate in reversed(missing):
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        candidate.chmod(0o700)
+
+
+def _write_private(path: Path, text: str, *, replace: bool) -> None:
     """Write ``text`` to ``path``, which exists with mode 0600 from the moment it does.
 
     The file is made by ``os.open`` with the mode in its arguments, so that no other user
-    can read it between its being made and its being made private, and is then moved into
-    place: a file that was already there is replaced by one that is private, whatever its
-    own mode was, and one that was interrupted leaves no half of a config.
+    can read it between its being made and its being made private; that mode is filtered by
+    the umask (0277 makes it 0400, 0777 makes it 0000), so it is set on the descriptor too.
+    It is then moved into place: a file that was already there is replaced by one that is
+    private, whatever its own mode was, and one that was interrupted leaves no half of a
+    config. ``O_EXCL`` refuses a temporary name that is already there, a link included, so
+    that nothing is written through one.
+
+    ``replace`` says whether replacing a config is agreed to. When it is not, the file is
+    put in place by a hard link, which fails if anything is there, a dangling link included,
+    and :class:`_TargetExists` is raised and nothing is replaced: a config that appeared
+    after the last look is somebody's work.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _make_private_directories(path.parent)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), 0o600)
             handle.write(text)
-        temporary.replace(path)
+        if replace:
+            temporary.replace(path)
+        else:
+            try:
+                os.link(temporary, path)
+            except FileExistsError as exc:
+                raise _TargetExists from exc
+            with contextlib.suppress(OSError):
+                temporary.unlink()
     except BaseException:
         with contextlib.suppress(OSError):
             temporary.unlink()
         raise
+
+
+def _may_replace(console: Console, ask: Ask, target: Path) -> bool:
+    """Ask whether the config that is there may be replaced; True only for a plain yes."""
+    _say(console, f"[yellow]{_outside(str(target))} already exists.[/yellow]")
+    if ask("overwrite?", choices=["y", "n"], default="n") != "y":
+        _say(console, "[dim]left alone[/dim]")
+        return False
+    return True
+
+
+def _publish(console: Console, ask: Ask, target: Path, text: str, agreed: bool) -> bool:
+    """Put the config in place; False when the person, asked, would not have it replaced.
+
+    Raises :class:`~nanoclaude.config.load.ConfigError` when it cannot be written.
+    """
+    try:
+        try:
+            _write_private(target, text, replace=agreed)
+        except _TargetExists:
+            if not _may_replace(console, ask, target):
+                return False
+            _write_private(target, text, replace=True)
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        raise ConfigError(
+            f"cannot write {target} ({reason}) — check that the directory exists and that you "
+            "can write to it"
+        ) from exc
+    return True
 
 
 def run_init(
@@ -367,11 +440,9 @@ def run_init(
     """
     environment = dict(os.environ if env is None else env)
     target = home / CONFIG_DIRNAME / CONFIG_FILENAME
-    if os.path.lexists(target):
-        _say(console, f"[yellow]{_outside(str(target))} already exists.[/yellow]")
-        if ask("overwrite?", choices=["y", "n"], default="n") != "y":
-            _say(console, "[dim]left alone[/dim]")
-            return 0
+    agreed = os.path.lexists(target)
+    if agreed and not _may_replace(console, ask, target):
+        return 0
 
     _say(console, "[bold]Which provider?[/bold]")
     presets = list(PRESETS.values())
@@ -392,14 +463,8 @@ def run_init(
     model = ask("model", default=preset.default_model).strip() or preset.default_model
 
     alias = preset.key
-    try:
-        _write_private(target, render_config(preset, alias, model))
-    except OSError as exc:
-        reason = exc.strerror or type(exc).__name__
-        raise ConfigError(
-            f"cannot write {target} ({reason}) — check that the directory exists and that you "
-            "can write to it"
-        ) from exc
+    if not _publish(console, ask, target, render_config(preset, alias, model), agreed):
+        return 0
     _say(console, f"[green]wrote[/green] {_outside(str(target))}")
     _forget_what_was_learned_about_models(console, target.parent / CACHE_FILENAME)
 

@@ -109,6 +109,23 @@ class Answers:
         return [message for message, kwargs in self.asked if kwargs.get("password")]
 
 
+class Racing(Answers):
+    """Answers, and something that happens while one question waits for its answer.
+
+    ``do`` runs when ``when`` is asked, before it is answered: the person is at the keyboard
+    and another process is not.
+    """
+
+    def __init__(self, *answers: str | None, when: str, do: Callable[[], None]) -> None:
+        super().__init__(*answers)
+        self._when, self._do = when, do
+
+    def __call__(self, message: str, **kwargs: Any) -> str:
+        if message == self._when:
+            self._do()
+        return super().__call__(message, **kwargs)
+
+
 class Verifier:
     """Stands in for the request that checks the key; says what it was asked, answers as told."""
 
@@ -414,6 +431,84 @@ def test_the_config_is_not_world_readable_whatever_the_umask(tmp_path, key):
     assert config_path(tmp_path).stat().st_mode & 0o777 == 0o600
 
 
+def removable(root: Path) -> None:
+    """Make everything under ``root`` ours to remove again, whatever a test left it as.
+
+    A test that makes the umask hostile and finds a regression leaves directories nobody can
+    enter, and pytest then fails to clean them up in every session after it.
+    """
+    pending = [root] if root.exists() else []
+    while pending:
+        path = pending.pop()
+        if path.is_symlink():
+            continue
+        path.chmod(0o700)  # before it is listed: a directory with no mode cannot be
+        if path.is_dir():
+            pending.extend(path.iterdir())
+
+
+@pytest.mark.parametrize("mask", [0o000, 0o022, 0o277, 0o777], ids=lambda m: f"umask{m:04o}")
+def test_the_config_is_0600_whatever_the_umask(tmp_path, key, mask):
+    # The mode given to os.open is filtered by the umask, so that a umask of 0277 makes the
+    # file 0400 and 0777 makes it 0000: not private, but unreadable, and a config nobody can
+    # read is the error init exists to prevent. The mode is set on the descriptor too.
+    before = os.umask(mask)
+    try:
+        ran = init(tmp_path, "1", key, None)
+        observed = config_path(tmp_path).stat().st_mode & 0o777
+    finally:
+        os.umask(before)
+        removable(tmp_path / ".nanoclaude")
+    assert ran.code == 0
+    assert observed == 0o600
+    assert [p.name for p in (tmp_path / ".nanoclaude").iterdir()] == ["config.toml"]
+
+
+@pytest.mark.parametrize("mask", [0o000, 0o022, 0o177, 0o277, 0o777], ids=lambda m: f"umask{m:04o}")
+def test_a_directory_init_makes_is_private_and_usable_whatever_the_umask(tmp_path, key, mask):
+    # mkdir filters its mode by the umask too: with 0177 or tighter (any bit of 0300) the new
+    # directory would lose its owner's write or search bit, and nothing could be made in it.
+    home = tmp_path / "a" / "b"
+    before = os.umask(mask)
+    try:
+        ran = init(home, "1", key, None)
+        modes = {
+            made: made.stat().st_mode & 0o777
+            for made in (tmp_path / "a", home, home / ".nanoclaude")
+        }
+    finally:
+        os.umask(before)
+        removable(tmp_path / "a")
+    assert ran.code == 0
+    assert modes == dict.fromkeys(modes, 0o700)
+    assert config_path(home).is_file()
+
+
+def test_a_dangling_link_where_the_directory_goes_is_an_error_and_is_not_made_into_one(
+    tmp_path, key
+):
+    (tmp_path / ".nanoclaude").symlink_to(tmp_path / "nowhere")
+    with pytest.raises(ConfigError, match=r"cannot write .*config\.toml"):
+        run_init(
+            plain_console()[0],
+            home=tmp_path,
+            ask=Answers("1", key, None),
+            env={},
+            verify=Verifier(),
+        )
+    assert (tmp_path / ".nanoclaude").is_symlink()
+    assert not (tmp_path / "nowhere").exists()
+
+
+def test_a_directory_that_was_already_there_is_left_as_it_is(tmp_path, key):
+    tmp_path.chmod(0o755)
+    (tmp_path / ".nanoclaude").mkdir(mode=0o750)
+    (tmp_path / ".nanoclaude").chmod(0o750)
+    init(tmp_path, "1", key, None)
+    assert tmp_path.stat().st_mode & 0o777 == 0o755
+    assert (tmp_path / ".nanoclaude").stat().st_mode & 0o777 == 0o750
+
+
 def test_the_config_is_private_from_the_moment_it_exists(tmp_path, key, monkeypatch):
     # Not written first and made private after: between the two, any other user could read it.
     # So every file made under the home is made with the private mode, by the call that makes it.
@@ -519,6 +614,112 @@ def test_only_a_plain_y_is_consent(tmp_path, answer):
     assert config_path(tmp_path).read_text() == "# mine\n"
 
 
+# A file that was not there when the questions began, and is there when the answer is written:
+# somebody else's work, made while the person was choosing a model. The answer to "is there a
+# config?" was no, and that is not consent to replace one.
+
+
+def appears(home: Path, text: str = "# somebody else's\n") -> Callable[[], None]:
+    return lambda: write_home(home, text)
+
+
+def test_a_config_that_appears_while_the_questions_are_asked_is_not_replaced_unasked(tmp_path, key):
+    console, buffer = plain_console(100)
+    asking = Racing("1", key, None, "n", when="model", do=appears(tmp_path))
+    checking = Verifier()
+    code = run_init(console, home=tmp_path, ask=asking, env={}, verify=checking)
+    assert code == 0
+    assert config_path(tmp_path).read_text() == "# somebody else's\n"
+    assert checking.calls == [], (
+        "and nothing was checked, or cleared, for a setup that did not happen"
+    )
+    assert "left alone" in buffer.getvalue()
+    assert [p.name for p in (tmp_path / ".nanoclaude").iterdir()] == ["config.toml"]
+
+
+def test_the_question_about_a_config_that_appeared_is_the_one_asked_about_any_other(tmp_path, key):
+    asking = Racing("1", key, None, "n", when="model", do=appears(tmp_path))
+    run_init(plain_console()[0], home=tmp_path, ask=asking, env={}, verify=Verifier())
+    (message, kwargs) = asking.asked[-1]
+    assert (message, kwargs["choices"], kwargs["default"]) == ("overwrite?", ["y", "n"], "n")
+    assert len(asking.asked) == 4
+
+
+def test_a_config_that_appeared_is_replaced_when_the_person_then_says_yes(tmp_path, key):
+    cache = seeded_cache(tmp_path)
+    asking = Racing("1", key, None, "y", when="model", do=appears(tmp_path))
+    checking = Verifier()
+    code = run_init(plain_console()[0], home=tmp_path, ask=asking, env={}, verify=checking)
+    assert code == 0
+    assert load_config(home=str(tmp_path), project=None, env={}).roles.main == "anthropic"
+    assert config_path(tmp_path).stat().st_mode & 0o777 == 0o600
+    assert len(checking.calls) == 1
+    assert cache.get("ollama", "qwen3-coder") is None
+    assert [p.name for p in (tmp_path / ".nanoclaude").iterdir()] == ["config.toml"]
+
+
+def test_declining_the_config_that_appeared_leaves_the_cache_as_it_was(tmp_path, key):
+    cache = seeded_cache(tmp_path)
+    asking = Racing("1", key, None, "n", when="model", do=appears(tmp_path))
+    run_init(plain_console()[0], home=tmp_path, ask=asking, env={}, verify=Verifier())
+    assert cache.get("ollama", "qwen3-coder") == CONSERVATIVE_DEFAULT
+
+
+def test_a_dangling_link_that_appears_is_a_config_that_appeared(tmp_path, key):
+    def link() -> None:
+        (tmp_path / ".nanoclaude").mkdir(exist_ok=True)
+        config_path(tmp_path).symlink_to(tmp_path / "nowhere")
+
+    asking = Racing("1", key, None, "n", when="model", do=link)
+    run_init(plain_console()[0], home=tmp_path, ask=asking, env={}, verify=Verifier())
+    assert config_path(tmp_path).is_symlink() and not config_path(tmp_path).exists()
+    assert len(asking.asked) == 4
+
+
+def test_a_config_that_was_agreed_to_is_replaced_without_a_second_question(tmp_path, key):
+    write_home(tmp_path, "# mine\n")
+    ran = init(tmp_path, "y", "1", key, None)
+    assert [m for m, _ in ran.ask.asked].count("overwrite?") == 1
+
+
+def test_a_file_planted_at_the_temporary_name_is_refused_and_nothing_goes_through_it(tmp_path, key):
+    victim = tmp_path / "victim"
+    victim.write_text("precious")
+    (tmp_path / ".nanoclaude").mkdir()
+    (tmp_path / ".nanoclaude" / f".config.toml.{os.getpid()}.tmp").symlink_to(victim)
+    with pytest.raises(ConfigError, match=r"cannot write .*config\.toml"):
+        run_init(
+            plain_console()[0],
+            home=tmp_path,
+            ask=Answers("1", key, None),
+            env={},
+            verify=Verifier(),
+        )
+    assert victim.read_text() == "precious"
+    assert not config_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize("agreed", [False, True])
+def test_an_interrupt_in_the_middle_of_the_write_leaves_no_temporary_file(
+    tmp_path, key, monkeypatch, agreed
+):
+    def interrupted(*_args: Any, **_kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "replace" if agreed else "link", interrupted)
+    answers = ["y", "1", key, None] if agreed else ["1", key, None]
+    if agreed:
+        write_home(tmp_path, "# mine\n")
+    with pytest.raises(KeyboardInterrupt):
+        run_init(
+            plain_console()[0], home=tmp_path, ask=Answers(*answers), env={}, verify=Verifier()
+        )
+    left = sorted(p.name for p in (tmp_path / ".nanoclaude").iterdir())
+    assert left == (["config.toml"] if agreed else [])
+    if agreed:
+        assert config_path(tmp_path).read_text() == "# mine\n"
+
+
 # --------------------------------------------------------------------------
 # What ncc has learned about models is forgotten when the setup is redone
 # --------------------------------------------------------------------------
@@ -536,6 +737,21 @@ def test_running_init_forgets_the_cached_capabilities_so_every_model_is_probed_a
     init(tmp_path, "1", key, None)
     assert cache.get("ollama", "qwen3-coder") is None
     assert not (tmp_path / ".nanoclaude" / "capabilities.json").exists()
+
+
+def test_a_write_that_fails_leaves_what_was_learned_as_it_was(tmp_path, key):
+    # Forgotten when the setup is redone, and a setup that did not happen is not one.
+    cache = seeded_cache(tmp_path)
+    config_path(tmp_path).mkdir()  # a directory where the file goes: the write cannot finish
+    with pytest.raises(ConfigError):
+        run_init(
+            plain_console()[0],
+            home=tmp_path,
+            ask=Answers("y", "1", key, None),
+            env={},
+            verify=Verifier(),
+        )
+    assert cache.get("ollama", "qwen3-coder") == CONSERVATIVE_DEFAULT
 
 
 def test_declining_to_replace_the_config_leaves_the_cache_as_it_was(tmp_path):
