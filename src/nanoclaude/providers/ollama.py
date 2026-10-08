@@ -43,7 +43,12 @@ from nanoclaude.providers.base import (
     partial_reply,
 )
 from nanoclaude.providers.capabilities import CONSERVATIVE_DEFAULT, Capabilities
-from nanoclaude.providers.retry import classify_status, connection_lost, unreadable_stream
+from nanoclaude.providers.retry import (
+    NOT_A_REPLY_STREAM,
+    classify_status,
+    connection_lost,
+    unreadable_stream,
+)
 
 DEFAULT_BASE_URL = "http://localhost:11434"
 
@@ -206,6 +211,8 @@ class OllamaClient:
             # The body did not decode, or a line was not JSON. Some of the reply had arrived
             # or it had not: kept and not asked again, or raised as it always was.
             if not (text or calls):
+                if isinstance(exc, json.JSONDecodeError):
+                    raise ModelError(NOT_A_REPLY_STREAM, retryable=False) from exc
                 raise
             partial = partial_reply(["".join(text)], usage, self._model)
             raise unreadable_stream(exc, partial, peer="ollama") from exc
@@ -234,7 +241,7 @@ class OllamaClient:
         if not blocks:
             if not done:
                 # No line said the reply was over, and none carried anything: an empty body.
-                raise ModelError("the provider's answer was not a reply stream")
+                raise ModelError(NOT_A_REPLY_STREAM)
             raise EmptyReplyError("ollama returned no content")
         return ModelReply(tuple(blocks), stop, usage, self._model)
 

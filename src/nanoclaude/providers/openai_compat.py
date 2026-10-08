@@ -41,7 +41,11 @@ from nanoclaude.providers.base import (
     new_call_id,
     partial_reply,
 )
-from nanoclaude.providers.retry import classify_status, classify_stream_error
+from nanoclaude.providers.retry import (
+    NOT_A_REPLY_STREAM,
+    classify_status,
+    classify_stream_error,
+)
 
 _FINISH = {
     "stop": StopKind.END_TURN,
@@ -254,7 +258,7 @@ class ChunkAccumulator:
             if not self._finished:
                 # Not one chunk said the reply was over, and none carried anything: a page, an
                 # empty body, a whole reply that was not streamed. It never was a reply stream.
-                raise ModelError("the provider's answer was not a reply stream")
+                raise ModelError(NOT_A_REPLY_STREAM)
             raise EmptyReplyError("the provider returned no content")
         return ModelReply(tuple(blocks), self._stop, self._usage, self._model)
 

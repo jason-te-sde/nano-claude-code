@@ -39,7 +39,11 @@ from nanoclaude.providers.base import (
     Usage,
     partial_reply,
 )
-from nanoclaude.providers.retry import classify_status, classify_stream_error
+from nanoclaude.providers.retry import (
+    NOT_A_REPLY_STREAM,
+    classify_status,
+    classify_stream_error,
+)
 
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -236,7 +240,7 @@ class StreamAccumulator:
             if not (self._saw_message_start and self._saw_message_stop):
                 # A reply that is empty ran from message_start to message_stop. Anything else
                 # (a page, an empty body, a stream that stopped before it began) never was one.
-                raise ModelError("the provider's answer was not a reply stream")
+                raise ModelError(NOT_A_REPLY_STREAM)
             raise EmptyReplyError("the provider returned no content blocks")
         return ModelReply(tuple(blocks), self._stop, self._usage, self._model)
 

@@ -167,16 +167,25 @@ def unreadable_stream(
     )
 
 
+#: What is said of an answer that was read as a reply stream and was not one: a page where the
+#: stream goes, a proxy's error, a captive portal's sign-in. Not a failure of this program, and
+#: not worth asking again.
+NOT_A_REPLY_STREAM = "the provider's answer was not a reply stream"
+
+
 def classify_stream_error(exc: Exception, partial: ModelReply | None) -> ModelError | None:
     """What a failure inside a stream's loop means, or None to raise it as it came.
 
     A connection that failed is :func:`classify_transport`. Anything else the loop raised
     (httpx.DecodingError, a line that is not JSON, any other ValueError) is kept as a
-    cut-off once some of the reply has arrived, and before that is left as it always was.
+    cut-off once some of the reply has arrived. Before that, a line that is not JSON is
+    :data:`NOT_A_REPLY_STREAM` and the rest is left as it always was.
     """
     if isinstance(exc, httpx.TransportError):
         return classify_transport(exc, partial)
     if partial is None:
+        if isinstance(exc, json.JSONDecodeError):
+            return ModelError(NOT_A_REPLY_STREAM, retryable=False)
         return None
     return unreadable_stream(exc, partial)
 

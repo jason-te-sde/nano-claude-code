@@ -1027,11 +1027,29 @@ async def test_a_line_that_is_not_json_after_text_keeps_what_arrived():
     assert caught.value.partial.blocks == (TextBlock("hel"),)
 
 
-async def test_a_body_that_cannot_be_read_before_anything_arrived_raises_as_it_always_did():
+async def test_a_body_that_cannot_be_decoded_before_anything_arrived_raises_as_it_always_did():
     with pytest.raises(httpx.DecodingError):
         await complete_from(arriving([], then=httpx.DecodingError("bad gzip")))
-    with pytest.raises(json.JSONDecodeError):
-        await complete_from(httpx.Response(200, content=b"data: {oops\n\n"))
+
+
+@pytest.mark.parametrize(
+    "body", [b"data: {oops\n\n", b"data: <html>Sign in to the network</html>\n\n"]
+)
+async def test_a_line_that_is_not_json_before_any_content_is_not_a_reply_stream(body):
+    # A proxy's page, a captive portal, a gateway's error: not a bug in this program, and
+    # not a JSONDecodeError for whoever called it to explain.
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        await complete_from(httpx.Response(200, content=body))
+    assert not isinstance(caught.value, EmptyReplyError)
+    assert caught.value.retryable is False and caught.value.partial is None
+    assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+
+
+async def test_a_line_that_is_not_json_after_reasoning_and_nothing_else_is_still_not_a_reply():
+    seen = wire([{"choices": [{"delta": {"reasoning_content": "hmm"}}]}])
+    with pytest.raises(ModelError, match="not a reply stream") as caught:
+        await complete_from(httpx.Response(200, content=seen + b"data: <html>\n\n"))
+    assert caught.value.partial is None and caught.value.retryable is False
 
 
 async def test_the_usage_the_server_had_reported_is_in_the_partial_reply():
