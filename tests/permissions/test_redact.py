@@ -7,11 +7,19 @@ even a fake one. The AWS documented example key and a bare PEM header are
 published, non-secret values and stay literal.
 """
 
+import base64
+import hashlib
+import time
 from collections.abc import Hashable
 
 import pytest
 
-from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor, shannon_entropy
+from nanoclaude.permissions.redact import (
+    ENTROPY_FLOOR,
+    SECRET_PATH_PATTERNS,
+    Redactor,
+    shannon_entropy,
+)
 
 AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 GITHUB_CLASSIC = "ghp_" + "A" * 36
@@ -130,3 +138,244 @@ def test_shannon_entropy_is_bits_per_character(value, expected):
     # scrub() never passes an empty value (the assignment rule needs 16+
     # characters), so the empty case is pinned here directly.
     assert shannon_entropy(value) == pytest.approx(expected)
+
+
+# ---- the assignment rule, whatever the case of the name
+
+
+def fake_secret(seed: str, length: int = 40) -> str:
+    """A value that looks random to the scanner and is not anybody's: a slice of a hash of
+    ``seed``, the first of them random enough to be caught. Built when the test runs so
+    that no credential-shaped literal is in the file."""
+    for attempt in range(1000):
+        value = hashlib.sha256(f"{seed}/{attempt}".encode()).hexdigest()[:length]
+        if shannon_entropy(value) > ENTROPY_FLOOR + 0.1:
+            return value
+    raise AssertionError("no sample of that length is random enough")
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        'aws_secret_access_key = "{v}"',
+        "api_key = '{v}'",
+        '{{"PASSWORD": "{v}"}}',
+        "{{'api_key': '{v}'}}",
+        "password: {v}",
+        "Password = {v}",
+        "client_secret={v}",
+        'apiKey: "{v}"',
+        "accessToken = '{v}'",
+        'PrivateKey = "{v}"',
+        'db_passwd="{v}"',
+        "export GITHUB_TOKEN={v}",
+        "AUTHTOKEN={v}",
+    ],
+)
+def test_an_assigned_secret_is_redacted_whatever_the_case_of_its_name(template):
+    value = fake_secret(template)
+    text = template.format(v=value)
+    cleaned, count = Redactor().scrub(text)
+    assert value not in cleaned, cleaned
+    assert count == 1, cleaned
+    assert "[redacted:assigned-secret]" in cleaned
+
+
+def test_the_shape_of_what_surrounds_a_redacted_value_is_kept():
+    value = fake_secret("shape")
+    cleaned, _ = Redactor().scrub(f'{{"PASSWORD": "{value}", "user": "ada"}}')
+    assert cleaned == '{"PASSWORD": "[redacted:assigned-secret]", "user": "ada"}'
+    cleaned, _ = Redactor().scrub(f"api_key = '{value}'  # rotate monthly")
+    assert cleaned == "api_key = '[redacted:assigned-secret]'  # rotate monthly"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'tokenizer_name = "sentence-transformers/all-MiniLM-L6-v2"',
+        'tokenizer = "bert-base-uncased-vocabulary-v1"',
+        "max_tokens = 4096000000000000000000",
+        'secretary = "Alexandria-Montgomery-Wellington"',
+        'password_field_label = "Enter your password here, please"',
+        "token_count = 1234567890123456789",
+        'api_key = "a" * 40',
+        "api_key = os.environ['API_KEY_FOR_THE_SERVICE_NAME']",
+    ],
+)
+def test_a_name_that_only_contains_a_secret_word_is_not_a_secret(text):
+    """Letting the name be in any case would catch ``tokenizer``, ``secretary`` and the
+    rest of the words that merely start with one: the keyword has to be a word of the
+    name. A name in capitals keeps the older, broader reading, where there are no word
+    breaks to go by."""
+    assert Redactor().scrub(text) == (text, 0)
+
+
+def test_a_value_that_is_too_short_or_too_regular_is_still_left_alone():
+    for text in ("password = 'hunter2'", "api_key = '" + "ab" * 10 + "'"):
+        assert Redactor().scrub(text) == (text, 0)
+
+
+# ---- a private key block is masked whole
+
+
+def _pem(kind: str = "RSA PRIVATE KEY", lines: int = 4) -> tuple[str, list[str]]:
+    """A block with a body no scanner would take for a key (the bytes are 0..255), made when
+    the test runs. Returns the block and its body lines."""
+    body = base64.b64encode(bytes(range(256)) * 2).decode()
+    rows = [body[i : i + 64] for i in range(0, 64 * lines, 64)]
+    block = "\n".join(["-----BEGIN " + kind + "-----", *rows, "-----END " + kind + "-----"])
+    return block, rows
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "RSA PRIVATE KEY",
+        "PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "EC PRIVATE KEY",
+    ],
+)
+def test_a_private_key_block_is_masked_from_begin_to_end(kind):
+    block, rows = _pem(kind)
+    cleaned, count = Redactor().scrub(f"before\n{block}\nafter")
+    assert cleaned == "before\n[redacted:private-key]\nafter"
+    assert count == 1
+    assert all(row not in cleaned for row in rows)
+
+
+def test_a_pgp_private_key_block_is_masked_whole():
+    block, _ = _pem("PGP PRIVATE KEY BLOCK")
+    cleaned, count = Redactor().scrub(f"x\n{block}\ny")
+    assert (cleaned, count) == ("x\n[redacted:private-key]\ny", 1)
+
+
+def test_two_blocks_are_two_masks_and_the_text_between_them_stays():
+    first, _ = _pem(lines=2)
+    second, _ = _pem("EC PRIVATE KEY", lines=3)
+    cleaned, count = Redactor().scrub(f"{first}\nbetween\n{second}\n")
+    assert cleaned == "[redacted:private-key]\nbetween\n[redacted:private-key]\n"
+    assert count == 2
+
+
+def test_a_block_with_windows_line_endings_is_masked_whole():
+    block, rows = _pem()
+    cleaned, _ = Redactor().scrub(block.replace("\n", "\r\n"))
+    assert all(row not in cleaned for row in rows)
+
+
+def test_a_block_inside_a_json_string_is_masked_whole():
+    block, _ = _pem()
+    cleaned, _ = Redactor().scrub('{"key": "' + block.replace("\n", "\\n") + '", "id": 7}')
+    assert cleaned == '{"key": "[redacted:private-key]", "id": 7}'
+
+
+def test_a_block_whose_lines_are_commented_or_indented_is_masked_whole():
+    block, rows = _pem()
+    for prefix in ("# ", "    ", "// ", "> "):
+        text = "\n".join(prefix + line for line in block.splitlines())
+        cleaned, count = Redactor().scrub(text)
+        assert all(row not in cleaned for row in rows), prefix
+        assert (cleaned, count) == (prefix + "[redacted:private-key]", 1), prefix
+
+
+def test_a_text_with_thousands_of_begin_lines_and_no_end_is_scrubbed_in_linear_time():
+    """Looking for the END line from every BEGIN to the end of the text would square the
+    work; the search stops at the next BEGIN."""
+    text = ("-----BEGIN " + "PRIVATE KEY-----\n") * 20_000
+    started = time.perf_counter()
+    cleaned, count = Redactor().scrub(text)
+    elapsed = time.perf_counter() - started
+    assert count == 20_000 and "BEGIN" not in cleaned
+    assert elapsed < 5, f"{elapsed:.1f}s to scrub 20,000 BEGIN lines"
+
+
+def test_a_block_cut_off_before_its_end_has_its_body_masked_anyway():
+    """What Grep -A or a Read window shows is a block with no end line, and the body is the
+    key."""
+    block, rows = _pem(lines=4)
+    cut = block.rsplit("\n", 1)[0]  # no END line
+    cleaned, count = Redactor().scrub(f"{cut}\nnot part of the key\n")
+    assert all(row not in cleaned for row in rows)
+    assert cleaned == "[redacted:private-key]\nnot part of the key\n"
+    assert count == 1
+
+
+def test_a_cut_off_encrypted_block_is_masked_past_its_two_headers():
+    block, rows = _pem(lines=3)
+    begin, *body = block.split("\n")[:-1]
+    headers = ["Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC," + "0123456789ABCDEF" * 2, ""]
+    cleaned, count = Redactor().scrub("\n".join([begin, *headers, *body]) + "\nnot part of it\n")
+    assert all(row not in cleaned for row in rows)
+    assert (cleaned, count) == ("[redacted:private-key]\nnot part of it\n", 1)
+
+
+def test_a_cut_off_block_inside_a_json_string_has_its_body_masked_too():
+    block, rows = _pem(lines=4)
+    cut = block.rsplit("\n", 1)[0].replace("\n", "\\n")  # the \\n a JSON string has
+    cleaned, _ = Redactor().scrub('{"key": "' + cut)
+    assert all(row not in cleaned for row in rows)
+    assert cleaned == '{"key": "[redacted:private-key]'
+
+
+def test_text_that_merely_follows_a_lone_header_line_is_left_alone():
+    cleaned, _ = Redactor().scrub("-----BEGIN RSA PRIVATE KEY-----\nthe key is stored elsewhere\n")
+    assert cleaned == "[redacted:private-key]\nthe key is stored elsewhere\n"
+
+
+def test_a_public_key_block_and_a_certificate_are_left_alone():
+    for kind in ("PUBLIC KEY", "CERTIFICATE"):
+        block, _ = _pem(kind)
+        assert Redactor().scrub(block) == (block, 0)
+
+
+# ---- the list of paths that are credentials by convention
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".envrc",
+        "svc/.envrc",
+        ".netrc",
+        "home/.npmrc",
+        "pkg/.npmrc",
+        ".pypirc",
+        ".git-credentials",
+        ".docker/config.json",
+        "home/.docker/config.json",
+        ".kube/config",
+        "home/.kube/config",
+        "release/app.jks",
+        "release/debug.keystore",
+        "infra/terraform.tfstate",
+        "infra/terraform.tfstate.backup",
+    ],
+)
+def test_more_credentials_by_convention_are_secret_paths(path):
+    assert Redactor().is_secret_path(f"/p/{path}", path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "certs/server.crt",
+        "certs/ca.crt",
+        "keys/id_rsa.pub",
+        "keys/id_ed25519.pub",
+        "keys/id_ecdsa.pub",
+        "docs/envrc.md",
+        "src/npmrc.py",
+        "docker/config.yaml",
+        ".docker/Dockerfile",
+        ".kube/README.md",
+        "kubeconfig-template.yaml",
+        "infra/main.tf",
+        "infra/tfstate.md",
+        "infra/notes.tfstate.md",
+        "keystore.py",
+    ],
+)
+def test_public_material_and_things_that_only_look_similar_stay_readable(path):
+    assert not Redactor().is_secret_path(f"/p/{path}", path)

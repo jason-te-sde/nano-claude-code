@@ -427,6 +427,24 @@ async def test_a_deny_rule_for_another_tool_does_not_hide_files_from_grep(ctx, t
     assert "secrets/notes.txt" in outcome.content
 
 
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+@pytest.mark.parametrize(
+    "path",
+    [".npmrc", ".kube/config", ".docker/config.json", "release/app.keystore", "main.tfstate"],
+)
+async def test_the_credentials_paths_added_to_the_list_are_dropped_from_matches_too(
+    ctx, tmp_repo, monkeypatch, force_python_fallback, path
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    target = tmp_repo / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("needle: not for the model\n")
+    (tmp_repo / "open.txt").write_text("needle: fine\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle"})
+    assert "not for the model" not in outcome.content
+    assert "open.txt" in outcome.content
+
+
 def test_the_description_is_byte_identical_to_the_spec():
     """It is a prompt. Changing a word needs a design note, so pin the shape."""
     assert GrepTool().spec().description == EXPECTED_DESCRIPTION
