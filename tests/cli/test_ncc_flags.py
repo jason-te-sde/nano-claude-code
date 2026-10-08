@@ -261,19 +261,11 @@ def test_plan_mode_refuses_writes_by_rule(ncc_home, project, serve, capsys):
     assert "mode.plan-read-only" in result.content
 
 
-@pytest.mark.parametrize(
-    "flags",
-    [
-        ["--dangerously-skip-permissions"],
-        ["--mode", "bypass", "--dangerously-skip-permissions"],
-        ["--mode=bypass", "--dangerously-skip-permissions"],
-    ],
-    ids=["the flag alone", "mode and flag", "mode spelled with ="],
-)
 def test_the_flag_with_the_long_name_turns_permission_prompts_off(
-    ncc_home, project, serve, capsys, sessions, flags
+    ncc_home, project, serve, capsys, sessions
 ):
     serve(m=[WRITE, says("done")])
+    flags = ["--dangerously-skip-permissions"]
     code, out, _ = run_ncc(capsys, "--root", str(project), *flags, "-p", "write it")
     assert (code, out) == (EXIT_CODES["completed"], "done\n")
     assert written(project)
@@ -282,10 +274,17 @@ def test_the_flag_with_the_long_name_turns_permission_prompts_off(
 
 @pytest.mark.parametrize(
     "flags",
-    [["--mode", "bypass"], ["--mode=bypass"], ["--mode", "bypass", "--mode", "bypass"]],
-    ids=["mode bypass", "mode=bypass", "twice"],
+    [
+        ["--mode", "bypass"],
+        ["--mode=bypass"],
+        ["--mode", "bypass", "--mode", "bypass"],
+        # The flag beside it does not make it a mode: the one way is the flag, by itself.
+        ["--mode", "bypass", "--dangerously-skip-permissions"],
+        ["--mode=bypass", "--dangerously-skip-permissions"],
+    ],
+    ids=["mode bypass", "mode=bypass", "twice", "mode and flag", "mode= and flag"],
 )
-def test_mode_bypass_alone_is_refused_and_nothing_runs(
+def test_mode_bypass_is_refused_with_the_flag_that_does_it_and_nothing_runs(
     ncc_home, project, serve, capsys, stores, flags
 ):
     clients = serve(m=[WRITE, says("done")])
@@ -293,8 +292,8 @@ def test_mode_bypass_alone_is_refused_and_nothing_runs(
     assert code == EXIT_CODES["usage"]
     assert out == ""
     assert err == (
-        "error: --mode bypass needs --dangerously-skip-permissions — pass that flag "
-        "as well, or choose another mode\n"
+        "error: bypass is turned on by --dangerously-skip-permissions, not by --mode "
+        "— pass that flag\n"
     )
     assert not written(project)
     assert clients["m"].requests == []

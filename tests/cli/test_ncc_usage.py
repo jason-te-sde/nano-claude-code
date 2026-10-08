@@ -8,6 +8,7 @@ parser reports through ``UsageError`` and the command prints it.
 
 from __future__ import annotations
 
+import argparse
 import sys
 
 import pytest
@@ -307,3 +308,55 @@ def test_the_terminal_question_is_asked_of_stdin_and_survives_what_stdin_can_be(
 )
 def test_what_argparse_says_is_reworded_by_what_it_is_and_never_lost(message, line):
     assert ncc_main._flag_error(message) == line
+
+
+# --------------------------------------------------------------------------
+# --mode and --help
+# --------------------------------------------------------------------------
+
+
+def _action(flag: str) -> argparse.Action:
+    parser = build_parser()
+    return next(action for action in parser._actions if flag in action.option_strings)
+
+
+def test_mode_offers_the_three_modes_that_leave_the_protections_on():
+    assert list(_action("--mode").choices or []) == ["default", "plan", "accept-edits"]
+
+
+def test_bypass_is_not_a_mode_the_parser_takes_and_the_flag_for_it_is_still_there():
+    with pytest.raises(UsageError, match="turned on by --dangerously-skip-permissions"):
+        build_parser().parse_args(["--mode", "bypass"])
+    assert build_parser().parse_args(["--dangerously-skip-permissions"]).mode is None
+
+
+@pytest.mark.parametrize("mode", ["Bypass", "BYPASS", "bypas", "off"])
+def test_only_the_mode_bypass_gets_the_pointer_to_the_flag(capsys, mode):
+    # Another word is just not a mode; it must not be told to go and turn the checks off.
+    code, out, err = run_ncc(capsys, "--mode", mode, "-p", "x")
+    assert (code, out) == (EXIT_CODES["usage"], "")
+    assert "dangerously" not in err
+    assert (
+        err
+        == f"error: --mode {mode} is not a mode \u2014 choose one of default, plan, accept-edits\n"
+    )
+
+
+def test_every_flag_has_one_line_of_help_that_fits_an_80_column_terminal(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    parser = build_parser()
+    rendered = parser.format_help()
+    for action in parser._actions:
+        name = "/".join(action.option_strings) or action.dest
+        text = action.help or ""
+        assert text, f"{name} has no help text"
+        assert "\n" not in text, f"{name}: the help text is more than one line"
+        assert text in rendered, f"{name}: its help text does not fit on one line at 80"
+
+
+def test_the_help_for_the_flag_that_turns_prompts_off_says_the_sandbox_stays_on(capsys):
+    code, out, err = run_ncc(capsys, "--help")
+    assert (code, err) == (0, "")
+    flag = _action("--dangerously-skip-permissions").help or ""
+    assert "sandbox" in flag
+    assert flag in " ".join(out.split())  # however the terminal wrapped it

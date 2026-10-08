@@ -125,8 +125,9 @@ def _turns(text: str) -> int:
     return value
 
 
-#: What ``--mode`` may be set to by itself. Bypass is also a mode, but only with the flag
-#: whose name says so, and what is offered to someone who typed a mode wrongly is not that.
+#: What ``--mode`` may be set to. Bypass is also a mode, but it is turned on only by the flag
+#: whose name says so (spec 6.2), so it is not one of these, and what is offered to someone
+#: who typed a mode wrongly is not that.
 _MODES = tuple(mode.value for mode in PermissionMode if mode is not PermissionMode.BYPASS)
 _OUTPUT_FORMATS = ("text", "json")
 
@@ -174,6 +175,11 @@ def _flag_error(message: str) -> str:
                 f"{value} is not a command \u2014 the only command is {', '.join(_COMMANDS)}; "
                 "to give ncc a task, pass it with -p"
             )
+        if flag == "--mode" and value == PermissionMode.BYPASS:
+            return (
+                f"{PermissionMode.BYPASS} is turned on by --dangerously-skip-permissions, "
+                "not by --mode \u2014 pass that flag"
+            )
         what, choices = ("mode", _MODES) if flag == "--mode" else ("format", _OUTPUT_FORMATS)
         return f"{flag} {value} is not a {what} — choose one of {', '.join(choices)}"
     if match := _NOT_ALLOWED.fullmatch(message):
@@ -218,31 +224,84 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         choices=_COMMANDS,
         metavar=_COMMAND,
-        help="init: pick a provider, give a key, and write the config; run it once, first",
+        help="init: pick a provider, enter a key, write the config",
     )
-    parser.add_argument("-p", "--print", dest="prompt", metavar="PROMPT", help="run once and exit")
+    parser.add_argument(
+        "-p",
+        "--print",
+        dest="prompt",
+        metavar="PROMPT",
+        help="run PROMPT once, print the answer, and exit",
+    )
     # No default: whether it was given at all is what says it has no use without a prompt.
-    parser.add_argument("--output-format", choices=_OUTPUT_FORMATS)
+    parser.add_argument(
+        "--output-format",
+        choices=_OUTPUT_FORMATS,
+        help="how -p prints its answer (default: text)",
+    )
     # No default: whether it was given at all is what says it was meant. Left out it is the
     # working directory, and a working directory that would put a whole home directory in
     # the sandbox is refused (see _refuse_a_root_that_is_too_wide).
     parser.add_argument(
         "--root",
         default=None,
-        help="working directory (default: cwd, but never a home directory or / unless named)",
+        help="project directory (default: here; ~ and / need --root)",
     )
-    parser.add_argument("--model", metavar="ALIAS", help="model to use for the main role")
-    parser.add_argument("--role", action="append", default=[], metavar="ROLE=ALIAS")
-    parser.add_argument("--mode", choices=[mode.value for mode in PermissionMode])
-    parser.add_argument("--add-dir", action="append", default=[], metavar="PATH")
-    parser.add_argument("--max-turns", type=_turns, metavar="N")
+    parser.add_argument(
+        "--model", metavar="ALIAS", help="model for the main role, for this run only"
+    )
+    parser.add_argument(
+        "--role",
+        action="append",
+        default=[],
+        metavar="ROLE=ALIAS",
+        help="route one role to a model; may be repeated",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=_MODES,
+        help="permission mode (bypass is a separate flag)",
+    )
+    parser.add_argument(
+        "--add-dir",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="also let the agent work in PATH; may be repeated",
+    )
+    parser.add_argument(
+        "--max-turns", type=_turns, metavar="N", help="most turns one prompt may take (default: 40)"
+    )
     again = parser.add_mutually_exclusive_group()
-    again.add_argument("-c", "--continue", dest="continue_last", action="store_true")
-    again.add_argument("-r", "--resume", metavar="SESSION_ID")
-    parser.add_argument("--allow-secrets", action="store_true")
-    parser.add_argument("--dangerously-skip-permissions", action="store_true")
-    parser.add_argument("--no-color", action="store_true")
-    parser.add_argument("--version", action="version", version=f"nano-claude-code {__version__}")
+    again.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_last",
+        action="store_true",
+        help="go on with the latest session in this directory",
+    )
+    again.add_argument(
+        "-r", "--resume", metavar="SESSION_ID", help="go on with the session with this id"
+    )
+    parser.add_argument(
+        "--allow-secrets",
+        action="store_true",
+        help="let credentials files be read, unredacted",
+    )
+    parser.add_argument(
+        "--dangerously-skip-permissions",
+        action="store_true",
+        help="do not ask before tool calls (the sandbox stays on)",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true", help="no colour in output (NO_COLOR works too)"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"nano-claude-code {__version__}",
+        help="show the version and exit",
+    )
     return parser
 
 
@@ -430,21 +489,16 @@ def _permission_mode(args: argparse.Namespace) -> PermissionMode:
     """The mode the flags ask for. Bypass takes the flag with the long name, and nothing else.
 
     Spec 6.2 makes turning the permission checks off a decision made at start, with a flag
-    whose spelling is the point. ``--mode bypass`` is the same decision spelled the short
-    way, so it is refused alone; and the flag beside a mode that asks for protection is two
-    answers to one question, so it is refused too and not settled quietly in the flag's favour.
+    whose spelling is the point, so ``--mode`` does not take ``bypass`` at all (the parser
+    refuses it, and says which flag does). The flag beside a ``--mode`` that asks for
+    protection is two answers to one question, so it is refused and not settled quietly in
+    the flag's favour.
     """
-    skipping = args.dangerously_skip_permissions
-    if args.mode == PermissionMode.BYPASS and not skipping:
-        raise UsageError(
-            "--mode bypass needs --dangerously-skip-permissions "
-            "— pass that flag as well, or choose another mode"
-        )
-    if skipping:
-        if args.mode not in (None, PermissionMode.BYPASS):
+    if args.dangerously_skip_permissions:
+        if args.mode is not None:
             raise UsageError(
                 f"--mode {args.mode} contradicts --dangerously-skip-permissions "
-                "— pass only one of them"
+                "\u2014 pass only one of them"
             )
         return PermissionMode.BYPASS
     return PermissionMode(args.mode) if args.mode else PermissionMode.DEFAULT
