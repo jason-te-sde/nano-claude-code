@@ -211,14 +211,14 @@ async def verify(config: Config, alias: str) -> str | None:
     will run: the key from the environment the config was loaded with, the address, the
     parameter the provider wants its output cap in, no temperature. The cap is eight tokens.
     A reply cut off at it is still an answer, whether it holds thinking or, from a model
-    that thinks where nobody can see, nothing at all (:class:`~nanoclaude.providers.base.
-    EmptyReplyError`): the key, the model and the request were accepted, which is all that
-    is read.
+    that thinks where nobody can see, nothing at all (``EmptyReplyError``): the key, the
+    model and the request were accepted, which is all that is read.
 
-    Never raises. What is wrong comes back as a line for the person, with the key cut out of
-    it: a provider can say a key back in its error, and a library can put a header in an
-    exception. A missing or refused key is a :class:`~nanoclaude.providers.base.CredentialsError`
-    and is reported like the rest.
+    Whatever the provider or the network does comes back as a line for the person and is
+    never raised, with the key cut out of it: a provider can say a key back in its error,
+    and a library can put a header in an exception. A missing or refused key is a
+    ``CredentialsError`` and is reported like the rest. ``alias`` must be one of the
+    config's models, as it is for ncc itself.
     """
     key = config.api_key_for(alias)
     request = ModelRequest("Reply with: ok", Transcript((user_text("ping"),)), (), 8)
@@ -300,8 +300,11 @@ def run_init(
 ) -> int:
     """Ask which provider, which model and (if one is needed) the key; write the config.
 
-    ``home`` is the directory that holds ``.nanoclaude``. The key is used for one request
-    and kept nowhere: not in the file, not in this process's environment, not on the screen.
+    ``home`` is the directory that holds ``.nanoclaude``. ``ask`` asks the questions and
+    ``verify`` sends the check; ``env`` is the environment, this process's unless given. The
+    key is used for one request and kept nowhere: not in the file, not in this process's
+    environment, not on the screen.
+
     Returns the exit status: 0 when the setup was finished or left alone, even if the key
     could not be verified, because the file is written and the key is the person's to fix.
     Raises :class:`~nanoclaude.config.load.ConfigError` when the file cannot be written.
