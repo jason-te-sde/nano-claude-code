@@ -21,6 +21,7 @@ from nanoclaude.cli import main as ncc_main
 from nanoclaude.cli.main import EXIT_CODES
 from nanoclaude.config.schema import Config
 from nanoclaude.conversation.store import Store
+from nanoclaude.conversation.transcript import assistant_text, user_text
 from nanoclaude.providers.base import ModelError, ModelRequest
 from nanoclaude.providers.capabilities import CapabilityCache
 from nanoclaude.testing.scripted import says
@@ -315,6 +316,52 @@ def test_ctrl_c_while_the_session_is_being_built_still_closes_the_store(
     assert code == EXIT_CODES["interrupted"]
     assert out == "" and err == INTERRUPTED
     assert_closed(stores[0])
+
+
+def test_a_session_nothing_was_said_in_is_not_the_one_continue_takes_up(
+    ncc_home, project, serve, capsys
+):
+    # A REPL that was left at once, after the conversation that matters.
+    serve(m=[says("one"), says("two")])
+    first = start(capsys, project)
+    store = stored(ncc_home)
+    store.create_session("abandoned00", cwd=str(project), roles={})
+    store.close()
+    _, out, _ = run_ncc(
+        capsys, "--root", str(project), "-c", "-p", "again", "--output-format", "json"
+    )
+    assert json.loads(out)["session_id"] == first
+
+
+def test_continue_finds_a_session_that_was_stored_under_a_symlink_spelling(
+    ncc_home, tmp_path, serve, capsys
+):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    clients = serve(m=[says("again")])
+    store = stored(ncc_home)
+    store.create_session("viaalink000", cwd=str(link), roles={})
+    store.append_message("viaalink000", 0, user_text("an earlier question"))
+    store.append_message("viaalink000", 1, assistant_text("an earlier answer"))
+    store.close()
+    _, out, _ = run_ncc(capsys, "--root", str(real), "-c", "-p", "more", "--output-format", "json")
+    assert json.loads(out)["session_id"] == "viaalink000"
+    assert shown(clients["m"].requests[0])[0] == ("user", "an earlier question")
+
+
+def test_continue_with_a_root_given_through_a_symlink_finds_what_was_started_there(
+    ncc_home, tmp_path, serve, capsys
+):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    serve(m=[says("a"), says("b")])
+    first = start(capsys, link)
+    _, out, _ = run_ncc(capsys, "--root", str(real), "-c", "-p", "more", "--output-format", "json")
+    assert json.loads(out)["session_id"] == first
 
 
 def test_the_advice_to_run_ncc_from_another_directory_quotes_it_for_a_shell(

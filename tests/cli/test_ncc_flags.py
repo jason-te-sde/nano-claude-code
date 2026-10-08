@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -19,6 +20,7 @@ from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.store import Store
 from nanoclaude.permissions.policy import PermissionMode
 from nanoclaude.providers.base import ModelReply
+from nanoclaude.providers.capabilities import CapabilityCache
 from nanoclaude.testing.scripted import calls, says
 from tests.cli.helpers import run_ncc, tool_results
 
@@ -551,3 +553,142 @@ def test_sessions_are_not_shared_between_runs_unless_asked(
     first = sessions[0]
     run_ncc(capsys, "--root", str(project), "-p", "two")
     assert isinstance(first, Session) and sessions[1].session_id != first.session_id
+
+
+# --------------------------------------------------------------------------
+# The rules in the configuration are the policy's rules
+# --------------------------------------------------------------------------
+
+
+def with_permissions(home: Path, rules: str) -> None:
+    config = home / ".nanoclaude" / "config.toml"
+    config.write_text(config.read_text() + "\n[permissions]\n" + rules)
+
+
+def decisions(home: Path, session_id: str) -> list[tuple[str, str, str]]:
+    store = Store(home / ".nanoclaude" / "sessions.db")
+    store.open()
+    rows = store.db.execute(
+        "SELECT tool, decision, rule FROM tool_calls WHERE session_id = ? ORDER BY ts",
+        (session_id,),
+    ).fetchall()
+    return [(row["tool"], row["decision"], row["rule"]) for row in rows]
+
+
+def run_to_json(capsys: pytest.CaptureFixture[str], *argv: str) -> dict[str, Any]:
+    code, out, _ = run_ncc(capsys, *argv, "--output-format", "json")
+    assert code == EXIT_CODES["completed"]
+    payload: dict[str, Any] = json.loads(out)
+    return payload
+
+
+def test_a_deny_rule_in_the_configuration_is_enforced_even_with_prompts_off(
+    ncc_home, project, serve, capsys
+):
+    with_permissions(ncc_home, 'deny = ["Write(out.txt)"]\n')
+    clients = serve(m=[WRITE, says("done")])
+    run_to_json(capsys, "--root", str(project), "--dangerously-skip-permissions", "-p", "write it")
+    assert not written(project)
+    (result,) = tool_results(clients["m"])
+    assert result.is_error and "rule.deny" in result.content
+
+
+def test_a_deny_rule_in_the_projects_own_configuration_is_enforced_too(
+    ncc_home, project, serve, capsys
+):
+    (project / ".nanoclaude").mkdir()
+    (project / ".nanoclaude" / "config.toml").write_text(
+        '[permissions]\ndeny = ["Write(out.txt)"]\n'
+    )
+    clients = serve(m=[WRITE, says("done")])
+    run_to_json(capsys, "--root", str(project), "--mode", "accept-edits", "-p", "write it")
+    assert not written(project)
+    (result,) = tool_results(clients["m"])
+    assert "rule.deny" in result.content
+
+
+def test_an_allow_rule_in_the_configuration_lets_a_headless_run_write(
+    ncc_home, project, serve, capsys
+):
+    with_permissions(ncc_home, 'allow = ["Read", "Write"]\n')
+    serve(m=[WRITE, says("done")])
+    payload = run_to_json(capsys, "--root", str(project), "-p", "write it")
+    assert written(project)
+    assert decisions(ncc_home, payload["session_id"]) == [("Write", "allow", "rule.allow")]
+
+
+def test_an_ask_rule_in_the_configuration_still_declines_a_headless_write(
+    ncc_home, project, serve, capsys
+):
+    with_permissions(ncc_home, 'allow = ["Read"]\nask = ["Write"]\n')
+    clients = serve(m=[WRITE, says("done")])
+    payload = run_to_json(capsys, "--root", str(project), "-p", "write it")
+    assert not written(project)
+    (result,) = tool_results(clients["m"])
+    assert result.is_error
+    # Asked about because a rule says to, and not by the default for what changes things.
+    assert decisions(ncc_home, payload["session_id"]) == [("Write", "ask", "rule.ask")]
+
+
+def test_without_an_ask_rule_the_same_write_is_asked_about_by_default(
+    ncc_home, project, serve, capsys
+):
+    with_permissions(ncc_home, 'allow = ["Read"]\nask = []\n')
+    serve(m=[WRITE, says("done")])
+    payload = run_to_json(capsys, "--root", str(project), "-p", "write it")
+    assert not written(project)
+    assert decisions(ncc_home, payload["session_id"]) == [("Write", "ask", "default.ask")]
+
+
+# --------------------------------------------------------------------------
+# Where ncc keeps what it learns about models, and how it names a directory
+# --------------------------------------------------------------------------
+
+
+def test_what_ncc_learns_about_a_model_is_kept_under_the_home_it_was_given(
+    ncc_home, project, serve, capsys, monkeypatch
+):
+    from nanoclaude.cli import main as ncc_main
+
+    seen: list[Path] = []
+
+    def spy(path: Path) -> Any:
+        seen.append(path)
+        return CapabilityCache(path)
+
+    monkeypatch.setattr(ncc_main, "CapabilityCache", spy)
+    serve(m=[says("ok")])
+    run_ncc(capsys, "--root", str(project), "-p", "hi")
+    assert seen == [ncc_home / ".nanoclaude" / "capabilities.json"]
+
+
+def test_a_root_given_through_a_symlink_is_the_directory_it_leads_to(
+    ncc_home, tmp_path, serve, capsys, sessions
+):
+    # Not merely made absolute: the session, its sandbox and its row in the store all name
+    # the one place, whichever way it was reached.
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    serve(m=[says("ok")])
+    _, out, _ = run_ncc(capsys, "--root", str(link), "-p", "hi", "--output-format", "json")
+    assert sessions[0].root == str(real)
+    store = Store(ncc_home / ".nanoclaude" / "sessions.db")
+    store.open()
+    row = store.session_row(json.loads(out)["session_id"])
+    assert row is not None and row.cwd == str(real)
+
+
+def test_a_relative_root_with_dots_through_a_symlink_is_resolved_on_the_disk(
+    ncc_home, tmp_path, serve, capsys, sessions, monkeypatch
+):
+    # link/.. is the parent of what link leads to, which is not the parent of link.
+    elsewhere = tmp_path / "elsewhere"
+    target = elsewhere / "target"
+    target.mkdir(parents=True)
+    (tmp_path / "link").symlink_to(target)
+    monkeypatch.chdir(tmp_path)
+    serve(m=[says("ok")])
+    run_ncc(capsys, "--root", "link/..", "-p", "hi")
+    assert sessions[0].root == str(elsewhere)
