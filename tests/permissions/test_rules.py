@@ -1,6 +1,7 @@
 import pytest
 
-from nanoclaude.permissions.rules import Rule, RuleSet, glob_matches_any
+from nanoclaude.permissions.rules import KNOWN_TOOLS, Rule, RuleSet, glob_matches_any
+from nanoclaude.tools.registry import default_registry
 
 
 def test_a_bare_tool_name_matches_every_call_to_it():
@@ -98,3 +99,67 @@ def test_a_newline_does_not_make_a_glob_match_what_it_should_not():
     assert not glob_matches_any(("src/**/*.py",), ("src/odd\ndir/a.txt",))
     # Two different names stay different: the newline is replaced, not dropped.
     assert not glob_matches_any(("src/ab.txt",), ("src/a\nb.txt",))
+
+
+# ---- a rule that names no tool is refused, not left to match nothing for ever
+
+REAL_TOOLS = sorted(tool.name for tool in default_registry())
+
+
+@pytest.mark.parametrize("name", REAL_TOOLS)
+def test_a_rule_naming_a_tool_that_exists_is_accepted(name):
+    assert Rule.parse(name).tool == name
+    assert Rule.parse(f"{name}(**/x)").tool == name
+
+
+@pytest.mark.parametrize("name", ["Bash", "Git"])
+def test_the_tools_that_are_being_built_are_accepted_as_reserved_names(name):
+    assert name not in REAL_TOOLS, "built now: it no longer needs to be reserved"
+    assert Rule.parse(name).tool == name
+    assert Rule.parse(f"{name}(status)").tool == name
+    assert Rule.parse("Bash(npm test:*)").prefix
+
+
+def test_the_known_tools_are_the_registered_ones_and_the_reserved_ones():
+    """A tool added to the registry and not to the list a rule may name would be a tool
+    that no rule could ever govern."""
+    assert set(KNOWN_TOOLS) == set(REAL_TOOLS) | {"Bash", "Git"}
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "read(secrets/**)",  # tool names are case-sensitive
+        "READ(secrets/**)",
+        "Raed(secrets/**)",
+        "read",
+        "Reads",
+        "Wrte(src/**)",
+        "grep(x)",
+        "mcp__server__tool",
+        "(secrets/**)",
+        "bash(npm test:*)",  # the prefix form
+    ],
+)
+def test_a_rule_naming_no_tool_is_refused_and_the_message_lists_the_tools(rule):
+    with pytest.raises(ValueError, match="unknown tool") as raised:
+        Rule.parse(rule)
+    message = str(raised.value)
+    assert all(name in message for name in KNOWN_TOOLS), message
+    assert "\n" not in message
+    assert "case-sensitive" in message
+
+
+def test_the_message_names_the_tool_as_it_was_written():
+    with pytest.raises(ValueError, match=r"unknown tool 'Raed'"):
+        Rule.parse("Raed(secrets/**)")
+
+
+def test_a_ruleset_refuses_a_rule_naming_no_tool_whichever_list_it_is_in():
+    for kind in ("allow", "ask", "deny"):
+        with pytest.raises(ValueError, match="unknown tool 'read'"):
+            RuleSet.build(**{kind: ["Write", "read(secrets/**)"]})
+
+
+def test_spaces_around_a_tool_name_are_not_part_of_it():
+    assert Rule.parse("  Read ( **/x )").tool == "Read"

@@ -35,6 +35,14 @@ RuleKind = Literal["allow", "ask", "deny"]
 GLOB_PATTERN_FACTORY = "gitwildmatch"
 
 
+#: Every tool name a rule may name: the six registered tools and two that are being built.
+#: ``Bash`` and ``Git`` are reserved, so that a rule written for them today does not have to
+#: be rewritten the day they arrive. Names are case-sensitive, as the registry's are: a rule
+#: that names ``read`` matches no call to ``Read``, and for a deny rule that is a refusal
+#: the person believes is in force and is not. A test pins this list to the registry.
+KNOWN_TOOLS = ("Bash", "Edit", "Git", "Glob", "Grep", "Read", "TodoWrite", "Write")
+
+
 @dataclass(frozen=True, slots=True)
 class Rule:
     tool: str
@@ -48,7 +56,7 @@ class Rule:
         if "(" not in raw:
             if ")" in raw:
                 raise ValueError(f"unbalanced parentheses in rule {text!r}")
-            return Rule(raw, None, False, raw)
+            return Rule(_known_tool(raw), None, False, raw)
         if not raw.endswith(")"):
             raise ValueError(f"unbalanced parentheses in rule {text!r}")
         tool, _, rest = raw.partition("(")
@@ -67,8 +75,8 @@ class Rule:
             prefix = subject[:-2]
             if not prefix:
                 raise ValueError(f"empty subject in rule {text!r}")
-            return Rule(tool.strip(), prefix, True, raw)
-        return Rule(tool.strip(), subject, False, raw)
+            return Rule(_known_tool(tool.strip()), prefix, True, raw)
+        return Rule(_known_tool(tool.strip()), subject, False, raw)
 
     def matches(self, tool: str, subject: str, relative_subject: str) -> bool:
         if tool != self.tool:
@@ -80,6 +88,17 @@ class Rule:
         if subject == self.subject:
             return True
         return glob_matches_any((self.subject,), (subject, relative_subject))
+
+
+def _known_tool(name: str) -> str:
+    """``name``, if a rule may name it. The same hazard as an empty subject, from the other
+    side: ``read(secrets/**)`` parses, never matches a call to ``Read``, and is a deny rule
+    that denies nothing."""
+    if name not in KNOWN_TOOLS:
+        raise ValueError(
+            f"unknown tool {name!r}; tool names are case-sensitive and are {', '.join(KNOWN_TOOLS)}"
+        )
+    return name
 
 
 def _prefix_match(subject: str, prefix: str) -> bool:

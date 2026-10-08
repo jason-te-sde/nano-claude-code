@@ -351,8 +351,8 @@ def test_a_rule_listed_twice_in_one_file_is_kept_once(tmp_path):
 
 
 def test_when_the_home_file_sets_no_ask_list_the_project_adds_to_the_default_one(tmp_path):
-    config = load(tmp_path, BASE, '[permissions]\nask = ["WebFetch"]\n')
-    assert config.permissions.ask == (*RULES_DEFAULTS["ask"], "WebFetch")
+    config = load(tmp_path, BASE, '[permissions]\nask = ["Glob"]\n')
+    assert config.permissions.ask == (*RULES_DEFAULTS["ask"], "Glob")
 
 
 @pytest.mark.parametrize("key", ["allow", "ask", "deny"])
@@ -370,9 +370,9 @@ def test_a_home_list_still_replaces_the_default_instead_of_stacking_onto_it(tmp_
 
 def test_a_list_the_project_does_not_set_keeps_the_home_list(tmp_path):
     home = BASE + '[permissions]\ndeny = ["Read(**/.env*)"]\n'
-    config = load(tmp_path, home, '[permissions]\nask = ["WebFetch"]\n')
+    config = load(tmp_path, home, '[permissions]\nask = ["Glob"]\n')
     assert config.permissions.deny == ("Read(**/.env*)",)
-    assert config.permissions.ask == (*RULES_DEFAULTS["ask"], "WebFetch")
+    assert config.permissions.ask == (*RULES_DEFAULTS["ask"], "Glob")
 
 
 def test_a_project_config_may_not_add_allow_rules_and_says_where_they_belong(tmp_path):
@@ -1165,6 +1165,8 @@ def test_every_shape_of_rule_the_grammar_allows_is_accepted(tmp_path, rule):
         ("Bash)", "unbalanced parentheses"),
         ("Bash()", "empty subject"),
         ("Bash(:*)", "empty subject"),
+        ("read(secrets/**)", "unknown tool 'read'"),
+        ("Raed", "unknown tool 'Raed'"),
     ],
 )
 def test_a_rule_the_grammar_rejects_is_refused_at_load_with_its_reason(tmp_path, key, rule, reason):
@@ -1174,6 +1176,13 @@ def test_a_rule_the_grammar_rejects_is_refused_at_load_with_its_reason(tmp_path,
     assert f"permissions.{key}[1] in {home_file(tmp_path)} is not a valid rule" in message
     assert reason in message
     assert "rules look like Tool, Tool(subject) or Tool(prefix:*)" in message
+
+
+def test_a_rule_naming_no_tool_says_which_tools_there_are(tmp_path):
+    message = refusal(tmp_path, BASE + '[permissions]\ndeny = ["read(secrets/**)"]\n')
+    assert "unknown tool 'read'" in message
+    for name in ("Bash", "Edit", "Git", "Glob", "Grep", "Read", "TodoWrite", "Write"):
+        assert name in message, message
 
 
 def test_a_mistake_in_the_project_file_names_the_project_file_only(tmp_path):
