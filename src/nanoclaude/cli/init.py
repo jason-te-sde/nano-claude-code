@@ -16,11 +16,14 @@ import asyncio
 import contextlib
 import os
 import re
-from collections.abc import Callable, Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.input import Input
+from prompt_toolkit.output import Output
 from rich.console import Console
 from rich.markup import escape
 
@@ -150,6 +153,49 @@ bash_timeout_s = {limits.bash_timeout_s:g}
 """
 
 
+def ask_on_terminal(
+    message: str,
+    *,
+    choices: Sequence[str] | None = None,
+    default: str | None = None,
+    password: bool = False,
+    input: Input | None = None,
+    output: Output | None = None,
+) -> str:
+    """Ask one question on the terminal; the answer, without the spaces around it.
+
+    ``choices`` are the answers that are accepted, in any case, and the question is asked
+    again until it gets one; the answer given back is the choice as it is spelled there.
+    Enter alone gives ``default``. ``password`` keeps the answer off the screen: a mask is
+    drawn in its place, and a default is neither shown nor taken. ``input`` and ``output``
+    are the terminal's unless given.
+
+    Every question gets a prompt of its own. A prompt keeps what it was given, and Up brings
+    it back: the model's question must not be able to show the key.
+
+    Raises ``KeyboardInterrupt`` for Ctrl+C and ``EOFError`` for Ctrl+D at an empty line, as
+    ``input()`` does.
+    """
+    shown_default = default if default is not None and not password else None
+    label = message
+    if choices:
+        label += f" [{'/'.join(choices)}]"
+    if shown_default:
+        label += f" ({shown_default})"
+    prompt = f"{label}: "
+    while True:
+        session: PromptSession[str] = PromptSession(input=input, output=output)
+        answer = session.prompt(prompt, is_password=password).strip()
+        if not answer and shown_default is not None:
+            answer = shown_default
+        if not choices:
+            return answer
+        for choice in choices:
+            if choice.lower() == answer.lower():
+                return choice
+        prompt = f"{message} (choose one of {', '.join(choices)}): "
+
+
 #: How long the check waits for the provider. A model that has to be loaded into memory first
 #: (a local one, cold) can take most of this; a person who has waited this long has a problem
 #: that another few seconds will not mend.
@@ -246,7 +292,7 @@ def run_init(
     console: Console,
     *,
     home: Path,
-    ask: Ask,
+    ask: Ask = ask_on_terminal,
     env: Mapping[str, str] | None = None,
     verify: Verifier = verify,
 ) -> int:

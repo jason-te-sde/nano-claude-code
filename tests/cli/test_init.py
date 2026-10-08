@@ -16,20 +16,30 @@ the test. Every key-shaped string is built when the test runs.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
+import pty
 import secrets
+import select
+import subprocess
+import sys
+import time
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from prompt_toolkit.input import PipeInput, create_pipe_input
+from prompt_toolkit.output.plain_text import PlainTextOutput
 
 from nanoclaude.cli import init as init_module
-from nanoclaude.cli.init import PRESETS, render_config, run_init, verify
+from nanoclaude.cli import main as ncc_main
+from nanoclaude.cli.init import PRESETS, ask_on_terminal, render_config, run_init, verify
+from nanoclaude.cli.main import EXIT_CODES
 from nanoclaude.config.load import ConfigError, load_config
 from nanoclaude.config.schema import ROLES, Config, PermissionsConfig
 from nanoclaude.providers.capabilities import (
@@ -37,7 +47,7 @@ from nanoclaude.providers.capabilities import (
     CapabilityCache,
     capabilities_for,
 )
-from tests.cli.helpers import plain_console
+from tests.cli.helpers import INTERRUPTED, plain_console, run_ncc
 
 
 def write_home(home: Path, text: str) -> None:
@@ -901,3 +911,443 @@ def test_a_blank_key_is_reported_by_the_check_and_does_not_break_the_setup(tmp_p
     # not "redacted" out of the message, which would put the marker between every two letters.
     assert "<your key>" not in buffer.getvalue()
     assert "[hidden]" not in buffer.getvalue()
+
+
+# --------------------------------------------------------------------------
+# The questions as a terminal asks them
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Terminal:
+    """A terminal for one conversation: the keys the person presses, and what the screen shows."""
+
+    keys: PipeInput
+    screen: io.StringIO
+
+    def ask(self, typed: str, message: str = "question", **kwargs: Any) -> str:
+        """Press ``typed``, as the answer to a question, and return the answer ``ask`` gives."""
+        self.keys.send_text(typed)
+        return ask_on_terminal(
+            message, input=self.keys, output=PlainTextOutput(self.screen), **kwargs
+        )
+
+
+@pytest.fixture
+def terminal() -> Iterator[Terminal]:
+    with create_pipe_input() as keys:
+        yield Terminal(keys, io.StringIO())
+
+
+ENTER = "\r"
+
+
+def test_what_is_typed_is_the_answer(terminal):
+    assert terminal.ask(f"claude-haiku-4-5{ENTER}") == "claude-haiku-4-5"
+
+
+def test_spaces_around_the_answer_are_not_part_of_it(terminal):
+    assert terminal.ask(f"  x  {ENTER}") == "x"
+
+
+def test_enter_alone_gives_the_default_and_the_default_is_shown(terminal):
+    assert terminal.ask(ENTER, "model", default="gpt-5") == "gpt-5"
+    assert "model (gpt-5):" in terminal.screen.getvalue()
+
+
+def test_a_question_with_no_default_is_not_answered_by_enter(terminal):
+    assert terminal.ask(ENTER) == ""
+
+
+def test_the_choices_are_shown_and_one_of_them_is_the_answer(terminal):
+    assert terminal.ask(f"2{ENTER}", "choice", choices=["1", "2", "3"], default="1") == "2"
+    assert "choice [1/2/3] (1):" in terminal.screen.getvalue()
+
+
+def test_something_that_is_not_a_choice_is_asked_again(terminal):
+    answer = terminal.ask(f"9{ENTER}2{ENTER}", "choice", choices=["1", "2"], default="1")
+    assert answer == "2"
+    assert "choose one of 1, 2" in terminal.screen.getvalue()
+
+
+def test_a_choice_typed_in_the_other_case_is_the_choice(terminal):
+    assert terminal.ask(f"Y{ENTER}", "overwrite?", choices=["y", "n"], default="n") == "y"
+
+
+def test_enter_at_a_question_with_choices_takes_the_default(terminal):
+    assert terminal.ask(ENTER, "overwrite?", choices=["y", "n"], default="n") == "n"
+
+
+def test_a_key_is_read_and_never_drawn(terminal, key):
+    assert terminal.ask(f"{key}{ENTER}", "paste your key", password=True) == key
+    screen = terminal.screen.getvalue()
+    assert key not in screen
+    assert "paste your key:" in screen
+
+
+def test_not_a_letter_of_the_key_is_drawn(terminal, key):
+    terminal.ask(f"{key}{ENTER}", "paste your key", password=True)
+    drawn = set(terminal.screen.getvalue().replace("paste your key:", ""))
+    assert not drawn & set(key), drawn
+
+
+def test_what_was_typed_for_one_question_cannot_be_called_back_at_the_next(terminal, key):
+    # A prompt keeps what it was given and Up brings it back. The key's prompt is not the
+    # model's: Up at the model question must show the model's own history, which is none.
+    terminal.ask(f"{key}{ENTER}", "paste your key", password=True)
+    answer = terminal.ask(f"\x1b[A{ENTER}", "model", default="gpt-5")
+    assert answer == "gpt-5"
+    assert key not in terminal.screen.getvalue()
+
+
+def test_ctrl_c_ends_the_question_the_way_it_ends_any_other(terminal):
+    with pytest.raises(KeyboardInterrupt):
+        terminal.ask("\x03")
+
+
+def test_ctrl_d_at_an_empty_line_says_the_input_has_ended(terminal):
+    with pytest.raises(EOFError):
+        terminal.ask("\x04")
+
+
+# --------------------------------------------------------------------------
+# The command: ncc init
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Machine:
+    """A machine with nothing set up: a home of its own, and ncc told to keep its files apart."""
+
+    home: Path
+    ncc: Path
+    project: Path
+
+
+@pytest.fixture
+def machine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Machine:
+    home, ncc, project = tmp_path / "home", tmp_path / "ncc", tmp_path / "project"
+    for directory in (home, ncc, project):
+        directory.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("NANOCLAUDE_HOME", str(ncc))
+    for name in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "NO_COLOR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(project)
+    return Machine(home, ncc, project)
+
+
+def asked_by(
+    monkeypatch: pytest.MonkeyPatch, ask: Callable[..., str], verify: Verifier | None = None
+) -> None:
+    """Have ``ncc init`` asked its questions by ``ask``, and check with ``verify`` if given."""
+
+    def run(console: Any, *, home: Path) -> int:
+        if verify is None:
+            return run_init(console, home=home, ask=ask)
+        return run_init(console, home=home, ask=ask, verify=verify)
+
+    monkeypatch.setattr(ncc_main, "run_init", run)
+
+
+def scripted(
+    monkeypatch: pytest.MonkeyPatch, *answers: str | None, verify: Verifier | None = None
+) -> Answers:
+    """Have ``ncc init`` asked its questions by a script, and check with ``verify`` if given."""
+    asking = Answers(*answers)
+    asked_by(monkeypatch, asking, verify)
+    return asking
+
+
+def not_called(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make ``run_init`` fail the test if it is reached; the list says whether it was."""
+    reached: list[str] = []
+
+    def run(*_args: Any, **_kwargs: Any) -> int:
+        reached.append("run_init")
+        raise AssertionError("ncc init went on to ask its questions")
+
+    monkeypatch.setattr(ncc_main, "run_init", run)
+    return reached
+
+
+def test_init_is_run_by_the_command_and_writes_where_ncc_keeps_its_files(
+    machine, monkeypatch, capsys, key
+):
+    scripted(monkeypatch, "1", key, None, verify=Verifier())
+    code, out, err = run_ncc(capsys, "init")
+    assert (code, err) == (0, "")
+    assert "wrote" in out and "verified" in out
+    assert config_path(machine.ncc).is_file()
+    assert list(machine.home.iterdir()) == [], "nothing goes in HOME when ncc was told where"
+
+
+def test_init_with_no_terminal_says_why_in_its_own_words_and_asks_nothing(
+    machine, monkeypatch, capsys
+):
+    monkeypatch.setattr(ncc_main, "_stdin_is_terminal", lambda: False)
+    reached = not_called(monkeypatch)
+    code, out, err = run_ncc(capsys, "init")
+    assert code == EXIT_CODES["usage"] == 2
+    assert out == ""
+    assert err == "error: ncc init asks questions \u2014 run it in a terminal\n"
+    assert reached == []
+    assert list(machine.ncc.iterdir()) == []
+
+
+def test_init_with_no_terminal_leaves_an_existing_config_alone_without_asking(
+    machine, monkeypatch, capsys
+):
+    write_home(machine.ncc, "# mine\n")
+    monkeypatch.setattr(ncc_main, "_stdin_is_terminal", lambda: False)
+    reached = not_called(monkeypatch)
+    assert run_ncc(capsys, "init")[0] == EXIT_CODES["usage"]
+    assert config_path(machine.ncc).read_text() == "# mine\n"
+    assert reached == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "flag"),
+    [
+        (["init", "-p", "hello"], "-p"),
+        (["init", "--model", "m"], "--model"),
+        (["init", "--root", "."], "--root"),
+        (["init", "--mode", "plan"], "--mode"),
+        (["init", "-c"], "-c"),
+        (["init", "--allow-secrets"], "--allow-secrets"),
+        (["init", "--dangerously-skip-permissions"], "--dangerously-skip-permissions"),
+        (["--max-turns", "3", "init"], "--max-turns"),
+        (["--output-format", "json", "init"], "--output-format"),
+    ],
+)
+def test_init_takes_no_flag_that_shapes_a_session_and_does_not_ignore_one(
+    machine, monkeypatch, capsys, argv, flag
+):
+    reached = not_called(monkeypatch)
+    code, out, err = run_ncc(capsys, *argv)
+    assert code == EXIT_CODES["usage"]
+    assert out == ""
+    assert err == (
+        f"error: ncc init takes no {flag} \u2014 run it on its own "
+        "(--no-color is the only flag that goes with it)\n"
+    )
+    assert reached == []
+
+
+@pytest.mark.parametrize("argv", [["init", "--no-color"], ["--no-color", "init"]])
+def test_init_takes_no_color(machine, monkeypatch, capsys, key, argv):
+    scripted(monkeypatch, "1", key, None, verify=Verifier())
+    code, out, _ = run_ncc(capsys, *argv)
+    assert code == 0
+    assert "\x1b[" not in out
+
+
+def test_a_word_that_is_not_a_command_is_said_so_and_a_task_goes_with_p(machine, capsys):
+    code, out, err = run_ncc(capsys, "fix the failing test")
+    assert code == EXIT_CODES["usage"] and out == ""
+    assert err == (
+        "error: fix the failing test is not a command \u2014 the only command is init; "
+        "to give ncc a task, pass it with -p\n"
+    )
+
+
+def test_a_word_after_init_is_an_unrecognized_argument(machine, capsys):
+    code, out, err = run_ncc(capsys, "init", "now")
+    assert code == EXIT_CODES["usage"] and out == ""
+    assert err.startswith("error: unrecognized argument now")
+
+
+def test_help_lists_the_command(capsys):
+    code, out, _ = run_ncc(capsys, "--help")
+    assert code == 0
+    assert "init" in out
+
+
+def test_ctrl_c_at_a_question_ends_init_like_any_interrupted_run_with_nothing_written(
+    machine, monkeypatch, capsys
+):
+    def interrupted(_message: str, **_kwargs: Any) -> str:
+        raise KeyboardInterrupt
+
+    asked_by(monkeypatch, interrupted)
+    code, _, err = run_ncc(capsys, "init")
+    assert (code, err) == (EXIT_CODES["interrupted"], INTERRUPTED)
+    assert list(machine.ncc.iterdir()) == []
+
+
+def test_the_input_ending_at_a_question_is_said_and_nothing_is_written(
+    machine, monkeypatch, capsys
+):
+    def ended(_message: str, **_kwargs: Any) -> str:
+        raise EOFError
+
+    asked_by(monkeypatch, ended)
+    code, _, err = run_ncc(capsys, "init")
+    assert code == EXIT_CODES["stopped"]
+    assert err == (
+        "error: the input ended before ncc init was finished \u2014 nothing was written; "
+        "run ncc init again\n"
+    )
+    assert list(machine.ncc.iterdir()) == []
+
+
+def test_a_config_that_cannot_be_written_is_one_line_and_a_configuration_error(
+    machine, monkeypatch, capsys, key
+):
+    where = machine.project / "a-file"
+    where.write_text("not a directory")
+    monkeypatch.setenv("NANOCLAUDE_HOME", str(where))
+    scripted(monkeypatch, "1", key, None, verify=Verifier())
+    code, out, err = run_ncc(capsys, "init")
+    assert code == EXIT_CODES["config"]
+    assert err.startswith("error: cannot write ") and err.count("\n") == 1
+    assert key not in out + err
+
+
+# -- the key, from the command's side: where it can be found afterwards -------------------
+
+
+def files_holding(root: Path, secret: str) -> list[Path]:
+    return [
+        path for path in root.rglob("*") if path.is_file() and secret.encode() in path.read_bytes()
+    ]
+
+
+def test_the_key_is_in_no_file_and_on_neither_stream_after_a_whole_run(
+    machine, monkeypatch, capsys, tmp_path, key, wire
+):
+    wire.answer = says_ok
+    scripted(monkeypatch, "1", key, None)
+    code, out, err = run_ncc(capsys, "init")
+    assert code == 0 and "verified" in out
+    assert wire.requests[0].headers["x-api-key"] == key, "the check was made with it"
+    assert files_holding(tmp_path, key) == []
+    assert key not in out and key not in err
+    assert key not in os.environ.values()
+
+
+def test_the_key_is_in_no_file_and_on_neither_stream_when_the_check_fails_and_says_it_back(
+    machine, monkeypatch, capsys, tmp_path, key, wire
+):
+    wire.answer = lambda _request: httpx.Response(
+        401, json={"error": {"message": f"Incorrect API key provided: {key}"}}
+    )
+    scripted(monkeypatch, "1", key, None)
+    code, out, err = run_ncc(capsys, "init")
+    assert code == 0 and "could not verify" in out
+    assert files_holding(tmp_path, key) == []
+    assert key not in out and key not in err
+
+
+def test_the_key_is_in_no_file_and_on_neither_stream_when_the_request_blows_up(
+    machine, monkeypatch, capsys, tmp_path, key, wire
+):
+    def explode(_request: httpx.Request) -> httpx.Response:
+        raise RuntimeError(f"cannot send {key!r}")
+
+    wire.answer = explode
+    scripted(monkeypatch, "1", key, None)
+    code, out, err = run_ncc(capsys, "init")
+    assert code == 0 and "RuntimeError" in out
+    assert files_holding(tmp_path, key) == []
+    assert key not in out and key not in err
+
+
+# --------------------------------------------------------------------------
+# On a real terminal: the prompt that is the default, with nothing scripted but the keys
+# --------------------------------------------------------------------------
+
+#: ``run_init`` as ncc calls it, with the questions it asks by default and the check replaced:
+#: this is about the prompt and the file, and no request leaves the machine.
+TERMINAL_HARNESS = """
+import sys
+from pathlib import Path
+from rich.console import Console
+from nanoclaude.cli.init import run_init
+
+async def answered(config, alias):
+    return None
+
+sys.exit(run_init(Console(), home=Path(sys.argv[1]), env={}, verify=answered))
+"""
+
+#: What a terminal sends back when asked where its cursor is, which prompt_toolkit asks.
+CURSOR_AT_ORIGIN = b"\x1b[1;1R"
+ASK_CURSOR = b"\x1b[6n"
+
+
+def type_into(command: list[str], answers: list[tuple[bytes, bytes]]) -> tuple[int, bytes]:
+    """Run ``command`` on a pseudo-terminal; type each answer once its question is on screen.
+
+    Returns the exit status and everything the program drew. A question that never appears
+    fails the test, naming it and what had been drawn, and the program is stopped.
+    """
+    master, slave = pty.openpty()
+    process = subprocess.Popen(  # noqa: S603 - the interpreter running these tests, and a fixed script
+        command,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env={**os.environ, "TERM": "xterm-256color"},
+        start_new_session=True,
+    )
+    os.close(slave)
+    drawn, since, asked, located = b"", 0, 0, 0
+    deadline = time.monotonic() + 30
+    try:
+        while time.monotonic() < deadline:
+            if select.select([master], [], [], 0.1)[0]:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # the program has gone and so has its end of the terminal
+                    break
+                if not chunk:
+                    break
+                drawn += chunk
+                while located < drawn.count(ASK_CURSOR):
+                    os.write(master, CURSOR_AT_ORIGIN)
+                    located += 1
+            if asked < len(answers) and answers[asked][0] in drawn[since:]:
+                os.write(master, answers[asked][1])
+                since, asked = len(drawn), asked + 1
+        else:
+            pytest.fail(f"timed out after {asked} answers; drawn so far: {drawn[-300:]!r}")
+        return process.wait(timeout=10), drawn
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(master)
+
+
+def test_on_a_real_terminal_the_key_is_typed_in_the_dark_and_the_config_is_private(tmp_path, key):
+    status, drawn = type_into(
+        [sys.executable, "-c", TERMINAL_HARNESS, str(tmp_path)],
+        [
+            (b"choice [1/2/3/4]", b"1\r"),
+            (b"paste your key", key.encode() + b"\r"),
+            (b"model (claude-sonnet-5-5)", b"\r"),
+        ],
+    )
+    assert status == 0, drawn
+    assert key.encode() not in drawn, "the terminal showed the key"
+    assert b"*" in drawn, "and drew the mask that says a key is being typed"
+    assert b"verified" in drawn
+    assert config_path(tmp_path).stat().st_mode & 0o777 == 0o600
+    assert key not in config_path(tmp_path).read_text()
+    assert load_config(home=str(tmp_path), project=None, env={}).models["anthropic"].model == (
+        "claude-sonnet-5-5"
+    )
+
+
+def test_on_a_real_terminal_a_choice_that_is_not_one_is_asked_again(tmp_path):
+    status, drawn = type_into(
+        [sys.executable, "-c", TERMINAL_HARNESS, str(tmp_path)],
+        [
+            (b"choice [1/2/3/4]", b"7\r"),
+            (b"choose one of 1, 2, 3, 4", b"4\r"),
+            (b"model (qwen3-coder)", b"\r"),
+        ],
+    )
+    assert status == 0, drawn
+    assert load_config(home=str(tmp_path), project=None, env={}).roles.main == "ollama"
