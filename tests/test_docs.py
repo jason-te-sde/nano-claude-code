@@ -6,6 +6,9 @@ goes wrong, since it is code that moves and the prose that stays.
 """
 
 import re
+import shlex
+import subprocess
+import sys
 import tomllib
 from dataclasses import fields
 from pathlib import Path
@@ -19,11 +22,18 @@ from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, load_config
 from nanoclaude.config.schema import ROLES, LimitsConfig, ModelConfig, PermissionsConfig, UiConfig
 from nanoclaude.permissions.danger.regex import RegexClassifier
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CONSERVATIVE_DEFAULT, capabilities_for
+from nanoclaude.tools.registry import default_registry
+from nanoclaude.tools.todo import TodoState
+from tests.script_modules import load_script
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src" / "nanoclaude"
 DOCS = ROOT / "docs"
 DESIGN = DOCS / "design"
+README = ROOT / "README.md"
+SECURITY = ROOT / "SECURITY.md"
+CONTRIBUTING = ROOT / "CONTRIBUTING.md"
+CHANGELOG = ROOT / "CHANGELOG.md"
 CONFIGURATION = DOCS / "configuration.md"
 ARCHITECTURE = DOCS / "architecture.md"
 TESTING = DOCS / "testing.md"
@@ -31,7 +41,7 @@ TESTING = DOCS / "testing.md"
 #: The documents about the program as it is, as opposed to the design notes, which argue for
 #: decisions and may name things that are not built. Checks that a document names only what
 #: exists run over these.
-DOCUMENTS = (CONFIGURATION, ARCHITECTURE, TESTING)
+DOCUMENTS = (README, CONFIGURATION, ARCHITECTURE, TESTING, SECURITY, CONTRIBUTING, CHANGELOG)
 
 #: The design notes that exist. The ones the shell and the syntax-tree classifier need are
 #: written with them, so they are not in this list yet: 0008, 0009 and 0011 are left for
@@ -364,6 +374,39 @@ def test_every_toml_example_says_whose_file_it_is_and_loads(document, first, bod
         load_config(home=str(home), project=str(project), env={})
 
 
+def _ncc_commands() -> list[str]:
+    return [
+        command
+        for document in DOCUMENTS
+        for command in re.findall(r"^\s*(ncc [^\n]+)$", _text(document), re.MULTILINE)
+    ]
+
+
+def test_every_command_in_the_documents_runs(tmp_path):
+    """Documented commands are executed, not written from memory."""
+    executed = 0
+    for command in _ncc_commands():
+        if "-p " in command or "init" in command:
+            continue  # these need a key, or a terminal
+        arguments = shlex.split(command)[1:]
+        result = subprocess.run(  # noqa: S603 - this interpreter, arguments from our own documents
+            [sys.executable, "-m", "nanoclaude.cli.main", *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env={"PATH": "/usr/bin:/bin", "NANOCLAUDE_HOME": str(tmp_path)},
+            timeout=60,
+        )
+        executed += 1
+        assert result.returncode in (0, 2), (
+            f"{command!r} exited {result.returncode}: {result.stderr}"
+        )
+        if arguments in (["--version"], ["--help"]):
+            assert result.returncode == 0, f"{command!r} exited {result.returncode}"
+    assert executed >= 1, "no documented command was run, so none was checked"
+
+
 # --------------------------------------------------------------------------
 # Links
 # --------------------------------------------------------------------------
@@ -534,3 +577,163 @@ def test_the_regex_classifier_does_not_yet_mark_its_clear_verdicts_as_unreliable
         "correct the paragraph on the danger classifier in docs/architecture.md"
     )
     assert "does not mark its verdicts so yet" in _text(ARCHITECTURE)
+
+
+# --------------------------------------------------------------------------
+# The README
+# --------------------------------------------------------------------------
+
+README_SECTIONS = [
+    "Install",
+    "Why this and not Claude Code",
+    "Roles",
+    "Safety",
+    "Configuration",
+    "What v0.1 does not do",
+    "Numbers",
+]
+
+
+def test_the_readme_has_the_sections_it_is_meant_to_have_and_no_others():
+    headings = re.findall(r"^## (.+?)\s*$", _text(README), re.MULTILINE)
+    assert headings == README_SECTIONS
+
+
+def test_the_readme_opens_with_the_one_line_that_says_what_this_is():
+    assert (
+        "A terminal coding agent that works with Anthropic, OpenAI-compatible and local models."
+        in _text(README)
+    )
+
+
+def test_every_tool_in_the_readme_exists_and_every_tool_is_in_the_readme():
+    registry = {tool.name for tool in default_registry(TodoState())}
+    assert registry, "the registry is empty"
+    readme = _text(README)
+    for name in registry:
+        assert name in readme, f"{name} is not mentioned in the README"
+    rows = _table_rows(_section(readme, "Safety"))
+    listed = {row[0].strip("`") for row in rows if re.fullmatch(r"`[A-Z][A-Za-z]+`", row[0])}
+    assert listed == registry, (
+        f"the README's tool table has {sorted(listed)}; the registry has {sorted(registry)}"
+    )
+
+
+def test_the_readme_says_which_tools_are_not_built_and_names_no_other_as_built():
+    readme = _text(README)
+    assert "Not built yet: `Bash` and `Git`" in readme
+    registry = {tool.name for tool in default_registry(TodoState())}
+    assert "Bash" not in registry
+    assert "Git" not in registry
+
+
+def test_every_slash_command_in_the_readme_exists():
+    readme = _text(README)
+    for name in _SLASH_COMMAND.findall(readme):
+        assert name in COMMANDS, f"/{name} is documented but not implemented"
+
+
+def test_the_readme_quotes_no_unmeasured_benchmark():
+    """Numbers appear here only when scripts/measure.py produced them."""
+    readme = _text(README).lower()
+    for claim in ("faster than", "% success", "outperforms", "success rate", "benchmark"):
+        assert claim not in readme, f"the README says {claim!r}"
+
+
+def test_the_readme_says_init_writes_the_configuration_and_then_checks_the_key():
+    readme = _text(README)
+    assert "before saving" not in readme, "init does not check the key before it saves"
+    assert "writes the file first and checks the key afterwards" in readme
+
+
+def test_the_readme_says_why_a_project_cannot_grant_itself_permissions():
+    sentence = (
+        "a cloned repository must not be able to grant itself permissions or redirect your API key"
+    )
+    assert sentence.lower() in _text(README).lower()
+    assert sentence.lower() in _text(CONFIGURATION).lower()
+
+
+def test_the_readme_repeats_the_list_in_the_scope_note_word_for_word():
+    note = _text(DESIGN / "0001-scope.md").split("## Why")[0]
+    in_note = [line for line in note.splitlines() if line.startswith("- ")]
+    section = _section(_text(README), "What v0.1 does not do")
+    in_readme = [line for line in section.splitlines() if line.startswith("- ")]
+    assert len(in_note) >= 20, "the scope note lists too few items to be the whole list"
+    assert in_readme == in_note
+
+
+def test_the_security_document_lists_an_untrusted_project_configuration_and_what_it_may_set():
+    text = _text(SECURITY)
+    assert "A project's configuration file" in text
+    for setting in (
+        "allow",
+        "base_url",
+        "api_key_env",
+        "deny",
+        "ask",
+        "max_turns",
+        "bash_timeout_s",
+    ):
+        assert f"`{setting}`" in text, f"SECURITY.md does not mention {setting}"
+
+
+# --------------------------------------------------------------------------
+# The numbers
+# --------------------------------------------------------------------------
+
+
+def _numbers_table() -> dict[str, str]:
+    rows = _table_rows(_section(_text(README), "Numbers"))
+    return {row[1].strip("`"): row[2] for row in rows if re.fullmatch(r"`[a-z_.]+`", row[1])}
+
+
+def _plain_number(text: str) -> float:
+    return float(text.replace(",", "").rstrip("%"))
+
+
+def test_the_readmes_numbers_are_the_ones_measure_prints():
+    measure = load_script("measure")
+    cheap = measure.cheap_metrics()
+    live = {
+        "tests": cheap["tests"],
+        "lines.src": cheap["lines"]["src"],
+        "lines.tests": cheap["lines"]["tests"],
+        "tools": cheap["tools"],
+        "adapters": cheap["adapters"],
+    }
+    documented = _numbers_table()
+    assert set(documented) == {*live, "coverage_percent", "danger_corpus"}, (
+        f"the README's table has the keys {sorted(documented)}"
+    )
+    for key, value in live.items():
+        assert _plain_number(documented[key]) == value, (
+            f"the README says {key} is {documented[key]}; scripts/measure.py finds {value}. "
+            "Run python scripts/measure.py and update the Numbers table."
+        )
+    corpus = cheap["danger_corpus"]
+    expected = (
+        f"{corpus['missed_by_regex']} of {corpus['dangerous']}"
+        if corpus["measured"]
+        else "not measured yet"
+    )
+    assert documented["danger_corpus"] == expected
+    # Coverage needs the whole suite to run, so it cannot be recomputed from inside it.
+    assert 0 < _plain_number(documented["coverage_percent"]) <= 100
+
+
+def test_every_figure_has_the_command_that_produced_it():
+    rows = _table_rows(_section(_text(README), "Numbers"))
+    figures = [row for row in rows if re.fullmatch(r"`[a-z_.]+`", row[1])]
+    assert len(figures) == 7
+    for row in figures:
+        assert "python scripts/measure.py" in row[3], f"{row[1]} has no command"
+
+
+def test_no_figure_is_quoted_in_the_readme_outside_the_numbers_table():
+    readme = _text(README)
+    prose = readme.replace(_section(readme, "Numbers"), "")
+    quoted = re.findall(
+        r"\d[\d,]*(?:\.\d+)?%?\s+(?:tests|lines|tools|adapters|coverage)\b|coverage of \d", prose
+    )
+    assert quoted == [], f"the README quotes {quoted} outside the table that measure.py feeds"

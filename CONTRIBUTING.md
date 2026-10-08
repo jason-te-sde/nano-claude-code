@@ -34,36 +34,24 @@ is not a guarantee — it is the fast check you run before pushing, not a substi
 ```
 <type>(<scope>): <imperative summary, no trailing period>
 
-<body: why this change, not just what it does>
+<body: why this change, what was considered and rejected, what it does not do, and how far
+it was verified>
 ```
 
 Scopes are the packages under `src/nanoclaude/`: `cli`, `agent`, `conversation`, `tools`,
-`permissions`, `providers`, `context`, `checkpoint`, `mcp`, `hooks`, `config`. Use `build` for
-packaging, CI and tooling changes that are not specific to one module, or omit the scope
-entirely for a change that spans the whole repository. Common types: `feat`, `fix`, `refactor`,
-`test`, `docs`, `ci`, `build`, `chore`.
+`permissions`, `providers`, `context`, `config`, and `checkpoint`, `mcp` and `hooks` once they
+exist. Use `build` for packaging, CI and tooling changes that are not specific to one module,
+or omit the scope entirely for a change that spans the whole repository. Common types: `feat`,
+`fix`, `refactor`, `test`, `docs`, `ci`, `build`, `chore`.
 
 Commit messages and everything else in this repository are English only — see Hygiene below.
 
 ## Tests
 
-Every behavioural change needs a test that fails without it. The suite has seven layers, per the
-design spec's own testing section; put a new test in the cheapest layer that can catch its bug.
-
-| Layer | What it covers | Speed |
-| --- | --- | --- |
-| 1. Unit | Pure functions and algorithms — the edit algorithm, permission decisions, dangerous-command classification, compaction, budget packing, secret redaction — table-driven and with `hypothesis` | milliseconds |
-| 2. Tool | A tool against a real temporary directory, a real subprocess, or a real git fixture repository | seconds |
-| 3. Adapter | Recorded-cassette replay for each provider adapter, plus an assertion that request bodies match that provider's documented shape. Cassettes are recorded once against a real key by `scripts/record-cassettes.py`, redacted, and committed; each provider covers at least a plain-text reply, a single tool call, parallel tool calls, a streaming interruption, and a 429 | seconds |
-| 4. Session | A scripted fake model driving the whole agent loop, including adversarial scripts: an edit without reading first, a path escape, malformed arguments, a 10MB output | seconds |
-| 5. End-to-end | `ncc -p` against a fixture repository, asserting the exit code and the shape of its JSON output | seconds |
-| 6. Differential | The regex and AST dangerous-command classifiers, run side by side over the same few hundred commands; every disagreement is either a documented gap or a fixed bug | seconds |
-| 7. Bench | Real models, scored by whether a fixture repository's own test suite passes, not by human or LLM judgment. Not part of regular CI — a nightly job runs only the local-Ollama rows | minutes |
-
-Today, only two of these have any code behind them: a handful of unit-style tests (the hygiene
-checks) and the CLI smoke test. Tool, adapter, session, end-to-end, differential and bench all
-arrive with the subsystem they exercise — a provider adapter needs to exist before it has
-cassettes, a dangerous-command classifier before it has a differential corpus, and so on.
+Every behavioural change needs a test that fails without it: write the test, watch it fail for
+the reason you expect, then make it pass. Put a new test in the cheapest layer that can catch its
+bug. [`docs/testing.md`](docs/testing.md) describes the layers that exist, what the helpers are,
+and, in a section of its own, what the suite does not cover.
 
 Rules that matter in practice:
 
@@ -71,6 +59,30 @@ Rules that matter in practice:
   with a deadline, so the suite behaves the same on a loaded CI runner as on a laptop.
 - Anything randomized takes a seed and prints it on failure.
 - An assertion failure should identify the state, not just the expected value.
+- A test that depends on something in the environment asserts that it ran. A skipped dependency
+  that turns the suite green looks exactly like a pass.
+- A check that loops over a set of things asserts that the set is not empty.
+- Coverage is a smoke alarm and not a target.
+
+## Documentation
+
+The documents make claims, and `tests/test_docs.py` checks the ones a test can: the commands,
+keys, defaults, exit codes, rule ids and tools a document names exist, every TOML example is
+loaded by the real configuration loader, every link resolves, and the figures in the README's
+numbers table are the ones `scripts/measure.py` produces.
+
+- When a number in the README goes stale the docs test says so. Run `python scripts/measure.py`
+  and copy its output into the table. Never write a figure there that the script did not print.
+- A decision that a reader would otherwise have to reconstruct from the code gets a note in
+  `docs/design/`, numbered next after the last, with exactly three sections: `## Why`,
+  `## Costs` and `## Rejected alternatives`. The costs say where the code falls short of the
+  idea. A change to a tool's description, which is a prompt, needs a note too.
+- A document that says a thing is not built is checked by a test that fails when it is built.
+  When one fails for that reason, the document is what to correct.
+- Every hosted model id in an example is checked against the provider's own list on the day it
+  is written, and the date is said.
+- An example that shows `allow`, `base_url` or `api_key_env` belongs in the home file's
+  example, and says so on its first line.
 
 ## Hygiene
 
@@ -85,4 +97,9 @@ onward:
    commit trailer crediting a model, a line claiming a change was produced by one, and similar
    constructions — not the word "Claude" on its own. The project is named nano-claude-code,
    `NOTICE` carries a required trademark statement, and `providers/anthropic.py` is a real
-   module name; all three must keep passing.
+   module name; all three must keep passing. The shapes are described, and why, in
+   [`docs/design/0016-attribution-policy.md`](docs/design/0016-attribution-policy.md), in words
+   that do not themselves match.
+
+The check reads tracked files only, so run `git add` on a new file before you run it. Tools that
+write commit messages may add their own trailer by default; delete it before you commit.
