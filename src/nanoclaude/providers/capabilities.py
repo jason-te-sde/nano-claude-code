@@ -15,6 +15,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+#: The cache's file, inside the directory ncc keeps its state in. Named once, so that the
+#: command that reads the cache and the one that clears it cannot disagree about where it is.
+CACHE_FILENAME = "capabilities.json"
+
 CacheStyle = Literal["explicit", "automatic", "none"]
 ReasoningStyle = Literal["none", "thinking", "opaque"]
 
@@ -53,6 +57,16 @@ _KNOWN: dict[tuple[str, str], Capabilities] = {
     # The alias and the dated id it points to.
     ("anthropic", "claude-haiku-4-5"): _HAIKU_4_5,
     ("anthropic", "claude-haiku-4-5-20251001"): _HAIKU_4_5,
+    # The model ncc init offers for OpenRouter. Checked 2026-10-07 against OpenRouter's public
+    # model list (https://openrouter.ai/api/v1/models): tools and tool_choice are supported
+    # and the entry prices cached reads, so the capabilities are the "deepseek" family's;
+    # what differs is the window, 1_024_000 against the family's 64_000. Without this row the
+    # model would be compacted as if its window were 64K. The listing's own output ceiling is
+    # 384_000, but OpenRouter can route a request to another host that caps lower, so the
+    # budget is the lower figure 64_000, which a routed host is more likely to meet.
+    ("openai_compat", "deepseek/deepseek-v4-pro"): Capabilities(
+        True, True, "automatic", 1_024_000, 64_000
+    ),
 }
 
 #: Prefix rules for families whose members all behave alike. Checked in order.
@@ -103,6 +117,15 @@ class CapabilityCache:
             # missing file -- empty, not an error.
             return {}
         return data
+
+    def clear(self) -> None:
+        """Forget every model, so that the next run probes each one again.
+
+        A cache that was never written is already clear. A path that cannot be removed
+        raises ``OSError``, naming it: the stale answers would stay in force, and which
+        file to delete by hand is for the caller to say.
+        """
+        self.path.unlink(missing_ok=True)
 
     def get(self, adapter: str, model: str) -> Capabilities | None:
         raw = self._load().get(f"{adapter}/{model}")

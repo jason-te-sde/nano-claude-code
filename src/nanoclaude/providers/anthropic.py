@@ -30,6 +30,7 @@ from nanoclaude.conversation.transcript import (
 )
 from nanoclaude.providers.base import (
     CredentialsError,
+    EmptyReplyError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -38,7 +39,11 @@ from nanoclaude.providers.base import (
     Usage,
     partial_reply,
 )
-from nanoclaude.providers.retry import classify_status, classify_stream_error
+from nanoclaude.providers.retry import (
+    NOT_A_REPLY_STREAM,
+    classify_status,
+    classify_stream_error,
+)
 
 DEFAULT_MODEL = "claude-sonnet-5"
 DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -117,10 +122,12 @@ class StreamAccumulator:
         self._signature: dict[int, list[str]] = {}
         self._stop = StopKind.END_TURN
         self._usage = Usage()
+        self._saw_message_start = False
         self._saw_message_stop = False
 
     def handle(self, event: str, data: Mapping[str, Any]) -> None:
         if event == "message_start":
+            self._saw_message_start = True
             message = data.get("message", {})
             self._model = message.get("model", self._model)
             usage = message.get("usage", {})
@@ -230,7 +237,11 @@ class StreamAccumulator:
                 call_id, name = meta
                 blocks.append(ToolUseBlock(call_id, name, self._decode(index, name)))
         if not blocks:
-            raise ModelError("the provider returned no content blocks")
+            if not (self._saw_message_start and self._saw_message_stop):
+                # A reply that is empty ran from message_start to message_stop. Anything else
+                # (a page, an empty body, a stream that stopped before it began) never was one.
+                raise ModelError(NOT_A_REPLY_STREAM)
+            raise EmptyReplyError("the provider returned no content blocks")
         return ModelReply(tuple(blocks), self._stop, self._usage, self._model)
 
     def _decode(self, index: int, name: str) -> Mapping[str, Any]:
@@ -333,7 +344,7 @@ class AnthropicClient:
             async with self._client.stream(
                 "POST", url, headers=self._headers, json=self.payload(request)
             ) as response:
-                if response.status_code >= 400:
+                if not response.is_success:
                     body = (await response.aread()).decode("utf-8", errors="replace")
                     raise classify_status(response.status_code, body)
                 async for event, data in iter_sse(response.aiter_lines()):

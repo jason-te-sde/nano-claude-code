@@ -31,6 +31,7 @@ from nanoclaude.conversation.transcript import (
 )
 from nanoclaude.providers.base import (
     CredentialsError,
+    EmptyReplyError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -40,7 +41,11 @@ from nanoclaude.providers.base import (
     new_call_id,
     partial_reply,
 )
-from nanoclaude.providers.retry import classify_status, classify_stream_error
+from nanoclaude.providers.retry import (
+    NOT_A_REPLY_STREAM,
+    classify_status,
+    classify_stream_error,
+)
 
 _FINISH = {
     "stop": StopKind.END_TURN,
@@ -250,7 +255,11 @@ class ChunkAccumulator:
                 )
             )
         if not blocks:
-            raise ModelError("the provider returned no content")
+            if not self._finished:
+                # Not one chunk said the reply was over, and none carried anything: a page, an
+                # empty body, a whole reply that was not streamed. It never was a reply stream.
+                raise ModelError(NOT_A_REPLY_STREAM)
+            raise EmptyReplyError("the provider returned no content")
         return ModelReply(tuple(blocks), self._stop, self._usage, self._model)
 
 
@@ -314,7 +323,7 @@ class OpenAICompatClient:
             async with self._client.stream(
                 "POST", url, headers=self._headers, json=self.payload(request)
             ) as response:
-                if response.status_code >= 400:
+                if not response.is_success:
                     body = (await response.aread()).decode("utf-8", errors="replace")
                     raise classify_status(response.status_code, body)
                 async for line in response.aiter_lines():

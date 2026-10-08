@@ -89,6 +89,16 @@ def classify_status(status: int, body: str) -> ModelError:
             "check the key, or run: ncc init",
             status=status,
         )
+    if 300 <= status < 400:
+        # httpx does not follow one, and the page behind it is not an answer. A captive
+        # portal sends one, and so does an address that has moved.
+        return ModelError(
+            f"the provider answered with a redirect (HTTP {status}) instead of a reply "
+            "\u2014 the address (base_url) is probably wrong, or something on the network is "
+            "answering in its place",
+            retryable=False,
+            status=status,
+        )
     if status == 404:
         return ModelError(
             f"the provider does not know that model or endpoint (HTTP 404): {detail}",
@@ -157,16 +167,25 @@ def unreadable_stream(
     )
 
 
+#: What is said of an answer that was read as a reply stream and was not one: a page where the
+#: stream goes, a proxy's error, a captive portal's sign-in. Not a failure of this program, and
+#: not worth asking again.
+NOT_A_REPLY_STREAM = "the provider's answer was not a reply stream"
+
+
 def classify_stream_error(exc: Exception, partial: ModelReply | None) -> ModelError | None:
     """What a failure inside a stream's loop means, or None to raise it as it came.
 
     A connection that failed is :func:`classify_transport`. Anything else the loop raised
     (httpx.DecodingError, a line that is not JSON, any other ValueError) is kept as a
-    cut-off once some of the reply has arrived, and before that is left as it always was.
+    cut-off once some of the reply has arrived. Before that, a line that is not JSON is
+    :data:`NOT_A_REPLY_STREAM` and the rest is left as it always was.
     """
     if isinstance(exc, httpx.TransportError):
         return classify_transport(exc, partial)
     if partial is None:
+        if isinstance(exc, json.JSONDecodeError):
+            return ModelError(NOT_A_REPLY_STREAM, retryable=False)
         return None
     return unreadable_stream(exc, partial)
 

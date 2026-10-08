@@ -45,6 +45,7 @@ from nanoclaude.agent.session import (
     new_session_id,
 )
 from nanoclaude.agent.ui import UI, AutoDecline
+from nanoclaude.cli.init import run_init
 from nanoclaude.cli.render import ConsoleUI, show_error
 from nanoclaude.cli.repl import run_repl
 from nanoclaude.config.load import CONFIG_DIRNAME, ConfigError, expand_root, load_config
@@ -57,7 +58,7 @@ from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.permissions.sandbox import Sandbox
 from nanoclaude.providers.base import CredentialsError, ModelError
-from nanoclaude.providers.capabilities import CapabilityCache
+from nanoclaude.providers.capabilities import CACHE_FILENAME, CapabilityCache
 from nanoclaude.tools.base import sanitize
 from nanoclaude.tools.registry import default_registry
 from nanoclaude.tools.todo import TodoState
@@ -79,8 +80,24 @@ _PROVIDER_ADVICE = "try again, or choose another model with --model"
 
 
 def nanoclaude_home() -> Path:
-    """The directory that holds ``.nanoclaude``: the person's home, unless told otherwise."""
-    return Path(os.environ.get("NANOCLAUDE_HOME", str(Path.home())))
+    """The directory that holds ``.nanoclaude``: the person's home, unless told otherwise.
+
+    ``NANOCLAUDE_HOME`` may start with ``~``, as every other path a person writes may, and
+    it is expanded here: the loader expands it too, so a path left as it was would be one
+    place for what writes the config and another for what reads it.
+
+    Raises :class:`~nanoclaude.config.load.ConfigError` for ``~name`` with no such user.
+    """
+    given = os.environ.get("NANOCLAUDE_HOME")
+    if given is None:
+        return Path.home()
+    try:
+        return Path(given).expanduser()
+    except RuntimeError as exc:
+        raise ConfigError(
+            f"NANOCLAUDE_HOME is {given!r}, which starts with ~ but names no home directory "
+            "\u2014 write the full path, or unset it"
+        ) from exc
 
 
 class UsageError(Exception):
@@ -115,6 +132,11 @@ _OUTPUT_FORMATS = ("text", "json")
 
 _FLAGS_HELP = "run ncc --help for the flags there are"
 
+#: The commands ncc has, beside running a prompt. ``ncc init`` is the only one.
+_COMMANDS = ("init",)
+#: What argparse calls the place a command goes, in the message it words for a wrong one.
+_COMMAND = "COMMAND"
+
 _EXPECTED_ONE = re.compile(r"argument (?P<flag>\S+): expected one argument")
 _INVALID_CHOICE = re.compile(
     r"argument (?P<flag>\S+): invalid choice: (?P<value>.*?) \(choose from", re.DOTALL
@@ -146,6 +168,12 @@ def _flag_error(message: str) -> str:
             value = ast.literal_eval(match["value"])
         except (ValueError, SyntaxError):
             value = match["value"]
+        if flag == _COMMAND:
+            # What was typed where a command goes is most often a task, said without -p.
+            return (
+                f"{value} is not a command \u2014 the only command is {', '.join(_COMMANDS)}; "
+                "to give ncc a task, pass it with -p"
+            )
         what, choices = ("mode", _MODES) if flag == "--mode" else ("format", _OUTPUT_FORMATS)
         return f"{flag} {value} is not a {what} — choose one of {', '.join(choices)}"
     if match := _NOT_ALLOWED.fullmatch(message):
@@ -184,6 +212,13 @@ def build_parser() -> argparse.ArgumentParser:
         # A flag is spelled out. With abbreviations on, --dangerously-skip would turn the
         # permission checks off, and spec 6.2 gives that flag its long name on purpose.
         allow_abbrev=False,
+    )
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=_COMMANDS,
+        metavar=_COMMAND,
+        help="init: pick a provider, give a key, and write the config; run it once, first",
     )
     parser.add_argument("-p", "--print", dest="prompt", metavar="PROMPT", help="run once and exit")
     # No default: whether it was given at all is what says it has no use without a prompt.
@@ -242,8 +277,10 @@ def main(argv: list[str] | None = None) -> int:
         show_error(_stderr_console(flagged), str(exc))
         return EXIT_CODES["usage"]
     err = _stderr_console(args.no_color)
-    home = nanoclaude_home()
     try:
+        home = nanoclaude_home()
+        if args.command == "init":
+            return _init(args, home, err, sys.argv[1:] if argv is None else argv)
         if args.prompt is not None and not args.prompt.strip():
             raise UsageError("-p needs a prompt — pass the task as its argument")
         if args.prompt is None and args.output_format is not None:
@@ -283,13 +320,44 @@ def main(argv: list[str] | None = None) -> int:
     except BrokenPipeError:
         _abandon_stdout()
         return EXIT_CODES["output_closed"]
-    except KeyboardInterrupt:
-        show_error(err, "interrupted \u2014 nothing more was done; run again to retry")
+    except KeyboardInterrupt as exc:
+        # Ctrl+C has no words of its own; one that came with a message (ncc init, interrupted
+        # after it wrote the config) has, and a person who is told nothing more was done when
+        # a file was written is told something false.
+        show_error(err, str(exc) or "interrupted \u2014 nothing more was done; run again to retry")
         return EXIT_CODES["interrupted"]
     except Exception as exc:
         # Last, after every exception that has a line and a code of its own. A script reads
         # the exit code and the first line of stderr, and a traceback is neither.
         show_error(err, _unexpected(exc))
+        return EXIT_CODES["stopped"]
+
+
+def _init(args: argparse.Namespace, home: Path, err: Console, typed: Sequence[str]) -> int:
+    """``ncc init``: the questions, the config and the check, in ``home``.
+
+    It asks, so it has no use without somebody to answer: with no terminal it says so in its
+    own words, before it asks anything, and not as the no-prompt error of a run that lost
+    its ``-p``. Every flag but ``--no-color`` shapes a session and init starts none, so one
+    that is given is refused and not ignored: a setting the person believes is in force and
+    is not is what this program refuses everywhere else.
+    """
+    for word in typed:
+        if word.startswith("-") and word != "--no-color":
+            raise UsageError(
+                f"ncc init takes no {word} \u2014 run it on its own "
+                "(--no-color is the only flag that goes with it)"
+            )
+    if not _stdin_is_terminal():
+        raise UsageError("ncc init asks questions \u2014 run it in a terminal")
+    try:
+        return run_init(_stdout_console(args.no_color), home=home)
+    except EOFError:
+        show_error(
+            err,
+            "the input ended before ncc init was finished \u2014 nothing was written; "
+            "run ncc init again",
+        )
         return EXIT_CODES["stopped"]
 
 
@@ -520,7 +588,7 @@ def _build_session(
     try:
         _open(store)
         session_id, resume = _which_session(args, store, settings.root)
-        router = Router(config, CapabilityCache(state_dir / "capabilities.json"))
+        router = Router(config, CapabilityCache(state_dir / CACHE_FILENAME))
         todo = TodoState()
         # One redactor for what the tools return and for what the audit records: with
         # --allow-secrets a credentials file is read, and the redactor must let it through.

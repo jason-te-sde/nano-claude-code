@@ -10,11 +10,13 @@ the person: a store another process is using, and a store that cannot be opened.
 
 from __future__ import annotations
 
+import secrets
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from nanoclaude.agent.router import Router
@@ -119,6 +121,48 @@ def test_a_store_that_fails_part_way_is_reported_in_the_same_way(
     )
     assert (code, out) == (EXIT_CODES["stopped"], "")
     assert err == UNEXPECTED.format(what="OperationalError: disk I/O error")
+
+
+def answered_with(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) -> None:
+    """Every request a provider client makes is answered with ``response``, from nowhere."""
+    real = httpx.AsyncClient
+
+    def make(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        transport = httpx.MockTransport(lambda _request: response)
+        return real(*args, **{**kwargs, "transport": transport})
+
+    monkeypatch.setattr(httpx, "AsyncClient", make)
+
+
+@pytest.mark.parametrize("adapter", ["ollama", "anthropic", "openai_compat"])
+def test_a_page_where_a_reply_stream_should_be_is_a_provider_error_and_not_a_bug(
+    ncc_home, project, capsys, monkeypatch, adapter
+):
+    # A captive portal or a proxy answers 200 with HTML. Its first line is not JSON, and
+    # that used to come out as a JSONDecodeError, which is reported as a bug in ncc.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-" + secrets.token_urlsafe(24))
+    monkeypatch.setenv("TEST_COMPAT_API_KEY", "sk-" + secrets.token_urlsafe(24))
+    extra = 'base_url = "http://compat.invalid/v1"\napi_key_env = "TEST_COMPAT_API_KEY"\n'
+    (ncc_home / ".nanoclaude" / "config.toml").write_text(
+        f'[models.m]\nadapter = "{adapter}"\nmodel = "some-model"\n'
+        + (extra if adapter == "openai_compat" else "")
+    )
+    body = b"<html>Sign in to the network</html>\n"
+    if adapter != "ollama":
+        body = (
+            b"data: " + body + b"\n"
+            if adapter == "openai_compat"
+            else b"event: message_start\ndata: " + body + b"\n"
+        )
+    answered_with(monkeypatch, httpx.Response(200, content=body))
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello")
+    assert code == EXIT_CODES["provider"] == 4
+    assert out == ""
+    assert err == (
+        "error: the provider's answer was not a reply stream "
+        "\u2014 try again, or choose another model with --model\n"
+    )
+    assert "bug" not in err
 
 
 def test_the_exceptions_that_are_mapped_are_not_swallowed_by_the_general_one(

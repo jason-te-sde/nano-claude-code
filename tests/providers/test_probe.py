@@ -261,6 +261,27 @@ def test_put_overwrites_an_existing_cache_file(tmp_path):
     assert cache.get("ollama", "m") == second
 
 
+def test_clearing_forgets_every_model_so_the_next_run_probes_again(tmp_path):
+    cache = CapabilityCache(tmp_path / "caps.json")
+    cache.put("ollama", "a", CONSERVATIVE_DEFAULT)
+    cache.put("ollama", "b", CONSERVATIVE_DEFAULT)
+    cache.clear()
+    assert (cache.get("ollama", "a"), cache.get("ollama", "b")) == (None, None)
+    assert not (tmp_path / "caps.json").exists()
+
+
+def test_clearing_a_cache_that_was_never_written_is_not_an_error(tmp_path):
+    CapabilityCache(tmp_path / "nowhere" / "caps.json").clear()
+
+
+def test_a_cache_that_cannot_be_removed_says_so_and_does_not_pretend(tmp_path):
+    # A directory where the file should be: unlink refuses, and the refusal is the
+    # caller's to word. Swallowing it would leave the stale answers in force.
+    (tmp_path / "caps.json").mkdir()
+    with pytest.raises(OSError, match=r"caps\.json"):
+        CapabilityCache(tmp_path / "caps.json").clear()
+
+
 # -- resolve_capabilities: only a probe that found something out is remembered --
 
 

@@ -10,6 +10,7 @@ import pytest
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock, Transcript, user_text
 from nanoclaude.providers.base import (
     CredentialsError,
+    EmptyReplyError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -148,3 +149,17 @@ def test_a_credentials_error_is_never_retryable_and_cannot_be_made_so():
     assert CredentialsError("no key").retryable is False
     with pytest.raises(TypeError):
         CredentialsError("no key", retryable=True)  # type: ignore[call-arg]
+
+
+def test_an_empty_reply_is_a_model_error_so_every_handler_of_one_still_catches_it():
+    error = EmptyReplyError("the provider returned no content")
+    assert isinstance(error, ModelError)
+    assert str(error) == "the provider returned no content"
+    assert error.status is None and error.partial is None and error.context_overflow is False
+
+
+def test_an_empty_reply_is_never_retryable_and_cannot_be_made_so():
+    # Asked again, a model that spent its output cap thinking spends it the same way.
+    assert EmptyReplyError("nothing").retryable is False
+    with pytest.raises(TypeError):
+        EmptyReplyError("nothing", retryable=True)  # type: ignore[call-arg]

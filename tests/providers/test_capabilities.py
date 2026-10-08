@@ -41,6 +41,39 @@ def test_no_claude_row_ships_without_a_hand_checked_line_above():
     assert shipped == {model for model, _, _ in PUBLISHED}
 
 
+# One line per OpenRouter row in _KNOWN, written out by hand from OpenRouter's public model
+# list (https://openrouter.ai/api/v1/models), checked 2026-10-07: the context window the
+# listing gives for the model, and the output the program budgets (see the row's comment).
+LISTED = [
+    ("deepseek/deepseek-v4-pro", 1_024_000, 64_000),
+]
+
+
+@pytest.mark.parametrize(("model", "window", "max_output"), LISTED)
+def test_each_known_openrouter_model_carries_its_listed_limits(model, window, max_output):
+    caps = capabilities_for("openai_compat", model)
+    assert (caps.context_window, caps.max_output) == (window, max_output)
+    # What its listing says (tools, tool_choice, a cache-read price) and nothing it does not:
+    # text in, text out, and no reasoning style the adapter would have to read.
+    assert caps.native_tools and caps.parallel_tools
+    assert caps.cache == "automatic"
+    assert caps.reasoning == "none" and not caps.vision
+
+
+def test_a_listed_model_is_not_given_its_families_smaller_row():
+    # The "deepseek" family row is for 64K-window models; compaction is set from the window,
+    # so a million-token model that fell through to it would be compacted at about 45K tokens.
+    family = capabilities_for("openai_compat", "deepseek-chat")
+    listed = capabilities_for("openai_compat", "deepseek/deepseek-v4-pro")
+    assert family.context_window == 64_000
+    assert listed.context_window > 15 * family.context_window
+
+
+def test_no_openai_compat_row_ships_without_a_hand_checked_line_above():
+    shipped = {model for adapter, model in _KNOWN if adapter == "openai_compat"}
+    assert shipped == {model for model, _, _ in LISTED}
+
+
 def test_unknown_model_falls_back_to_the_conservative_default():
     caps = capabilities_for("openai_compat", "some-model-nobody-has-heard-of")
     assert caps == CONSERVATIVE_DEFAULT
