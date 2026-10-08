@@ -14,9 +14,10 @@ import pytest
 
 from nanoclaude.cli.commands import COMMANDS
 from nanoclaude.cli.init import PRESETS
-from nanoclaude.cli.main import EXIT_CODES
+from nanoclaude.cli.main import EXIT_CODES, main
 from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, load_config
 from nanoclaude.config.schema import ROLES, LimitsConfig, ModelConfig, PermissionsConfig, UiConfig
+from nanoclaude.permissions.danger.regex import RegexClassifier
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CONSERVATIVE_DEFAULT, capabilities_for
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -457,3 +458,79 @@ def test_the_testing_document_says_what_the_tests_do_not_cover():
             f"no item of the section is about {topic!r}; the items are {leads}"
         )
     assert "cassette" in section.lower(), "the section does not say what the cassettes are"
+
+
+# --------------------------------------------------------------------------
+# What the documents say is absent stays absent until they are corrected
+# --------------------------------------------------------------------------
+#
+# A document that says "nothing reads this yet" is true on the day it is written and false
+# the day somebody builds the reader. These fail on that day, and the failure message says
+# which document to correct.
+
+
+def _source() -> dict[str, str]:
+    return {
+        str(path.relative_to(SRC)): path.read_text(encoding="utf-8") for path in SRC.rglob("*.py")
+    }
+
+
+def test_nothing_reads_the_shell_limits_yet():
+    readers = {
+        name
+        for name, text in _source().items()
+        if re.search(r"\b(?:bash_timeout_s|output_cap_bytes)\b", text)
+    }
+    assert readers == {"config/schema.py", "config/load.py", "cli/init.py"}, (
+        f"{sorted(readers)} read bash_timeout_s or output_cap_bytes; "
+        "docs/configuration.md says that nothing does yet"
+    )
+
+
+def test_only_the_main_and_compact_roles_are_sent_requests():
+    used = set()
+    for text in _source().values():
+        used |= set(re.findall(r'router\.(?:client_for|capabilities_for)\(\s*"(\w+)"', text))
+        used |= set(re.findall(r'self\._complete\(\s*"(\w+)"', text))
+    assert used == {"main", "compact"}, (
+        f"requests are sent to the roles {sorted(used)}; docs/configuration.md and "
+        "docs/design/0005-role-model-routing.md say that only main and compact are"
+    )
+
+
+def test_nothing_acts_on_the_capability_fields_the_notes_say_are_not_consulted():
+    for name, text in _source().items():
+        if name == "providers/capabilities.py":
+            continue
+        found = re.findall(r"\.(?:parallel_tools|vision|reasoning)\b|capabilities\.cache\b", text)
+        assert found == [], (
+            f"{name} reads {found}; docs/design/0003-capability-negotiation.md says that "
+            "parallel_tools, cache, reasoning and vision are not consulted"
+        )
+
+
+def test_nothing_reads_the_ui_settings():
+    readers = {
+        name
+        for name, text in _source().items()
+        if re.search(r"UiConfig|diff_style|config\.ui\b|\.theme\b", text)
+    }
+    assert readers == {"config/schema.py", "config/load.py"}, (
+        f"{sorted(readers)} read the [ui] settings; docs/configuration.md says that nothing does"
+    )
+
+
+def test_ncc_has_no_audit_command_and_the_scope_note_says_so(capsys):
+    assert main(["audit"]) == EXIT_CODES["usage"]
+    capsys.readouterr()
+    assert "`ncc audit`" in _text(DESIGN / "0001-scope.md")
+
+
+def test_the_regex_classifier_does_not_yet_mark_its_clear_verdicts_as_unreliable():
+    """The architecture document says so, as something the shell tool's task has to do."""
+    verdict = RegexClassifier().classify("ls -la")
+    assert verdict.authoritative is True, (
+        "the regex classifier now marks its safe verdicts as not authoritative; "
+        "correct the paragraph on the danger classifier in docs/architecture.md"
+    )
+    assert "does not mark its verdicts so yet" in _text(ARCHITECTURE)
