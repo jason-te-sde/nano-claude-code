@@ -12,6 +12,7 @@ from nanoclaude.permissions.policy import (
     PermissionResult,
     Policy,
     evaluate,
+    read_refusal,
 )
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.permissions.sandbox import Sandbox
@@ -629,3 +630,59 @@ def test_a_session_grant_does_not_promote_the_regex_classifiers_own_safe_verdict
     )
     assert result.decision is Decision.ASK
     assert result.rule != "grant.session"
+
+
+# ---- the read verdict: what every way a file's contents reach the model asks first
+
+
+def test_a_path_a_read_deny_rule_covers_is_refused_for_reading():
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(secrets/**)"]))
+    refusal = read_refusal(p, "/p/secrets/notes.txt")
+    assert refusal is not None
+    assert (refusal.decision, refusal.rule) == (Decision.DENY, "rule.deny")
+    assert "Read(secrets/**)" in refusal.reason
+
+
+def test_a_credentials_path_is_refused_for_reading():
+    refusal = read_refusal(policy(), "/p/.env")
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
+def test_a_path_outside_the_sandbox_is_refused_for_reading():
+    refusal = read_refusal(policy(), "/etc/passwd")
+    assert refusal is not None and refusal.rule == "sandbox.outside-root"
+
+
+def test_an_ordinary_path_is_not_refused_for_reading():
+    assert read_refusal(policy(), "/p/src/a.py") is None
+
+
+def test_allow_secrets_lifts_the_credentials_refusal_but_not_the_deny_rule():
+    p = policy(allow_secrets=True, rules=RuleSet.build(allow=["Read"], deny=["Read(**/vault.txt)"]))
+    assert read_refusal(p, "/p/.env") is None
+    refusal = read_refusal(p, "/p/vault.txt")
+    assert refusal is not None and refusal.rule == "rule.deny"
+
+
+def test_only_a_deny_rule_for_read_governs_reading():
+    """A rule for another tool says nothing about what Read may show."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Write(secrets/**)", "Bash(cat:*)"]))
+    assert read_refusal(p, "/p/secrets/notes.txt") is None
+
+
+def test_the_first_spelling_that_is_refused_decides():
+    """A file reached through a link has two spellings, and either one being refused
+    is enough."""
+    p = policy()
+    assert read_refusal(p, "/p/notes.txt", "/p/.env") is not None
+    assert read_refusal(p, "/p/.env", "/p/notes.txt") is not None
+    assert read_refusal(p, "/p/notes.txt", "/p/real.txt") is None
+
+
+def test_the_read_verdict_is_the_one_read_itself_gets():
+    """Read and the verdict cannot drift apart: both ask evaluate."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(secrets/**)"]))
+    for path in ("/p/secrets/notes.txt", "/p/.env", "/etc/passwd", "/p/a.py"):
+        direct = evaluate(req(subject=path, paths=(path,)), p, Grants())
+        refusal = read_refusal(p, path)
+        assert (refusal is not None) == (direct.decision is Decision.DENY), path

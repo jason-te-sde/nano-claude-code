@@ -344,3 +344,35 @@ def test_the_fallback_search_skips_a_fifo_rather_than_waiting_on_it(tmp_path):
         fifo, python_search, "def hello", root=str(tmp_path), glob="*.py", limit=100
     )
     assert [Path(m.path).name for m in matches] == ["a.py"]
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            ripgrep_search,
+            marks=pytest.mark.skipif(not ripgrep_available(), reason="ripgrep not on PATH"),
+        ),
+        python_search,
+    ],
+)
+def test_neither_backend_reads_through_a_symlink(backend, tmp_path):
+    """ripgrep does not follow links, so a file reached only through one is not
+    searched. The fallback used to stat and read through them, which is how a link
+    inside the project to a file outside it had its lines returned. What a link
+    leads to is searched under its own name when it is in the project at all, so
+    nothing is lost by not following it.
+    """
+    project, outside = tmp_path / "project", tmp_path / "outside"
+    (project / "real").mkdir(parents=True)
+    outside.mkdir()
+    (outside / "private.txt").write_text("needle outside\n")
+    (project / "real" / "inside.txt").write_text("needle inside\n")
+    (project / "file_link.txt").symlink_to(outside / "private.txt")
+    (project / "dir_link").symlink_to(outside, target_is_directory=True)
+    (project / "inside_link.txt").symlink_to(project / "real" / "inside.txt")
+    (project / "inside_dir_link").symlink_to(project / "real", target_is_directory=True)
+
+    found = [m.path for m in backend("needle", root=str(project), glob=None, limit=100)]
+
+    assert [Path(p).relative_to(project).as_posix() for p in found] == ["real/inside.txt"]

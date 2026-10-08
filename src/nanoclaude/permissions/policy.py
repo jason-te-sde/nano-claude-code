@@ -191,6 +191,28 @@ def _unpromotable(danger: DangerVerdict | None) -> bool:
     return danger is not None and danger.level is DangerLevel.SAFE and not danger.authoritative
 
 
+def read_refusal(policy: Policy, *paths: str) -> PermissionResult | None:
+    """Why ``policy`` refuses to show the model this file, or None when it does not.
+
+    The Read tool is one way a file's contents reach the model; Grep's matches, an ``@``
+    mention inlined into a prompt and whatever comes next are others, and a rule that
+    refuses the first has to hold for all of them. They all ask this, which asks
+    :func:`evaluate` the question Read itself would be asked, so that what they refuse can
+    never drift away from what Read refuses: a ``Read(...)`` deny rule, a credentials path
+    (unless ``allow_secrets``), a path outside the sandbox. Only the hard-denial rows can
+    answer no to a read, so a verdict that is anything but a deny is a yes.
+
+    A file reached through a link has more than one spelling -- the link's own, and what it
+    resolves to -- and any of them being refused refuses the file: ``paths`` are all
+    spellings of one file, and the first refusal is the one returned.
+    """
+    for path in paths:
+        verdict = evaluate(PermissionRequest("Read", path, (path,)), policy)
+        if verdict.decision is Decision.DENY:
+            return verdict
+    return None
+
+
 def evaluate(
     request: PermissionRequest, policy: Policy, grants: Grants = _NO_GRANTS
 ) -> PermissionResult:

@@ -1,11 +1,14 @@
 import shutil
 from dataclasses import replace
+from pathlib import Path
 from typing import Never
 
 import pytest
 
-from nanoclaude.tools.base import ToolArgumentError
+from nanoclaude.permissions.rules import RuleSet
+from nanoclaude.tools.base import ToolArgumentError, ToolContext
 from nanoclaude.tools.grep import GrepTool
+from nanoclaude.tools.search import Match
 
 EXPECTED_DESCRIPTION = """Search file contents with a regular expression.
 
@@ -296,6 +299,132 @@ async def test_allow_secrets_lets_secret_file_matches_through(
     assert not outcome.is_error
     assert ".env" in outcome.content
     assert "hunter2" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_file_symlink_to_outside_the_sandbox_surfaces_nothing(
+    layout, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (layout.outside / "private.txt").write_text("needle from outside\n")
+    (layout.project / "notes.txt").symlink_to(layout.outside / "private.txt")
+    (layout.project / "real.txt").write_text("needle from inside\n")
+    for mode in ("content", "files", "count"):
+        outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle", "output_mode": mode})
+        assert "from outside" not in outcome.content, f"{mode}: {outcome.content}"
+        assert "notes.txt" not in outcome.content, f"{mode}: {outcome.content}"
+        assert "real.txt" in outcome.content, f"{mode}: {outcome.content}"
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_directory_symlink_to_outside_the_sandbox_surfaces_nothing(
+    layout, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (layout.outside / "private.txt").write_text("needle from outside\n")
+    (layout.project / "vendor").symlink_to(layout.outside, target_is_directory=True)
+    (layout.project / "real.txt").write_text("needle from inside\n")
+    outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle"})
+    assert "from outside" not in outcome.content
+    assert "vendor" not in outcome.content
+    assert "real.txt" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_link_inside_the_sandbox_to_a_credentials_file_surfaces_nothing(
+    layout, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (layout.project / ".env").write_text("needle=postgres://admin:hunter2@db.internal/prod\n")
+    (layout.project / "notes.txt").symlink_to(layout.project / ".env")
+    outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle", "-C": 1})
+    assert "hunter2" not in outcome.content
+    assert "notes.txt" not in outcome.content
+
+
+def _backend_that_reports(monkeypatch: pytest.MonkeyPatch, *paths: Path) -> None:
+    """A search backend that follows links: it reports a match in each of ``paths``
+    as it is spelled, whatever those paths lead to."""
+    monkeypatch.setattr(
+        "nanoclaude.tools.grep.search",
+        lambda *_a, **_k: [Match(str(p), 1, f"needle in {p.name}") for p in paths],
+    )
+
+
+async def test_matches_are_judged_by_where_their_path_leads_whichever_backend_found_them(
+    layout, monkeypatch
+):
+    """Grep does not trust a backend to have skipped what it must not show: a path
+    that resolves outside the sandbox, or to a credentials file, is dropped here
+    on what it resolves to, however innocent its own name is."""
+    (layout.outside / "private.txt").write_text("outside\n")
+    (layout.project / ".env").write_text("secret\n")
+    (layout.project / "to_outside.txt").symlink_to(layout.outside / "private.txt")
+    (layout.project / "to_env.txt").symlink_to(layout.project / ".env")
+    (layout.project / "real.txt").write_text("fine\n")
+    _backend_that_reports(
+        monkeypatch,
+        layout.project / "to_outside.txt",
+        layout.project / "to_env.txt",
+        layout.project / "real.txt",
+    )
+    outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle"})
+    assert "real.txt" in outcome.content
+    assert "to_outside" not in outcome.content
+    assert "to_env" not in outcome.content
+
+
+async def test_a_link_that_leads_somewhere_readable_inside_the_sandbox_is_kept(layout, monkeypatch):
+    """The check must not alarm on everything: a link to an ordinary file in the project
+    is as readable as the file."""
+    (layout.project / "real.txt").write_text("fine\n")
+    (layout.project / "alias.txt").symlink_to(layout.project / "real.txt")
+    _backend_that_reports(monkeypatch, layout.project / "alias.txt")
+    outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle"})
+    assert "needle in alias.txt" in outcome.content
+
+
+async def test_a_link_named_like_a_credentials_file_is_dropped_by_its_name(layout, monkeypatch):
+    (layout.project / "harmless.txt").write_text("fine\n")
+    (layout.project / ".env").symlink_to(layout.project / "harmless.txt")
+    _backend_that_reports(monkeypatch, layout.project / ".env")
+    outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle"})
+    assert ".env" not in outcome.content
+
+
+def _deny_reading(ctx: ToolContext, *rules: str) -> ToolContext:
+    return replace(ctx, policy=replace(ctx.policy, rules=RuleSet.build(deny=list(rules))))
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_read_deny_rule_also_keeps_grep_out_of_the_files_it_covers(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    """``deny = ["Read(secrets/**)"]`` refuses Read. It is a statement about what the
+    model may see of those files, so it holds for every other way their lines could
+    reach it: matches, the context around them, the names of the files, and the counts."""
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "secrets").mkdir()
+    (tmp_repo / "secrets" / "notes.txt").write_text("before\nneedle: launch code 1234\nafter\n")
+    (tmp_repo / "open.txt").write_text("needle: public\n")
+    denying = _deny_reading(ctx, "Read(secrets/**)")
+    for mode in ("content", "files", "count"):
+        outcome = await GrepTool().run(
+            denying, "t1", {"pattern": "needle", "output_mode": mode, "-C": 1}
+        )
+        assert not outcome.is_error, outcome.content
+        assert "secrets" not in outcome.content, f"{mode}: {outcome.content}"
+        assert "launch code" not in outcome.content, f"{mode}: {outcome.content}"
+        assert "before" not in outcome.content, f"{mode}: {outcome.content}"
+        assert "open.txt" in outcome.content, f"{mode}: {outcome.content}"
+
+
+async def test_a_deny_rule_for_another_tool_does_not_hide_files_from_grep(ctx, tmp_repo):
+    (tmp_repo / "secrets").mkdir()
+    (tmp_repo / "secrets" / "notes.txt").write_text("needle\n")
+    denying = _deny_reading(ctx, "Write(secrets/**)")
+    outcome = await GrepTool().run(denying, "t1", {"pattern": "needle"})
+    assert "secrets/notes.txt" in outcome.content
 
 
 def test_the_description_is_byte_identical_to_the_spec():

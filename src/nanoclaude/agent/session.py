@@ -285,7 +285,7 @@ class Session:
             prompt,
             root=self.root,
             redactor=self.redactor,
-            allow_secrets=self.policy.allow_secrets,
+            policy=self.policy,
         )
         return text
 

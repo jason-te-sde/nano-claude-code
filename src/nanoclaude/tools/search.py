@@ -7,7 +7,11 @@ fallback does the same job slowly, because "install ripgrep first" is not an
 acceptable thing to say to someone who just ran pipx install.
 
 The two backends are covered by the same test so the fallback cannot quietly
-become a different tool with the same name.
+become a different tool with the same name. That includes links: ripgrep does not
+follow a symbolic link, to a file or to a directory, so a file is searched under the
+name it really has and never through a link to it. The fallback does the same.
+Following links is how a link inside the project to a file outside it would have its
+lines returned.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import re
 import shutil
 import stat
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,8 +63,20 @@ def _ignore_spec(root: str) -> pathspec.PathSpec[PathspecPattern]:
     return pathspec.PathSpec.from_lines(GLOB_PATTERN_FACTORY, lines)
 
 
-def walk_files(root: str, *, pattern: str | None = None, limit: int = DEFAULT_LIMIT) -> list[str]:
-    """Absolute paths under ``root``, gitignore-aware, most recently modified first."""
+def walk_files(
+    root: str,
+    *,
+    pattern: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    keep: Callable[[str], bool] | None = None,
+) -> list[str]:
+    """Absolute paths under ``root``, gitignore-aware, most recently modified first.
+
+    ``keep`` is asked about each path that would otherwise be listed, and a path it
+    refuses is not. It is asked before ``limit`` is applied, not after: a refusal made
+    on the capped list would let a directory of refused entries crowd out every other.
+    A link to a directory is not entered, whatever it leads to.
+    """
     ignore = _ignore_spec(root)
     glob_spec = pathspec.PathSpec.from_lines(GLOB_PATTERN_FACTORY, [pattern]) if pattern else None
     found: list[tuple[float, str]] = []
@@ -81,6 +98,8 @@ def walk_files(root: str, *, pattern: str | None = None, limit: int = DEFAULT_LI
             if ignore.match_file(relative):
                 continue
             if glob_spec is not None and not glob_spec.match_file(relative):
+                continue
+            if keep is not None and not keep(absolute):
                 continue
             try:
                 found.append((os.path.getmtime(absolute), absolute))  # noqa: PTH204
@@ -234,9 +253,11 @@ def python_search(
     matches: list[Match] = []
     for path in sorted(walk_files(root, pattern=glob and f"**/{glob}", limit=10_000)):
         try:
-            status = Path(path).stat()
+            # lstat, not stat: a link is not a regular file, so one is not opened, which
+            # is what ripgrep does and what keeps a link from reading a file it leads to.
             # Only a regular file is opened: reading a FIFO waits for a writer, and a
             # device may never end.
+            status = Path(path).lstat()
             if not stat.S_ISREG(status.st_mode) or status.st_size > MAX_SEARCH_BYTES:
                 continue
             data = Path(path).read_bytes()

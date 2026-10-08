@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from nanoclaude.tools.base import ToolArgumentError
@@ -59,6 +61,49 @@ async def test_hitting_the_result_limit_says_so_in_the_header(ctx, tmp_repo):
         (tmp_repo / f"f{i}.py").write_text("")
     outcome = await GlobTool().run(ctx, "t1", {"pattern": "*.py"})
     assert "truncated at 200" in outcome.content
+
+
+async def test_a_symlink_to_a_file_outside_the_sandbox_is_not_listed(layout):
+    (layout.outside / "private.txt").write_text("")
+    (layout.project / "notes.txt").symlink_to(layout.outside / "private.txt")
+    (layout.project / "real.txt").write_text("")
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "**/*.txt"})
+    assert "real.txt" in outcome.content
+    assert "notes.txt" not in outcome.content
+
+
+async def test_nothing_is_listed_through_a_symlink_to_a_directory_outside_the_sandbox(layout):
+    (layout.outside / "private.txt").write_text("")
+    (layout.project / "vendor").symlink_to(layout.outside, target_is_directory=True)
+    (layout.project / "real.txt").write_text("")
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "**/*"})
+    assert "real.txt" in outcome.content
+    assert "vendor" not in outcome.content
+    assert "private.txt" not in outcome.content
+
+
+async def test_a_symlink_to_a_file_inside_the_sandbox_is_still_listed(layout):
+    """The check must not alarm on everything: a link within the project is as visible
+    as the file it leads to."""
+    (layout.project / "real.txt").write_text("")
+    (layout.project / "alias.txt").symlink_to(layout.project / "real.txt")
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "**/*.txt"})
+    assert "alias.txt" in outcome.content and "real.txt" in outcome.content
+
+
+async def test_links_that_lead_outside_do_not_use_up_the_result_limit(layout):
+    """Entries are dropped before the limit is applied. Filtering the capped list
+    afterwards would let a directory full of fresh links to outside push every real
+    file out of the answer."""
+    (layout.outside / "private.txt").write_text("")
+    for i in range(DEFAULT_LIMIT):
+        (layout.project / f"link{i}.txt").symlink_to(layout.outside / "private.txt")
+    real = layout.project / "real.txt"
+    real.write_text("")
+    os.utime(real, (1, 1))  # older than every link
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "*.txt"})
+    assert "real.txt" in outcome.content
+    assert "link" not in outcome.content
 
 
 def test_the_description_is_byte_identical_to_the_spec():

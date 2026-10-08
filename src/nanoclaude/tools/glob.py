@@ -8,6 +8,7 @@ list is still a good list.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
@@ -53,7 +54,15 @@ class GlobTool:
         pattern = require_str(arguments, "pattern")
         base = arguments.get("path")
         root = ctx.resolve(base) if isinstance(base, str) and base else ctx.root
-        found = walk_files(root, pattern=pattern, limit=DEFAULT_LIMIT)
+        # A link to a file outside the sandbox is not an entry of this project, whatever
+        # its own name says: it is not listed, and the walk does not count it against the
+        # limit.
+        found = walk_files(
+            root,
+            pattern=pattern,
+            limit=DEFAULT_LIMIT,
+            keep=lambda path: ctx.sandbox.contains(os.path.realpath(path)),
+        )
         if not found:
             return ok(call_id, f"No files matched {pattern} under {ctx.display(root)}")
         listing = "\n".join(ctx.display(path) for path in found)

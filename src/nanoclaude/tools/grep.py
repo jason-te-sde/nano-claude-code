@@ -9,20 +9,24 @@ spent its context on the wrong thing.
 Both search backends walk the tree themselves rather than consulting a list of
 paths the caller already cleared, so a broad search can surface a file the
 caller never named -- an un-ignored ``.env`` sitting next to code, say. That
-file is covered by the secret-path rule tools/base.py's callers enforce before
-a call that *names* it, but a path discovered mid-walk never goes through that
-check. Matches are filtered against the same redactor-owned rule here, after
-the backend returns, so it applies regardless of which backend ran.
+file is covered by the policy's refusal to read it, which the executor enforces
+before a call that *names* it, but a path discovered mid-walk never goes through
+that check. Matches are filtered against the same verdict here, after the
+backend returns, so it applies regardless of which backend ran: a credentials
+path, a path outside the sandbox, and any file a ``Read(...)`` deny rule covers.
+A path is judged by its own spelling and by what it resolves to, so a link
+cannot carry a file past the verdict that its target would not get.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from collections import Counter
 from collections.abc import Mapping
 from typing import Any
 
-from nanoclaude.permissions.policy import PermissionRequest
+from nanoclaude.permissions.policy import PermissionRequest, read_refusal
 from nanoclaude.providers.base import ToolSpec
 from nanoclaude.tools.base import ToolContext, ToolOutcome, failed, ok, optional_int, require_str
 from nanoclaude.tools.search import Match, search
@@ -98,7 +102,7 @@ class GrepTool:
         except RuntimeError as exc:
             return failed(call_id, f"search failed: {exc}")
 
-        matches = self._drop_secret_files(ctx, matches)
+        matches = self._drop_unreadable(ctx, matches)
 
         if not matches:
             return ok(call_id, f"No matches for {pattern}")
@@ -156,13 +160,25 @@ class GrepTool:
         return "\n".join(lines)
 
     @staticmethod
-    def _drop_secret_files(ctx: ToolContext, matches: list[Match]) -> list[Match]:
-        """Requirement (added 2026-10-01, task-14-brief.md): a credentials-shaped
-        file discovered while walking the tree must not have its contents
-        surfaced, on either search backend, unless the policy explicitly opts
-        in. Applies to a context line exactly as it does to a match: both carry
-        the same path, and is_secret_path is keyed on the path alone.
+    def _drop_unreadable(ctx: ToolContext, matches: list[Match]) -> list[Match]:
+        """Keep only matches in files the policy would let Read show the model.
+
+        Requirement (added 2026-10-01, task-14-brief.md): a credentials-shaped file
+        discovered while walking the tree must not have its contents surfaced, on
+        either search backend, unless the policy explicitly opts in. It has since been
+        widened to the whole of Read's verdict (see ``read_refusal``), since a deny
+        rule for Read is no less a statement about what the model may see. Applies to a
+        context line exactly as it does to a match: both carry the same path, and the
+        verdict is keyed on the path alone.
         """
-        if ctx.policy.allow_secrets:
-            return matches
-        return [m for m in matches if not ctx.redactor.is_secret_path(m.path, ctx.display(m.path))]
+        verdicts: dict[str, bool] = {}
+
+        def readable(path: str) -> bool:
+            if path not in verdicts:
+                # Both spellings, so that neither a link named like a harmless file to a
+                # credentials file, nor one named like a credentials file to a harmless
+                # one, gets past.
+                verdicts[path] = read_refusal(ctx.policy, path, os.path.realpath(path)) is None
+            return verdicts[path]
+
+        return [m for m in matches if readable(m.path)]

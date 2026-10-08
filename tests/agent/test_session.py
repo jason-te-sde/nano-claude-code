@@ -53,6 +53,7 @@ from nanoclaude.conversation.transcript import (
     user_text,
     validate,
 )
+from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.prompts import SYSTEM_PROMPT
 from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, StopKind, Usage
 from nanoclaude.providers.capabilities import (
@@ -2309,6 +2310,17 @@ async def test_a_mention_of_a_secrets_file_is_expanded_only_when_the_policy_allo
     allowing.policy = replace(allowing.policy, allow_secrets=True)
     await allowing.run("what is in @.env")
     assert "GREETING=hello" in allowing.model.requests[0].transcript.messages[0].text()
+
+
+async def test_a_mention_of_a_file_a_read_deny_rule_covers_is_not_inlined(tmp_repo):
+    (tmp_repo / "secrets").mkdir()
+    (tmp_repo / "secrets" / "notes.txt").write_text("launch code 1234\n")
+    session = build_session(tmp_repo, [says("ok")])
+    session.policy = replace(session.policy, rules=RuleSet.build(deny=["Read(secrets/**)"]))
+    await session.run("what is in @secrets/notes.txt")
+    first = session.model.requests[0].transcript.messages[0].text()
+    assert "launch code" not in first
+    assert "was not inlined" in first and "rule.deny" in first
 
 
 async def test_global_instructions_come_from_the_sessions_home(tmp_repo):
