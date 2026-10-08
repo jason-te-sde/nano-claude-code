@@ -75,7 +75,7 @@ PRESETS: dict[str, Preset] = {
         "openrouter",
         "OpenRouter (many models, one key)",
         "openai_compat",
-        "deepseek/deepseek-v3",
+        "deepseek/deepseek-v4-pro",
         "OPENROUTER_API_KEY",
         base_url="https://openrouter.ai/api/v1",
     ),

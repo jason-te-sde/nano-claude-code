@@ -1410,3 +1410,17 @@ def test_on_a_real_terminal_a_choice_that_is_not_one_is_asked_again(tmp_path):
     )
     assert status == 0, drawn
     assert load_config(home=str(tmp_path), project=None, env={}).roles.main == "ollama"
+
+
+# Each hosted preset's default model, written out by hand from the provider's own list.
+# OpenRouter's public model list (https://openrouter.ai/api/v1/models), checked
+# 2026-10-07: deepseek/deepseek-v3 is not on it; deepseek/deepseek-v4-pro is, with tools.
+CHECKED_DEFAULTS = {
+    "anthropic": "claude-sonnet-5-5",
+    "openrouter": "deepseek/deepseek-v4-pro",
+}
+
+
+@pytest.mark.parametrize(("name", "model"), sorted(CHECKED_DEFAULTS.items()))
+def test_a_presets_default_model_is_one_its_provider_lists(name, model):
+    assert PRESETS[name].default_model == model
