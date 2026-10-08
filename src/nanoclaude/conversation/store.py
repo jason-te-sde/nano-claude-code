@@ -26,6 +26,7 @@ a field.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from collections.abc import Mapping, Sequence
@@ -163,6 +164,21 @@ class SessionRow:
     total_cost_usd: float | None
     total_input_tokens: int
     total_output_tokens: int
+
+
+def same_directory(first: str, second: str) -> bool:
+    """Whether two paths are the same place, whatever they were spelled like.
+
+    Through a symlink, with another capitalisation where the file system ignores it, with a
+    ``..`` in it: the disk says, by comparing what each one is. A directory that is no longer
+    there cannot be asked, and is the place its resolved path says it was.
+    """
+    if first == second:
+        return True
+    try:
+        return Path(first).samefile(second)
+    except OSError:
+        return os.path.realpath(first) == os.path.realpath(second)
 
 
 def _same_messages(
@@ -366,19 +382,27 @@ class Store:
         return [SessionRow(**dict(row)) for row in rows]
 
     def latest_session_id(self, *, cwd: str | None = None) -> str | None:
-        """The session started most recently: in the whole store, or with ``cwd`` in one directory.
+        """The session started most recently: in the whole store, or the one to continue in ``cwd``.
 
-        ``cwd`` is compared whole, as the string the session recorded: a directory is not
-        a prefix, and the name of one is not a pattern.
+        With ``cwd`` it is the latest session started in that directory, as a place (see
+        :func:`same_directory`), in which something was said: a row left by a session that was
+        closed at once holds nothing to continue, and is passed over. Without it, the latest
+        row there is, whatever it holds.
         """
         if cwd is None:
             row = self.db.execute(
                 "SELECT id FROM sessions ORDER BY started_at DESC, rowid DESC LIMIT 1"
             ).fetchone()
-        else:
-            row = self.db.execute(
-                "SELECT id FROM sessions WHERE cwd = ? "
-                "ORDER BY started_at DESC, rowid DESC LIMIT 1",
-                (cwd,),
-            ).fetchone()
-        return row["id"] if row else None
+            return row["id"] if row else None
+        talked = self.db.execute(
+            "SELECT id, cwd FROM sessions "
+            "WHERE EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id) "
+            "ORDER BY started_at DESC, rowid DESC"
+        )
+        known: dict[str, bool] = {}
+        for row in talked:
+            if row["cwd"] not in known:
+                known[row["cwd"]] = same_directory(row["cwd"], cwd)
+            if known[row["cwd"]]:
+                return str(row["id"])
+        return None
