@@ -582,6 +582,67 @@ def test_an_existing_config_is_not_overwritten_without_consent(tmp_path):
     assert "left alone" in ran.out
 
 
+def test_a_config_that_is_a_link_is_said_to_be_one_with_where_it_goes_and_what_a_yes_does(tmp_path):
+    dotfile = tmp_path / "dotfiles" / "config.toml"
+    dotfile.parent.mkdir()
+    dotfile.write_text("# mine\n")
+    (tmp_path / ".nanoclaude").mkdir()
+    config_path(tmp_path).symlink_to(dotfile)
+    ran = init(tmp_path, "n")
+    line = " ".join(ran.out.split())
+    assert f"{config_path(tmp_path)} is a link to {dotfile}." in line
+    assert "Answering y replaces the link with a regular file" in line
+    assert f"{dotfile} is left as it is" in line
+    assert config_path(tmp_path).is_symlink() and dotfile.read_text() == "# mine\n"
+
+
+def test_a_yes_replaces_the_link_and_leaves_what_it_led_to_alone(tmp_path, key):
+    dotfile = tmp_path / "dotfiles" / "config.toml"
+    dotfile.parent.mkdir()
+    dotfile.write_text("# mine\n")
+    (tmp_path / ".nanoclaude").mkdir()
+    config_path(tmp_path).symlink_to(dotfile)
+    init(tmp_path, "y", "1", key, None)
+    assert not config_path(tmp_path).is_symlink() and config_path(tmp_path).is_file()
+    assert dotfile.read_text() == "# mine\n"
+    assert config_path(tmp_path).stat().st_mode & 0o777 == 0o600
+
+
+def test_a_link_is_said_as_it_was_made_and_never_as_markup(tmp_path):
+    (tmp_path / ".nanoclaude").mkdir()
+    config_path(tmp_path).symlink_to("../[red]dot[bold]/config.toml")
+    ran = init(tmp_path, "n")
+    assert "is a link to ../[red]dot[bold]/config.toml." in " ".join(ran.out.split())
+
+
+def test_a_link_that_leads_nowhere_is_a_config_that_is_there_and_is_asked_about_first(tmp_path):
+    (tmp_path / ".nanoclaude").mkdir()
+    config_path(tmp_path).symlink_to(tmp_path / "nowhere")
+    ran = init(tmp_path, "n")
+    assert [m for m, _ in ran.ask.asked] == ["overwrite?"], "before anything else is asked"
+    assert f"is a link to {tmp_path / 'nowhere'}." in " ".join(ran.out.split())
+    assert config_path(tmp_path).is_symlink() and not (tmp_path / "nowhere").exists()
+
+
+def test_a_link_that_cannot_be_read_is_still_asked_about_and_not_a_crash(tmp_path, monkeypatch):
+    # It was a link when it was looked at, and is not when it is read: somebody is at work.
+    (tmp_path / ".nanoclaude").mkdir()
+    config_path(tmp_path).symlink_to(tmp_path / "nowhere")
+
+    def vanished(self: Path) -> Path:
+        raise FileNotFoundError(self)
+
+    monkeypatch.setattr(Path, "readlink", vanished)
+    ran = init(tmp_path, "n")
+    assert f"{config_path(tmp_path)} already exists." in " ".join(ran.out.split())
+    assert [m for m, _ in ran.ask.asked] == ["overwrite?"]
+
+
+def test_a_config_that_is_not_a_link_is_not_called_one(tmp_path):
+    write_home(tmp_path, "# mine\n")
+    assert "is a link" not in init(tmp_path, "n").out
+
+
 def test_an_existing_config_is_asked_about_with_no_as_the_answer_enter_gives(tmp_path):
     write_home(tmp_path, "# mine\n")
     ran = init(tmp_path, None)
@@ -672,9 +733,11 @@ def test_a_dangling_link_that_appears_is_a_config_that_appeared(tmp_path, key):
         config_path(tmp_path).symlink_to(tmp_path / "nowhere")
 
     asking = Racing("1", key, None, "n", when="model", do=link)
-    run_init(plain_console()[0], home=tmp_path, ask=asking, env={}, verify=Verifier())
+    console, buffer = plain_console(200)
+    run_init(console, home=tmp_path, ask=asking, env={}, verify=Verifier())
     assert config_path(tmp_path).is_symlink() and not config_path(tmp_path).exists()
     assert len(asking.asked) == 4
+    assert f"is a link to {tmp_path / 'nowhere'}." in " ".join(buffer.getvalue().split())
 
 
 def test_a_config_that_was_agreed_to_is_replaced_without_a_second_question(tmp_path, key):
@@ -1217,17 +1280,33 @@ def test_a_key_the_provider_refuses_is_reported_and_the_file_stays(tmp_path, key
     assert config_path(tmp_path).is_file()
 
 
-def test_a_blank_key_is_reported_by_the_check_and_does_not_break_the_setup(tmp_path, wire):
-    console, buffer = plain_console(100)
-    code = run_init(console, home=tmp_path, ask=Answers("1", "   ", None), env={})
-    assert code == 0
-    assert "could not verify" in buffer.getvalue() and "ANTHROPIC_API_KEY" in buffer.getvalue()
-    assert wire.requests == []
-    assert config_path(tmp_path).is_file()
-    # Nothing was pasted, so there is no key to tell the person to keep; and an empty key is
-    # not "redacted" out of the message, which would put the marker between every two letters.
-    assert "<your key>" not in buffer.getvalue()
-    assert "[hidden]" not in buffer.getvalue()
+@pytest.mark.parametrize("blank", ["", "   ", " \t "])
+def test_a_blank_key_is_asked_for_again_and_never_sent_to_the_check(tmp_path, key, blank):
+    ran = init(tmp_path, "1", blank, "", key, None)
+    keys = [(m, kw) for m, kw in ran.ask.asked if kw.get("password")]
+    assert len(keys) == 3 and all(kw == {"password": True} for _, kw in keys)
+    assert "a key is needed" in ran.out
+    assert ran.out.count("a key is needed") == 2
+    (config, alias) = ran.verify.calls[0]
+    assert len(ran.verify.calls) == 1 and config.api_key_for(alias) == key
+    assert "could not verify" not in ran.out
+
+
+def test_the_key_is_asked_for_again_before_the_model_is_asked_about(tmp_path, key):
+    ran = init(tmp_path, "1", "", key, None)
+    assert [bool(kw.get("password")) for _, kw in ran.ask.asked] == [False, True, True, False]
+
+
+def test_nothing_is_written_while_the_key_is_still_missing(tmp_path):
+    # Ctrl+C at the key question: the person gave up, and there is nothing to show for it.
+    def gives_up(message: str, **kwargs: Any) -> str:
+        if kwargs.get("password"):
+            raise KeyboardInterrupt
+        return "1"
+
+    with pytest.raises(KeyboardInterrupt):
+        run_init(plain_console()[0], home=tmp_path, ask=gives_up, env={}, verify=Verifier())
+    assert not (tmp_path / ".nanoclaude").exists()
 
 
 # --------------------------------------------------------------------------
@@ -1520,6 +1599,37 @@ def test_ctrl_c_at_a_question_ends_init_like_any_interrupted_run_with_nothing_wr
     code, _, err = run_ncc(capsys, "init")
     assert (code, err) == (EXIT_CODES["interrupted"], INTERRUPTED)
     assert list(machine.ncc.iterdir()) == []
+
+
+class Interrupting(Verifier):
+    """A check that the person stops with Ctrl+C while it is waiting for the provider."""
+
+    async def __call__(self, config: Config, alias: str) -> str | None:
+        await super().__call__(config, alias)
+        raise KeyboardInterrupt
+
+
+def test_ctrl_c_during_the_check_says_the_config_was_written_and_the_key_was_not_checked(
+    machine, monkeypatch, capsys, key
+):
+    scripted(monkeypatch, "1", key, None, verify=Interrupting())
+    code, out, err = run_ncc(capsys, "init")
+    assert code == EXIT_CODES["interrupted"] == 130
+    assert config_path(machine.ncc).is_file(), "it was written before the check began"
+    assert err == (
+        f"error: interrupted while the key was being checked \u2014 the config was written to "
+        f"{config_path(machine.ncc)} and the key was not checked; run ncc to try it, or ncc init "
+        "to start over\n"
+    )
+    assert key not in out + err
+
+
+def test_ctrl_c_at_a_question_is_still_the_plain_interrupted_line(machine, monkeypatch, capsys):
+    def interrupted(_message: str, **_kwargs: Any) -> str:
+        raise KeyboardInterrupt
+
+    asked_by(monkeypatch, interrupted)
+    assert run_ncc(capsys, "init")[2] == INTERRUPTED
 
 
 def test_the_input_ending_at_a_question_is_said_and_nothing_is_written(

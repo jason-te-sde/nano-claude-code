@@ -320,8 +320,11 @@ def main(argv: list[str] | None = None) -> int:
     except BrokenPipeError:
         _abandon_stdout()
         return EXIT_CODES["output_closed"]
-    except KeyboardInterrupt:
-        show_error(err, "interrupted \u2014 nothing more was done; run again to retry")
+    except KeyboardInterrupt as exc:
+        # Ctrl+C has no words of its own; one that came with a message (ncc init, interrupted
+        # after it wrote the config) has, and a person who is told nothing more was done when
+        # a file was written is told something false.
+        show_error(err, str(exc) or "interrupted \u2014 nothing more was done; run again to retry")
         return EXIT_CODES["interrupted"]
     except Exception as exc:
         # Last, after every exception that has a line and a code of its own. A script reads

@@ -389,9 +389,28 @@ def _write_private(path: Path, text: str, *, replace: bool) -> None:
         raise
 
 
+def _what_is_there(target: Path) -> str:
+    """What the config that is there is, for the question about replacing it.
+
+    A link is said to be one, with where it leads, because replacing it is not replacing
+    what it leads to: the link goes, a regular file takes its place, and the file it led
+    to (often one in a dotfiles repository) is left as it is.
+    """
+    if target.is_symlink():
+        try:
+            leads_to = _outside(str(target.readlink()))
+        except OSError:
+            return f"{_outside(str(target))} already exists."
+        return (
+            f"{_outside(str(target))} is a link to {leads_to}. Answering y replaces the link "
+            f"with a regular file; {leads_to} is left as it is."
+        )
+    return f"{_outside(str(target))} already exists."
+
+
 def _may_replace(console: Console, ask: Ask, target: Path) -> bool:
     """Ask whether the config that is there may be replaced; True only for a plain yes."""
-    _say(console, f"[yellow]{_outside(str(target))} already exists.[/yellow]")
+    _say(console, f"[yellow]{_what_is_there(target)}[/yellow]")
     if ask("overwrite?", choices=["y", "n"], default="n") != "y":
         _say(console, "[dim]left alone[/dim]")
         return False
@@ -458,8 +477,15 @@ def run_init(
             whose = f"the key in {preset.key_env}"
             _say(console, f"[dim]{preset.key_env} is already set; using it[/dim]")
         else:
-            key = ask("paste your key (hidden; it is checked once and never saved)", password=True)
-            key = key.strip()
+            while not key:
+                key = ask(
+                    "paste your key (hidden; it is checked once and never saved)", password=True
+                ).strip()
+                if not key:
+                    _say(
+                        console,
+                        "[yellow]a key is needed[/yellow] \u2014 paste it, or press Ctrl+C to stop",
+                    )
     model = ask("model", default=preset.default_model).strip() or preset.default_model
 
     alias = preset.key
@@ -480,7 +506,7 @@ def run_init(
     # with the key it was given. It is added to this copy of the environment and nowhere else.
     held = {preset.key_env: key} if key else {}
     config = load_config(home=str(home), project=None, env={**environment, **held})
-    _check_the_key(console, verify, config, alias, key, whose)
+    _check_the_key(console, verify, config, alias, key, whose, target)
     _say(
         console,
         "\nTry it:\n  [bold]ncc[/bold]\n  [bold]ncc -p 'what does this project do?'[/bold]",
@@ -488,8 +514,22 @@ def run_init(
     return 0
 
 
+class InterruptedWhileChecking(KeyboardInterrupt):
+    """Ctrl+C after the config was written. Its message is the line for the person.
+
+    A ``KeyboardInterrupt``, so that whatever ends a run on Ctrl+C ends this one the same
+    way, with the same status; the command prints the message and not its generic line.
+    """
+
+
 def _check_the_key(
-    console: Console, check: Verifier, config: Config, alias: str, key: str, whose: str
+    console: Console,
+    check: Verifier,
+    config: Config,
+    alias: str,
+    key: str,
+    whose: str,
+    config_path: Path,
 ) -> None:
     """Look at the key, and send the check if it is one that can be sent; say what came of it.
 
@@ -502,7 +542,14 @@ def _check_the_key(
         show_error(console, _flawed_key_line(whose, flaw, config.api_key_env_for(alias)))
         return
     _say(console, "[dim]checking with one small request...[/dim]")
-    problem = asyncio.run(check(config, alias))
+    try:
+        problem = asyncio.run(check(config, alias))
+    except KeyboardInterrupt as exc:
+        raise InterruptedWhileChecking(
+            "interrupted while the key was being checked \u2014 the config was written to "
+            f"{config_path} and the key was not checked; run ncc to try it, or ncc init to "
+            "start over"
+        ) from exc
     if problem:
         _say(console, f"[yellow]could not verify:[/yellow] {_outside(_redact(problem, key))}")
     else:
