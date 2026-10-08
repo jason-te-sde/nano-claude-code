@@ -1239,8 +1239,28 @@ async def test_a_provider_that_never_answers_is_given_up_on(tmp_path, key, wire,
         raise AssertionError("unreachable")
 
     wire.answer = never
-    problem = await verify(config_for(tmp_path, "anthropic", key), "anthropic")
+    # The outer limit is for a check that has lost its own: it fails here, in five seconds,
+    # instead of waiting for a provider that is never going to answer.
+    problem = await asyncio.wait_for(verify(config_for(tmp_path, "anthropic", key), "anthropic"), 5)
     assert problem is not None and "no answer" in problem
+
+
+def test_the_check_waits_a_minute_for_a_provider_and_no_longer():
+    # A model that has to be loaded into memory first (a local one, cold) can take most of it;
+    # a person who has waited this long has a problem that more seconds will not mend.
+    assert init_module.VERIFY_TIMEOUT_S == 60.0
+
+
+def test_the_timeout_is_said_in_seconds_as_it_is_set(tmp_path, key, wire, monkeypatch):
+    monkeypatch.setattr(init_module, "VERIFY_TIMEOUT_S", 0.25)
+
+    async def never(_request: httpx.Request) -> httpx.Response:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    wire.answer = never
+    problem = asyncio.run(verify(config_for(tmp_path, "anthropic", key), "anthropic"))
+    assert problem == "no answer within 0.25 seconds \u2014 check your network connection"
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -1860,7 +1880,12 @@ CHECKED_DEFAULTS = {
 
 
 @pytest.mark.parametrize(("name", "model"), sorted(CHECKED_DEFAULTS.items()))
-def test_a_presets_default_model_is_one_its_provider_lists(name, model):
+def test_a_hosted_presets_default_is_pinned_to_the_value_checked_against_its_providers_list(
+    name, model
+):
+    # Not a test that the provider lists the model: it cannot know. A default changed for any
+    # reason fails here, and whoever changes it checks the provider's list again and writes the
+    # date above.
     assert PRESETS[name].default_model == model
 
 

@@ -221,6 +221,13 @@ async def verify(config: Config, alias: str) -> str | None:
     and a library can put a header in an exception. A missing or refused key is a
     ``CredentialsError`` and is reported like the rest. ``alias`` must be one of the
     config's models, as it is for ncc itself.
+
+    The 60 seconds bound the wait for an answer, not the work behind the wait. A name is
+    looked up in a thread of the event loop's own, which nothing can interrupt, so a lookup
+    that hangs outlasts the limit: the wait is given up, the line is returned, and the loop
+    then waits for the thread when it closes (without limit on Python 3.11, for up to five
+    minutes on 3.12 and later). That is accepted, and no thread of ours is added to get
+    around it: a machine whose resolver hangs has a problem of which this is not the worst.
     """
     key = config.api_key_for(alias)
     flaw = _key_flaw(key)
