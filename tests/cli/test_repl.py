@@ -233,6 +233,21 @@ async def test_the_banner_names_the_main_model_and_how_to_get_help_and_leave(tmp
     assert "claude-sonnet-5" in first and "/help" in first and "Ctrl+D" in first
 
 
+TEXT_TOOL_BANNER = "\u26a0 text-tool mode (model lacks native tool calling)"  # spec 4.4, verbatim
+
+
+async def test_a_main_model_without_native_tool_calling_is_flagged_at_start(tmp_repo):
+    harness = Harness(tmp_repo, [], native_tools=False)
+    await harness.run()
+    assert harness.text.splitlines()[1] == TEXT_TOOL_BANNER
+
+
+async def test_a_main_model_with_native_tool_calling_gets_no_such_warning(tmp_repo):
+    harness = Harness(tmp_repo, [], native_tools=True)
+    await harness.run()
+    assert "text-tool mode" not in harness.text
+
+
 async def test_ctrl_d_leaves_and_says_goodbye(tmp_repo):
     harness = Harness(tmp_repo, [])
     assert await harness.run() == 0

@@ -46,6 +46,8 @@ from nanoclaude.conversation.transcript import TranscriptError
 from nanoclaude.providers.base import ModelError
 
 PROMPT = "> "
+#: Spec 4.4, verbatim: shown at start when the main model lacks native tool calling.
+TEXT_TOOL_BANNER = "\u26a0 text-tool mode (model lacks native tool calling)"
 
 #: Spec 8: two Ctrl+C within this many seconds leave.
 LEAVE_WITHIN_S = 1.0
@@ -233,6 +235,10 @@ async def run_repl(
         f"nano-claude-code · {config.models[config.roles.main].model} "
         "· /help for commands · Ctrl+D to exit",
     )
+    # Spec 4.4: a model that cannot call tools natively is driven through the text
+    # protocol, which small models follow less reliably; the person should know.
+    if not (await session.router.capabilities_for("main")).native_tools:
+        show_notice(console, TEXT_TOOL_BANNER)
     taps = _DoubleTap(clock)
     while True:
         try:
