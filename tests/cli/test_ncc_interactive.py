@@ -181,30 +181,21 @@ def test_a_reply_in_the_repl_is_shown_with_the_model_named_in_the_banner(
     assert "bye" in out
 
 
-def test_a_missing_key_is_reported_as_a_line_and_the_repl_carries_on(
-    ncc_home, project, capsys, monkeypatch
-):
-    # The real router and adapters: the first prompt finds no key, and so does the second.
-    # Neither ends the session, which is left by Ctrl+D.
+def test_a_missing_key_ends_ncc_before_the_repl_starts(ncc_home, project, capsys, monkeypatch):
+    # The real router and adapters. It used to be found at the first prompt, and again at the
+    # second, with the REPL open in between; now it is found once, at the start.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    keyboard = ScriptedPrompter("first", "second")
 
-    async def with_keyboard(
-        session: Session, console: Console, history_path: str | None = None
-    ) -> int:
-        return await run_repl(session, console, history_path, prompt=keyboard)
+    async def never(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("the REPL was started without a key")
 
-    monkeypatch.setattr(ncc_main, "run_repl", with_keyboard)
+    monkeypatch.setattr(ncc_main, "run_repl", never)
     code, out, err = run_ncc(capsys, "--root", str(project))
-    assert (code, err) == (EXIT_CODES["completed"], "")
-    # The REPL's console wraps its lines at the width of a plain terminal, so read them joined.
-    flat = " ".join(out.split())
-    message = (
+    assert (code, out) == (EXIT_CODES["config"], "")
+    assert err == (
         "error: role 'main' uses model 'm', which needs ANTHROPIC_API_KEY "
-        "\u2014 set it, or run: ncc init"
+        "\u2014 set it, or run: ncc init\n"
     )
-    assert flat.count(message) == 2
-    assert out.rstrip().endswith("bye")
 
 
 # --------------------------------------------------------------------------
@@ -335,8 +326,9 @@ def test_a_session_changed_by_another_process_while_closing_is_reported(
     ],
 )
 def test_what_goes_wrong_before_the_repl_starts_is_one_line_on_stderr(
-    ncc_home, project, capsys, repl, argv, code, needle
+    ncc_home, project, serve, capsys, repl, argv, code, needle
 ):
+    serve(m=[])
     got, out, err = run_ncc(capsys, "--root", str(project), *argv)
     assert got == code
     assert out == "" and err.startswith("error: ") and needle in err and err.count("\n") == 1

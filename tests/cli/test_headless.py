@@ -193,7 +193,7 @@ def unsuitable() -> list[ModelReply]:
 def test_a_model_without_working_tool_calls_is_a_stop_and_not_a_completion(
     ncc_home, project, serve, capsys
 ):
-    serve(textual=unsuitable())
+    serve(m=[], textual=unsuitable())  # m plays the roles --model leaves alone
     code, out, err = run_ncc(
         capsys, "--root", str(project), "--model", "textual", "-p", "read a.py"
     )
@@ -211,7 +211,7 @@ def test_a_model_without_working_tool_calls_is_a_stop_and_not_a_completion(
 def test_a_model_without_working_tool_calls_is_an_error_in_the_json(
     ncc_home, project, serve, capsys
 ):
-    serve(textual=unsuitable())
+    serve(m=[], textual=unsuitable())  # m plays the roles --model leaves alone
     code, out, err = run_ncc(
         capsys,
         "--root",
@@ -400,6 +400,28 @@ def test_a_missing_key_is_a_configuration_error_that_names_the_variable(
     )
 
 
+def test_a_role_whose_model_has_no_key_is_reported_when_the_run_starts(
+    ncc_home, project, serve, capsys, monkeypatch
+):
+    # The compact role is first used at the first compaction, which may be an hour in. The
+    # model the person is talking to is fine, and is not asked anything.
+    monkeypatch.delenv("CHEAP_API_KEY", raising=False)
+    config = ncc_home / ".nanoclaude" / "config.toml"
+    config.write_text(
+        config.read_text()
+        + '\n[models.cheap]\nadapter = "anthropic"\nmodel = "claude-haiku-4-5"\n'
+        + 'api_key_env = "CHEAP_API_KEY"\n\n[roles]\nmain = "m"\ncompact = "cheap"\n'
+    )
+    clients = serve(m=[says("hello")])
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hi")
+    assert (code, out) == (EXIT_CODES["config"], "")
+    assert err == (
+        "error: role 'compact' uses model 'cheap', which needs CHEAP_API_KEY "
+        "\u2014 set it, or run: ncc init\n"
+    )
+    assert clients["m"].requests == []
+
+
 @pytest.mark.parametrize("fmt", FORMATS, ids=["text", "json"])
 @pytest.mark.parametrize("status", [401, 403])
 def test_a_key_the_provider_rejects_is_a_configuration_error_too(
@@ -427,8 +449,9 @@ def test_any_other_provider_failure_is_still_a_provider_error(
 
 
 def test_a_model_window_too_small_for_the_prompt_is_a_configuration_error(
-    ncc_home, project, capsys
+    ncc_home, project, serve, capsys
 ):
+    serve(m=[])  # a key is not what is wrong here
     config = ncc_home / ".nanoclaude" / "config.toml"
     config.write_text(
         '[models.m]\nadapter = "anthropic"\nmodel = "claude-sonnet-5"\ncontext_window = 1000\n'
@@ -571,7 +594,8 @@ def test_a_usage_error_is_one_line_with_nothing_in_it_for_a_terminal_to_act_on(
     assert err == "error: --add-dir no where is not a directory \u2014 pass one that exists\n"
 
 
-def test_an_unknown_session_is_one_line_too(ncc_home, project, capsys):
+def test_an_unknown_session_is_one_line_too(ncc_home, project, serve, capsys):
+    serve(m=[])
     code, out, err = run_ncc(capsys, "--root", str(project), "--resume", "a\nb", "-p", "hi")
     assert code == EXIT_CODES["usage"] and out == ""
     assert err.startswith('error: no stored session "a b" \u2014 ') and err.count("\n") == 1

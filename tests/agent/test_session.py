@@ -31,9 +31,10 @@ from typing import Any
 import pytest
 
 from nanoclaude.agent.loop import StopReason
+from nanoclaude.agent.router import Router
 from nanoclaude.agent.session import Session, new_session_id
 from nanoclaude.agent.ui import Approval, AutoApprove, AutoDecline
-from nanoclaude.config.schema import LimitsConfig, ModelConfig, RolesConfig
+from nanoclaude.config.schema import Config, LimitsConfig, ModelConfig, RolesConfig
 from nanoclaude.conversation.budget import (
     Budget,
     ContextTooSmallError,
@@ -57,6 +58,7 @@ from nanoclaude.permissions.policy import PermissionRequest
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.prompts import SYSTEM_PROMPT
 from nanoclaude.providers.base import (
+    CredentialsError,
     ModelError,
     ModelReply,
     ModelRequest,
@@ -3668,3 +3670,39 @@ async def test_a_session_whose_registry_has_bash_is_told_to_run_tests(tmp_repo):
     system = session.model.requests[0].system
     assert "After changing code, run the project's tests" in system
     assert "cannot run commands" not in system
+
+
+# --------------------------------------------------------------------------
+# A role whose model has no key stops the session at the start
+# --------------------------------------------------------------------------
+
+
+def test_a_session_whose_compact_model_has_no_key_is_refused_before_anything_is_stored(tmp_repo):
+    built = build_session(tmp_repo, [says("never asked")])
+    models = {
+        "m": ModelConfig("anthropic", "claude-sonnet-5"),
+        "cheap": ModelConfig("anthropic", "claude-haiku-4-5", api_key_env="CHEAP_KEY"),
+    }
+    config = Config(
+        models=models,
+        roles=RolesConfig("m", "m", "m", "m", "cheap", "m"),
+        env={"ANTHROPIC_API_KEY": "k"},
+    )
+    router = Router(config, built.router.cache)
+    store = Store(tmp_repo / "sessions.db")
+    store.open()
+    with pytest.raises(CredentialsError) as caught:
+        Session(
+            root=str(tmp_repo),
+            config=config,
+            router=router,
+            registry=built.registry,
+            policy=built.policy,
+            store=store,
+            session_id="abc123",
+        )
+    assert str(caught.value) == (
+        "role 'compact' uses model 'cheap', which needs CHEAP_KEY — set it, or run: ncc init"
+    )
+    # Refused first: a session that never started leaves no row behind to resume.
+    assert store.session_row("abc123") is None

@@ -166,8 +166,9 @@ def test_a_page_where_a_reply_stream_should_be_is_a_provider_error_and_not_a_bug
 
 
 def test_the_exceptions_that_are_mapped_are_not_swallowed_by_the_general_one(
-    ncc_home, project, capsys
+    ncc_home, project, serve, capsys
 ):
+    serve(m=[])
     # The general clause is last. If it came first, each of these would be exit 1.
     assert run_ncc(capsys, "--root", str(project), "--model", "ghost", "-p", "hi")[0] == 3
     assert run_ncc(capsys, "--root", str(project), "--resume", "nope", "-p", "hi")[0] == 2
@@ -185,7 +186,9 @@ def test_an_interrupt_is_still_130_and_not_an_unexpected_error(
     assert (code, out, err) == (EXIT_CODES["interrupted"], "", INTERRUPTED)
 
 
-def test_the_repl_is_covered_too(ncc_home, project, capsys, monkeypatch):
+def test_the_repl_is_covered_too(ncc_home, project, serve, capsys, monkeypatch):
+    serve(m=[])
+
     async def explodes(*_args: object, **_kwargs: object) -> int:
         raise RuntimeError("the REPL broke")
 

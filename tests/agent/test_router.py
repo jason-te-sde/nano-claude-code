@@ -333,7 +333,9 @@ async def test_a_missing_openai_compatible_key_names_the_models_own_variable(mak
     config = Config(models=models, roles=roles_all("or"), env={"OPENAI_API_KEY": "someone-elses"})
     with pytest.raises(CredentialsError) as caught:
         await make(config).client_for("main")
-    assert "set OPENROUTER_API_KEY or run: ncc init" in str(caught.value)
+    assert str(caught.value) == (
+        "role 'main' uses model 'or', which needs OPENROUTER_API_KEY — set it, or run: ncc init"
+    )
     assert "OPENAI_API_KEY" not in str(caught.value)
     assert caught.value.retryable is False
 
@@ -342,7 +344,7 @@ async def test_a_missing_openai_compatible_key_names_the_default_variable_when_n
     make,
 ):
     models = {"o": ModelConfig("openai_compat", "gpt-5", base_url="https://api.openai.com/v1")}
-    with pytest.raises(ModelError, match="set OPENAI_API_KEY or run: ncc init"):
+    with pytest.raises(ModelError, match="which needs OPENAI_API_KEY — set it, or run: ncc init"):
         await make(Config(models=models, roles=roles_all("o"))).client_for("main")
 
 
@@ -779,3 +781,64 @@ def test_the_router_does_not_promise_the_saving_it_cannot_yet_deliver():
     doc = router_module.__doc__ or ""
     assert "largest saving" not in doc
     assert "v0.3" in doc and "main" in doc and "compact" in doc
+
+
+# --------------------------------------------------------------------------
+# A key that is missing is reported when the session starts, not when its role is first used
+# --------------------------------------------------------------------------
+
+
+def keyed_config(**roles: str) -> Config:
+    """``big`` has its key, ``cheap`` names a variable that is not set, ``small`` needs none."""
+    models = {
+        "big": ModelConfig("anthropic", "claude-sonnet-5"),
+        "cheap": ModelConfig("anthropic", "claude-haiku-4-5", api_key_env="CHEAP_KEY"),
+        "small": ModelConfig("ollama", "qwen3-coder"),
+    }
+    base = {"main": "big", "explore": "big", "plan": "big", "verify": "big", "compact": "big"}
+    base["title"] = "big"
+    base.update(roles)
+    return Config(models=models, roles=RolesConfig(**base), env={"ANTHROPIC_API_KEY": "k"})
+
+
+def test_a_role_whose_model_has_no_key_is_named_with_the_variable_and_nothing_is_built(
+    make, monkeypatch
+):
+    def build_nothing(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("checking for a key must not build a client")
+
+    monkeypatch.setattr(Router, "_build", build_nothing)
+    with pytest.raises(CredentialsError) as caught:
+        make(keyed_config(compact="cheap")).check_credentials()
+    assert str(caught.value) == (
+        "role 'compact' uses model 'cheap', which needs CHEAP_KEY — set it, or run: ncc init"
+    )
+    assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize("role", ["explore", "plan", "verify", "title"])
+def test_every_role_is_checked_and_not_only_the_two_that_are_routed_in_this_version(make, role):
+    # A role nothing asks for yet is still a line in the configuration that says which key
+    # it needs, and it is better told now than when sub-agents begin to use it.
+    with pytest.raises(CredentialsError, match=f"role '{role}' uses model 'cheap'"):
+        make(keyed_config(**{role: "cheap"})).check_credentials()
+
+
+def test_when_several_roles_lack_a_key_the_first_in_role_order_is_named(make):
+    with pytest.raises(CredentialsError, match="role 'main' uses model 'cheap'"):
+        make(keyed_config(compact="cheap", main="cheap")).check_credentials()
+
+
+def test_roles_with_their_keys_and_local_models_pass(make):
+    make(keyed_config()).check_credentials()
+    config = keyed_config(compact="small", title="small")
+    config.env.clear()
+    config.env["ANTHROPIC_API_KEY"] = "k"
+    make(config).check_credentials()
+
+
+def test_a_client_that_was_handed_over_stands_in_for_the_key(make):
+    # Tests and front ends give the router a client for an alias: there is nothing to look
+    # up for it, and refusing it for lacking a variable would refuse a model that works.
+    router = make(keyed_config(compact="cheap"), {"cheap": FakeClient("haiku")})
+    router.check_credentials()
