@@ -3369,6 +3369,17 @@ async def test_a_cleared_conversation_has_no_cut_off_text(tmp_repo):
     assert session.cut_off_text is None
 
 
+async def test_what_a_cut_off_reply_kept_keeps_the_indentation_it_began_with(tmp_repo):
+    # The first line of code is indented, and that indentation is code.
+    session = build_session(tmp_repo, [cut_off("\n\n    indented = 1\n    more   \n\n")])
+    with pytest.raises(ModelError):
+        await session.run("question")
+    assert session.cut_off_text == "    indented = 1\n    more"
+    assert session.state.transcript.messages[-1].text() == (
+        "    indented = 1\n    more\n\n[this reply was cut off before it finished]"
+    )
+
+
 async def test_a_reply_that_quotes_the_cut_off_marker_is_still_a_whole_reply(tmp_repo):
     # What marks a kept reply is something the session did, and not words a model can write.
     quoted = "It ends with [this reply was cut off before it finished]"

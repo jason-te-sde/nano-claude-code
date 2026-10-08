@@ -25,6 +25,7 @@ above this module has to repair one:
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from collections.abc import Sequence
 from contextlib import AsyncExitStack, suppress
@@ -82,6 +83,10 @@ _INTERRUPTED_TURN = "[this turn was interrupted before it finished]"
 #: Ends the text of a reply whose stream broke midway, as the model sees it when the person
 #: asks it to go on: it knows where it stopped, and that nobody saw the rest.
 _CUT_OFF_REPLY = "[this reply was cut off before it finished]"
+
+#: Blank lines before the first line with something on it. Not the indentation of that line,
+#: which is code.
+_LEADING_BLANK_LINES = re.compile(r"\A(?:[ \t]*\r?\n)+")
 
 #: A main model whose window is smaller than this many tokens keeps at most
 #: ``SMALL_WINDOW_KEEP_RECENT`` recent turns whatever ``keep_recent_turns`` says
@@ -498,7 +503,8 @@ class Session:
         """
         self.router.record("main", partial.usage, *self._adapter_and_model("main"))
         self.state = replace(self.state, usage=self.state.usage + partial.usage)
-        text = "".join(b.text for b in partial.blocks if isinstance(b, TextBlock)).strip()
+        arrived = "".join(b.text for b in partial.blocks if isinstance(b, TextBlock))
+        text = _LEADING_BLANK_LINES.sub("", arrived).rstrip()
         what = f"the reply was cut off ({cause})"
         if not text:
             return ModelError(f"{what} \u2014 ask the model to continue", retryable=False)
