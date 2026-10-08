@@ -15,17 +15,21 @@ the test. Every key-shaped string is built when the test runs.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import secrets
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
-from nanoclaude.cli.init import PRESETS, render_config, run_init
+from nanoclaude.cli import init as init_module
+from nanoclaude.cli.init import PRESETS, render_config, run_init, verify
 from nanoclaude.config.load import ConfigError, load_config
 from nanoclaude.config.schema import ROLES, Config, PermissionsConfig
 from nanoclaude.providers.capabilities import (
@@ -583,3 +587,317 @@ def test_the_check_is_not_asked_to_run_when_the_person_said_no(tmp_path):
 def test_it_ends_by_saying_how_to_start(tmp_path, key):
     ran = init(tmp_path, "1", key, None)
     assert "ncc -p" in ran.out
+
+
+# --------------------------------------------------------------------------
+# The check itself: one small request, through the client ncc would use
+# --------------------------------------------------------------------------
+
+
+def config_for(home: Path, name: str, key: str | None, model: str | None = None) -> Config:
+    """The config ``ncc init`` writes for a preset, loaded as ncc loads it."""
+    preset = PRESETS[name]
+    write_home(home, render_config(preset, name, model or preset.default_model))
+    env = {preset.key_env: key} if key and preset.key_env else {}
+    return load_config(home=str(home), project=None, env=env)
+
+
+Handler = Callable[[httpx.Request], httpx.Response]
+
+
+@dataclass
+class Wire:
+    """What went out, and how to answer it: every request ``verify`` makes ends up here."""
+
+    requests: list[httpx.Request]
+    clients: list[httpx.AsyncClient]
+    answer: Handler
+
+    def body(self) -> dict[str, Any]:
+        (request,) = self.requests
+        sent: dict[str, Any] = json.loads(request.content)
+        return sent
+
+
+@pytest.fixture
+def wire(monkeypatch: pytest.MonkeyPatch) -> Wire:
+    """Put a transport made here under every HTTP client the providers build.
+
+    Nothing leaves the process: a request that is made is a request this test can read.
+    """
+    sent = Wire([], [], lambda _request: httpx.Response(500))
+    real = httpx.AsyncClient
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        sent.requests.append(request)
+        return sent.answer(request)
+
+    def make(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        client = real(*args, **{**kwargs, "transport": httpx.MockTransport(transport)})
+        sent.clients.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", make)
+    return sent
+
+
+def sse(*events: tuple[str, dict[str, Any]]) -> httpx.Response:
+    text = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events)
+    return httpx.Response(200, content=text.encode(), headers={"content-type": "text/event-stream"})
+
+
+def anthropic_reply(*blocks: tuple[str, dict[str, Any]], stop: str = "end_turn") -> httpx.Response:
+    events: list[tuple[str, dict[str, Any]]] = [
+        ("message_start", {"message": {"model": "m", "usage": {"input_tokens": 9}}})
+    ]
+    for index, (kind, delta) in enumerate(blocks):
+        events += [
+            ("content_block_start", {"index": index, "content_block": {"type": kind}}),
+            ("content_block_delta", {"index": index, "delta": delta}),
+            ("content_block_stop", {"index": index}),
+        ]
+    events += [
+        ("message_delta", {"delta": {"stop_reason": stop}, "usage": {"output_tokens": 8}}),
+        ("message_stop", {}),
+    ]
+    return sse(*events)
+
+
+def chat_reply(*chunks: dict[str, Any]) -> httpx.Response:
+    text = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+    return httpx.Response(200, content=text.encode(), headers={"content-type": "text/event-stream"})
+
+
+OK_ANTHROPIC = anthropic_reply(("text", {"type": "text_delta", "text": "ok"}))
+
+
+def says_ok(request: httpx.Request) -> httpx.Response:
+    if "api/chat" in str(request.url):
+        return httpx.Response(
+            200,
+            content=b'{"message": {"role": "assistant", "content": "ok"}, "done": true}\n',
+        )
+    if "chat/completions" in str(request.url):
+        return chat_reply(
+            {"choices": [{"delta": {"content": "ok"}, "finish_reason": None}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        )
+    return anthropic_reply(("text", {"type": "text_delta", "text": "ok"}))
+
+
+async def test_a_provider_that_answers_verifies_the_key(tmp_path, key, wire):
+    wire.answer = says_ok
+    assert await verify(config_for(tmp_path, "anthropic", key), "anthropic") is None
+    (request,) = wire.requests
+    assert str(request.url) == "https://api.anthropic.com/v1/messages"
+
+
+async def test_the_key_goes_to_the_provider_in_the_header_and_nowhere_else(tmp_path, key, wire):
+    wire.answer = says_ok
+    await verify(config_for(tmp_path, "anthropic", key), "anthropic")
+    (request,) = wire.requests
+    assert request.headers["x-api-key"] == key
+    assert key not in str(request.url)
+    assert key.encode() not in request.content
+
+
+async def test_the_request_is_small_and_names_the_model_and_no_temperature(tmp_path, key, wire):
+    wire.answer = says_ok
+    await verify(config_for(tmp_path, "anthropic", key), "anthropic")
+    body = wire.body()
+    assert body["model"] == "claude-sonnet-5-5"
+    assert body["max_tokens"] == 8
+    assert "temperature" not in body  # current Claude models refuse any other value
+    assert "tools" not in body
+    assert len(body["messages"]) == 1
+
+
+async def test_the_model_checked_is_the_one_the_alias_names(tmp_path, key, wire):
+    wire.answer = says_ok
+    config = config_for(tmp_path, "anthropic", key, "claude-haiku-4-5")
+    await verify(config, "anthropic")
+    assert wire.body()["model"] == "claude-haiku-4-5"
+
+
+async def test_a_reply_that_stops_at_the_cap_with_only_thinking_in_it_still_verifies(
+    tmp_path, key, wire
+):
+    # A thinking model spends eight tokens thinking and is cut off. That is a 200: the key,
+    # the model and the request were all accepted, which is all this reads.
+    wire.answer = lambda _request: anthropic_reply(
+        ("thinking", {"type": "thinking_delta", "thinking": "let me"}), stop="max_tokens"
+    )
+    assert await verify(config_for(tmp_path, "anthropic", key), "anthropic") is None
+
+
+async def test_openai_is_sent_the_parameter_its_own_host_wants(tmp_path, key, wire):
+    wire.answer = says_ok
+    config = config_for(tmp_path, "openai", key)
+    assert await verify(config, "openai") is None
+    (request,) = wire.requests
+    assert str(request.url) == "https://api.openai.com/v1/chat/completions"
+    assert request.headers["authorization"] == f"Bearer {key}"
+    body = wire.body()
+    assert body["max_completion_tokens"] == 8
+    assert "max_tokens" not in body and "temperature" not in body
+
+
+async def test_another_openai_compatible_host_is_sent_max_tokens(tmp_path, key, wire):
+    wire.answer = says_ok
+    await verify(config_for(tmp_path, "openrouter", key), "openrouter")
+    (request,) = wire.requests
+    assert request.url.host == "openrouter.ai"
+    assert request.headers["authorization"] == f"Bearer {key}"
+    assert wire.body()["max_tokens"] == 8
+
+
+async def test_a_local_model_is_asked_with_no_key_at_all(tmp_path, wire):
+    wire.answer = says_ok
+    assert await verify(config_for(tmp_path, "ollama", None), "ollama") is None
+    (request,) = wire.requests
+    assert request.url.host == "localhost"
+    assert "authorization" not in request.headers and "x-api-key" not in request.headers
+
+
+async def test_a_reply_cut_at_the_cap_before_any_text_verifies_on_the_openai_wire_too(
+    tmp_path, key, wire
+):
+    # What a reasoning model sends when its eight tokens went on thinking nobody can see:
+    # a finished stream whose only content is the reason it stopped.
+    wire.answer = lambda _request: chat_reply(
+        {"choices": [{"delta": {"role": "assistant", "content": ""}, "finish_reason": None}]},
+        {"choices": [{"delta": {}, "finish_reason": "length"}]},
+    )
+    assert await verify(config_for(tmp_path, "openai", key), "openai") is None
+
+
+async def test_a_local_thinking_model_cut_at_the_cap_before_any_text_verifies_too(tmp_path, wire):
+    body = b'{"message": {"role": "assistant", "content": "", "thinking": "hm"}, "done": true}\n'
+    wire.answer = lambda _request: httpx.Response(200, content=body)
+    assert await verify(config_for(tmp_path, "ollama", None), "ollama") is None
+
+
+async def test_a_rejected_key_is_reported_in_the_providers_words(tmp_path, key, wire):
+    wire.answer = lambda _request: httpx.Response(
+        401, json={"error": {"type": "authentication_error", "message": "invalid x-api-key"}}
+    )
+    problem = await verify(config_for(tmp_path, "anthropic", key), "anthropic")
+    assert problem is not None
+    assert "rejected your credentials" in problem and "invalid x-api-key" in problem
+
+
+async def test_a_rejected_key_the_provider_says_back_is_not_in_what_is_returned(
+    tmp_path, key, wire
+):
+    wire.answer = lambda _request: httpx.Response(
+        401, json={"error": {"message": f"Incorrect API key provided: {key}."}}
+    )
+    problem = await verify(config_for(tmp_path, "openai", key), "openai")
+    assert problem is not None
+    assert "Incorrect API key provided" in problem
+    assert key not in problem
+
+
+async def test_a_model_the_provider_does_not_know_is_reported(tmp_path, key, wire):
+    wire.answer = lambda _request: httpx.Response(404, json={"error": {"message": "no such model"}})
+    problem = await verify(config_for(tmp_path, "openai", key), "openai")
+    assert problem is not None and "no such model" in problem
+
+
+async def test_a_provider_that_cannot_be_reached_is_reported(tmp_path, wire):
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    wire.answer = refuse
+    problem = await verify(config_for(tmp_path, "ollama", None), "ollama")
+    assert problem is not None and "could not reach" in problem and "refused" in problem
+
+
+async def test_an_exception_nobody_planned_for_is_a_message_and_not_a_traceback(
+    tmp_path, key, wire
+):
+    def explode(_request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("boom")
+
+    wire.answer = explode
+    problem = await verify(config_for(tmp_path, "anthropic", key), "anthropic")
+    assert problem == "RuntimeError: boom"
+
+
+async def test_an_exception_that_holds_the_key_is_not_returned_with_it(tmp_path, key, wire):
+    # A library can put a header value into the message of what it raises.
+    def explode(_request: httpx.Request) -> httpx.Response:
+        raise RuntimeError(f"Illegal header value {key!r}")
+
+    wire.answer = explode
+    problem = await verify(config_for(tmp_path, "anthropic", key), "anthropic")
+    assert problem is not None and "Illegal header value" in problem
+    assert key not in problem
+
+
+async def test_a_missing_key_is_reported_without_a_request_being_made(tmp_path, wire):
+    problem = await verify(config_for(tmp_path, "anthropic", None), "anthropic")
+    assert problem is not None and "ANTHROPIC_API_KEY" in problem
+    assert wire.requests == []
+
+
+async def test_a_provider_that_never_answers_is_given_up_on(tmp_path, key, wire, monkeypatch):
+    monkeypatch.setattr(init_module, "VERIFY_TIMEOUT_S", 0.05)
+
+    async def never(_request: httpx.Request) -> httpx.Response:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    wire.answer = never
+    problem = await verify(config_for(tmp_path, "anthropic", key), "anthropic")
+    assert problem is not None and "no answer" in problem
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_the_client_is_closed_however_the_check_ends(tmp_path, key, wire, fails):
+    wire.answer = (lambda _request: httpx.Response(401, json={})) if fails else says_ok
+    await verify(config_for(tmp_path, "anthropic", key), "anthropic")
+    assert wire.clients and all(client.is_closed for client in wire.clients)
+
+
+# --------------------------------------------------------------------------
+# The whole of it: the questions, the file, and the real request to a stand-in provider
+# --------------------------------------------------------------------------
+
+
+def test_init_checks_the_key_with_the_real_request_when_nothing_else_is_given(tmp_path, key, wire):
+    wire.answer = says_ok
+    console, buffer = plain_console(100)
+    code = run_init(console, home=tmp_path, ask=Answers("1", key, None), env={})
+    assert code == 0
+    assert "verified" in buffer.getvalue()
+    assert wire.requests[0].headers["x-api-key"] == key
+    assert key not in buffer.getvalue()
+    assert key not in config_path(tmp_path).read_text()
+
+
+def test_a_key_the_provider_refuses_is_reported_and_the_file_stays(tmp_path, key, wire):
+    wire.answer = lambda _request: httpx.Response(
+        401, json={"error": {"message": f"bad key {key}"}}
+    )
+    console, buffer = plain_console(100)
+    code = run_init(console, home=tmp_path, ask=Answers("1", key, None), env={})
+    assert code == 0
+    assert (
+        "could not verify" in buffer.getvalue() and "rejected your credentials" in buffer.getvalue()
+    )
+    assert key not in buffer.getvalue()
+    assert config_path(tmp_path).is_file()
+
+
+def test_a_blank_key_is_reported_by_the_check_and_does_not_break_the_setup(tmp_path, wire):
+    console, buffer = plain_console(100)
+    code = run_init(console, home=tmp_path, ask=Answers("1", "   ", None), env={})
+    assert code == 0
+    assert "could not verify" in buffer.getvalue() and "ANTHROPIC_API_KEY" in buffer.getvalue()
+    assert wire.requests == []
+    assert config_path(tmp_path).is_file()
+    # Nothing was pasted, so there is no key to tell the person to keep; and an empty key is
+    # not "redacted" out of the message, which would put the marker between every two letters.
+    assert "<your key>" not in buffer.getvalue()
+    assert "[hidden]" not in buffer.getvalue()

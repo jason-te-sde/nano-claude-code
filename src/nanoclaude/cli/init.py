@@ -17,15 +17,18 @@ import contextlib
 import os
 import re
 from collections.abc import Callable, Coroutine, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 from rich.markup import escape
 
+from nanoclaude.agent.router import Router
 from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, ConfigError, load_config
 from nanoclaude.config.schema import ROLES, Config, LimitsConfig, PermissionsConfig
+from nanoclaude.conversation.transcript import Transcript, user_text
+from nanoclaude.providers.base import EmptyReplyError, ModelError, ModelRequest
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CapabilityCache
 from nanoclaude.tools.base import sanitize
 
@@ -147,6 +150,52 @@ bash_timeout_s = {limits.bash_timeout_s:g}
 """
 
 
+#: How long the check waits for the provider. A model that has to be loaded into memory first
+#: (a local one, cold) can take most of this; a person who has waited this long has a problem
+#: that another few seconds will not mend.
+VERIFY_TIMEOUT_S = 60.0
+
+
+async def verify(config: Config, alias: str) -> str | None:
+    """Send one small request with the model ``alias`` names. None if it was answered.
+
+    The request goes through the client ncc builds for the alias, so what is checked is what
+    will run: the key from the environment the config was loaded with, the address, the
+    parameter the provider wants its output cap in, no temperature. The cap is eight tokens.
+    A reply cut off at it is still an answer, whether it holds thinking or, from a model
+    that thinks where nobody can see, nothing at all (:class:`~nanoclaude.providers.base.
+    EmptyReplyError`): the key, the model and the request were accepted, which is all that
+    is read.
+
+    Never raises. What is wrong comes back as a line for the person, with the key cut out of
+    it: a provider can say a key back in its error, and a library can put a header in an
+    exception. A missing or refused key is a :class:`~nanoclaude.providers.base.CredentialsError`
+    and is reported like the rest.
+    """
+    key = config.api_key_for(alias)
+    request = ModelRequest("Reply with: ok", Transcript((user_text("ping"),)), (), 8)
+    # A router for its way of making the client. The cache is a path that is never read: no
+    # capability is asked for, and if one ever were, a file under /dev/null cannot be made.
+    router = Router(
+        replace(config, roles=replace(config.roles, main=alias)), CapabilityCache(Path(os.devnull))
+    )
+    try:
+        client = await router.client_for("main")
+        await asyncio.wait_for(client.complete(request), VERIFY_TIMEOUT_S)
+    except TimeoutError:
+        return f"no answer within {VERIFY_TIMEOUT_S:g} seconds — check your network connection"
+    except EmptyReplyError:
+        return None
+    except ModelError as exc:
+        return _redact(str(exc), key)
+    except Exception as exc:
+        # Whatever it is, init ends in a line for the person and not in a traceback.
+        return _redact(f"{type(exc).__name__}: {exc}", key)
+    finally:
+        await router.aclose()
+    return None
+
+
 def _outside(text: str) -> str:
     """Text that came from outside (a provider's error, a path), safe to put in a template.
 
@@ -198,8 +247,8 @@ def run_init(
     *,
     home: Path,
     ask: Ask,
-    verify: Verifier,
     env: Mapping[str, str] | None = None,
+    verify: Verifier = verify,
 ) -> int:
     """Ask which provider, which model and (if one is needed) the key; write the config.
 
