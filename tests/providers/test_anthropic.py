@@ -734,7 +734,7 @@ async def test_only_the_visible_text_is_kept_when_the_stream_breaks_after_thinki
     with pytest.raises(ModelError) as caught:
         await complete_from(arriving(seen, then=httpx.ReadError("connection reset")))
     assert caught.value.partial == ModelReply(
-        (TextBlock("The answer"),), StopKind.CUT_OFF, Usage(9, 0), "claude-sonnet-5"
+        (TextBlock("The answer"),), StopKind.CUT_OFF, Usage(9, 0), DEFAULT_MODEL
     )
 
 
@@ -756,7 +756,7 @@ def test_a_partial_reply_keeps_each_text_block_in_order_and_leaves_the_calls_out
         (TextBlock("First. "), TextBlock("Third.")),
         StopKind.CUT_OFF,
         Usage(3, 0),
-        "claude-sonnet-5",
+        DEFAULT_MODEL,
     )
 
 
@@ -955,3 +955,8 @@ async def test_a_line_that_is_not_json_after_a_message_start_alone_is_still_not_
     with pytest.raises(ModelError, match="not a reply stream") as caught:
         await complete_from(raw_response(first, b"event: x\ndata: {oops\n\n"))
     assert caught.value.partial is None and caught.value.retryable is False
+
+
+def test_the_default_model_is_a_current_one():
+    # Claude Sonnet 5 is legacy on the vendor's models page (checked 2026-10-02).
+    assert DEFAULT_MODEL == "claude-sonnet-5-5"

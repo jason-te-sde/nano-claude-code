@@ -69,7 +69,10 @@ class RegexClassifier:
             f"{rule.rule_id}: {rule.description}" for rule in RULES if rule.pattern.search(stripped)
         )
         level = DangerLevel.BLOCKED if hits else DangerLevel.SAFE
-        return DangerVerdict(level, hits, self.name)
+        # A pattern list can refuse a command but never clear one, so a SAFE from
+        # here means "nothing refused this", and policy rows 8 and 9 must not
+        # promote it to allow (spec 6.4's degradation guarantee).
+        return DangerVerdict(level, hits, self.name, authoritative=False)
 
 
 _QUOTED = re.compile(r"""'[^']*'|"[^"]*\"""")

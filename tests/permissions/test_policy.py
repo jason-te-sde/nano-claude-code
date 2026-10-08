@@ -3,6 +3,7 @@ from typing import Any
 import pytest
 
 from nanoclaude.permissions.danger import DangerLevel, DangerVerdict
+from nanoclaude.permissions.danger.regex import RegexClassifier
 from nanoclaude.permissions.policy import (
     Decision,
     Grants,
@@ -533,10 +534,9 @@ def test_evaluate_defaults_to_no_grants_when_the_argument_is_omitted():
 
 
 # Step 7b: the degradation guarantee (spec 6.4, 17) enforced in code, not just
-# in prose. A SAFE verdict whose classifier was not authoritative -- today
-# only reachable by constructing one directly, since the fallback wiring
-# that will actually set the flag is a later task's work -- must not be
-# promoted to ALLOW by row 8 or row 9. All four directions are pinned, not
+# in prose. A SAFE verdict whose classifier was not authoritative -- every SAFE
+# the regex classifier gives, since it can refuse a command but never clear
+# one -- must not be promoted to ALLOW by row 8 or row 9. All four directions are pinned, not
 # just the negative case: a guard proven only by its denial is the defect the
 # completeness clause (spec, test-completeness) names.
 SAFE_AST = DangerVerdict(DangerLevel.SAFE, (), "ast")
@@ -603,3 +603,29 @@ def test_a_file_changing_tool_is_not_in_the_allowed_without_asking_set():
         Grants(),
     )
     assert result.decision is Decision.ASK
+
+
+# The regex classifier's own verdicts, not hand-built ones: what it says about a
+# command it found nothing in is "nothing refused this", never a clearance.
+def test_the_regex_classifier_never_clears_a_command_it_found_nothing_in():
+    verdict = RegexClassifier().classify("npm test")
+    assert verdict.level is DangerLevel.SAFE
+    assert verdict.authoritative is False
+
+
+def test_an_allow_rule_does_not_promote_the_regex_classifiers_own_safe_verdict():
+    p = policy(rules=RuleSet.build(allow=["Bash(npm test:*)"], ask=["Bash"]))
+    danger = RegexClassifier().classify("npm test")
+    result = evaluate(req(tool="Bash", subject="npm test", paths=(), danger=danger), p)
+    assert result.decision is Decision.ASK
+    assert result.rule != "rule.allow"
+
+
+def test_a_session_grant_does_not_promote_the_regex_classifiers_own_safe_verdict():
+    p = policy(rules=RuleSet.build(ask=["Bash"]))
+    danger = RegexClassifier().classify("ls")
+    result = evaluate(
+        req(tool="Bash", subject="ls", paths=(), danger=danger), p, Grants(frozenset({"Bash"}))
+    )
+    assert result.decision is Decision.ASK
+    assert result.rule != "grant.session"
