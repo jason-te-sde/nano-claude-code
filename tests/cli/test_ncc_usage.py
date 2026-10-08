@@ -17,7 +17,7 @@ from nanoclaude.cli import main as ncc_main
 from nanoclaude.cli.main import EXIT_CODES, UsageError, build_parser
 from nanoclaude.cli.main import _stdin_is_terminal as real_stdin_is_terminal
 from nanoclaude.testing.scripted import says
-from tests.cli.helpers import run_ncc
+from tests.cli.helpers import assert_failed_run_stdout, run_ncc
 
 # --------------------------------------------------------------------------
 # What argparse found wrong, in the form of spec 17.9
@@ -197,7 +197,7 @@ def test_an_empty_model_is_a_usage_error_and_not_the_default(
 def test_an_output_format_with_no_prompt_is_a_usage_error(ncc_home, project, capsys, fmt):
     code, out, err = run_ncc(capsys, "--root", str(project), "--output-format", fmt)
     assert code == EXIT_CODES["usage"]
-    assert out == ""
+    assert_failed_run_stdout(["json"] if fmt == "json" else [], out, err, code)
     assert err == (
         "error: --output-format needs -p — it shapes the answer to one prompt; "
         "pass a prompt with -p\n"

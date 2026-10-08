@@ -12,7 +12,18 @@ Streams are a contract too. stdout carries the answer and nothing else, written 
 the model wrote it: not through Rich, which would read ``[...]`` in code as markup and wrap
 a long line at 80 columns when the output is a file. Everything that went wrong is one line
 on stderr in the form of spec 17.9, and a run that fails with nothing to show leaves stdout
-empty.
+empty. So is each call a headless run had to decline, because nobody was there to ask: one
+``ncc: declined ...`` line each (see :mod:`nanoclaude.cli.headless`).
+
+With ``--output-format json`` stdout is one JSON object, however the run ended. A failure's
+object has the keys a finished run's has, with ``is_error`` true, ``stop_reason`` ``"error"``,
+what was spent so far (nothing, before there was a session), ``error`` as the stderr line
+without its prefix and ``exit_code`` as the process's. The format is read from the parsed
+arguments; a mistake that stops them being parsed is answered in JSON when the arguments typed
+say ``--output-format json`` (the last such flag winning, as in the parser) and as a line on
+stderr alone otherwise, because a format that was not given, or was not one there is, is not
+one to answer in. ``--help`` and ``--version`` are text, and a reader that has closed stdout
+is not written to (exit 141).
 """
 
 from __future__ import annotations
@@ -44,9 +55,10 @@ from nanoclaude.agent.session import (
     UnknownSessionError,
     new_session_id,
 )
-from nanoclaude.agent.ui import UI, AutoDecline
+from nanoclaude.agent.ui import UI
+from nanoclaude.cli.headless import ReportingDecline
 from nanoclaude.cli.init import run_init
-from nanoclaude.cli.render import ConsoleUI, show_error
+from nanoclaude.cli.render import ConsoleUI, error_text, show_error
 from nanoclaude.cli.repl import run_repl
 from nanoclaude.config.load import CONFIG_DIRNAME, ConfigError, expand_root, load_config
 from nanoclaude.config.schema import ROLES
@@ -57,7 +69,7 @@ from nanoclaude.permissions.policy import PermissionMode, Policy
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.permissions.sandbox import Sandbox, is_within
-from nanoclaude.providers.base import CredentialsError, ModelError
+from nanoclaude.providers.base import CredentialsError, ModelError, Usage
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CapabilityCache
 from nanoclaude.tools.base import sanitize
 from nanoclaude.tools.registry import default_registry
@@ -330,7 +342,34 @@ class _Outcome:
     code: int
 
 
+@dataclass(slots=True)
+class _Run:
+    """What a failed run can still say about itself: the session, once there was one."""
+
+    session: Session | None = None
+
+
+def _asked_for_json(typed: Sequence[str]) -> bool:
+    """Whether the arguments, as typed, ask for ``--output-format json``.
+
+    For a mistake that stopped them being parsed, when the parsed format is not there to ask.
+    The last ``--output-format`` wins, as it does in the parser, and nothing after a bare
+    ``--`` is a flag. Only the exact word counts: a format that is not one there is, is not
+    one to answer in.
+    """
+    wanted = None
+    for index, word in enumerate(typed):
+        if word == "--":
+            break
+        if word == "--output-format" and index + 1 < len(typed):
+            wanted = typed[index + 1]
+        elif word.startswith("--output-format="):
+            wanted = word.partition("=")[2]
+    return wanted == "json"
+
+
 def main(argv: list[str] | None = None) -> int:
+    typed = sys.argv[1:] if argv is None else argv
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
@@ -338,11 +377,14 @@ def main(argv: list[str] | None = None) -> int:
         # process: the console script does, with what it returns.
         return exc.code if isinstance(exc.code, int) else 1
     except UsageError as exc:
-        # Nothing was parsed, so whether colour was asked off is read from what was typed.
-        flagged = "--no-color" in (sys.argv[1:] if argv is None else argv)
-        show_error(_stderr_console(flagged), str(exc))
-        return EXIT_CODES["usage"]
+        # Nothing was parsed, so whether colour was asked off, and whether the answer is to
+        # be JSON, are read from what was typed.
+        return _end_with(
+            exc, _stderr_console("--no-color" in typed), as_json=_asked_for_json(typed)
+        )
     err = _stderr_console(args.no_color)
+    as_json = args.output_format == "json"
+    run = _Run()
     try:
         home = nanoclaude_home()
         if args.command == "init":
@@ -364,39 +406,62 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(
                 _run_interactive(args, settings, home, _stdout_console(args.no_color))
             )
-        outcome = asyncio.run(_run_headless(args, settings, home))
-        _report(outcome, as_json=args.output_format == "json", err=err)
+        outcome = asyncio.run(_run_headless(args, settings, home, err, run))
+        _report(outcome, as_json=as_json, err=err)
         return outcome.code
-    except (UsageError, UnknownSessionError) as exc:
-        show_error(err, str(exc))
-        return EXIT_CODES["usage"]
-    except (ConfigError, ContextTooSmallError, CredentialsError) as exc:
-        # A key that is missing or refused is mended in the configuration, as the rest are.
-        show_error(err, str(exc))
-        return EXIT_CODES["config"]
-    except SessionChangedError as exc:
-        show_error(err, str(exc))
-        return EXIT_CODES["stopped"]
-    except ModelError as exc:
-        show_error(err, _with_advice(str(exc), _PROVIDER_ADVICE))
-        return EXIT_CODES["provider"]
-    except StoreOpenError as exc:
-        show_error(err, str(exc))
-        return EXIT_CODES["stopped"]
     except BrokenPipeError:
         _abandon_stdout()
         return EXIT_CODES["output_closed"]
-    except KeyboardInterrupt as exc:
+    except (Exception, KeyboardInterrupt) as exc:
+        return _end_with(exc, err, as_json=as_json, session=run.session)
+
+
+def _failure(exc: BaseException) -> tuple[str, int]:
+    """The line for a person, and the exit code, for an exception that ended the run.
+
+    The order is the order of the cases: a key that is missing or refused is mended in the
+    configuration, as the rest are, and is a :class:`ModelError` that must not be taken for a
+    failure of the provider. Last is anything nobody planned for: a script reads the exit
+    code and the first line of stderr, and a traceback is neither.
+    """
+    if isinstance(exc, (UsageError, UnknownSessionError)):
+        return str(exc), EXIT_CODES["usage"]
+    if isinstance(exc, (ConfigError, ContextTooSmallError, CredentialsError)):
+        return str(exc), EXIT_CODES["config"]
+    if isinstance(exc, SessionChangedError | StoreOpenError):
+        return str(exc), EXIT_CODES["stopped"]
+    if isinstance(exc, ModelError):
+        return _with_advice(str(exc), _PROVIDER_ADVICE), EXIT_CODES["provider"]
+    if isinstance(exc, KeyboardInterrupt):
         # Ctrl+C has no words of its own; one that came with a message (ncc init, interrupted
         # after it wrote the config) has, and a person who is told nothing more was done when
         # a file was written is told something false.
-        show_error(err, str(exc) or "interrupted \u2014 nothing more was done; run again to retry")
-        return EXIT_CODES["interrupted"]
-    except Exception as exc:
-        # Last, after every exception that has a line and a code of its own. A script reads
-        # the exit code and the first line of stderr, and a traceback is neither.
-        show_error(err, _unexpected(exc))
-        return EXIT_CODES["stopped"]
+        words = str(exc) or "interrupted \u2014 nothing more was done; run again to retry"
+        return words, EXIT_CODES["interrupted"]
+    return _unexpected(exc), EXIT_CODES["stopped"]
+
+
+def _end_with(
+    exc: BaseException, err: Console, *, as_json: bool, session: Session | None = None
+) -> int:
+    """End a run that failed: the line on stderr, and for JSON the one object on stdout.
+
+    ``session`` is the run's own, if it got as far as one: what it had spent is reported
+    even though the run did not finish. The object is written first, as for a run that ends
+    with a stop line, so that a script reading stdout has it by the time stderr is read.
+    """
+    message, code = _failure(exc)
+    if as_json:
+        turns = session.state.turn if session is not None else 0
+        payload = _payload(session, "", "error", turns, error=message, code=code)
+        try:
+            print(json.dumps(payload, indent=2))
+            sys.stdout.flush()
+        except BrokenPipeError:
+            _abandon_stdout()
+            return EXIT_CODES["output_closed"]
+    show_error(err, message)
+    return code
 
 
 def _init(args: argparse.Namespace, home: Path, err: Console, typed: Sequence[str]) -> int:
@@ -600,7 +665,7 @@ def _is_busy(exc: BaseException) -> bool:
     )
 
 
-def _unexpected(exc: Exception) -> str:
+def _unexpected(exc: BaseException) -> str:
     """What a person is told of an exception nobody planned for, as spec 17.9 words it."""
     if _is_busy(exc):
         return "the session store is busy — another ncc may be using it; try again"
@@ -657,7 +722,11 @@ def _abandon_stdout() -> None:
 
 
 def _build_session(
-    args: argparse.Namespace, settings: _Settings, home: Path, console: Console | None
+    args: argparse.Namespace,
+    settings: _Settings,
+    home: Path,
+    console: Console | None,
+    err: Console,
 ) -> Session:
     config = load_config(home=str(home), project=settings.root, env=dict(os.environ))
     if args.model is not None:
@@ -694,7 +763,7 @@ def _build_session(
             router=router,
             registry=default_registry(todo),
             policy=policy,
-            ui=_ui(console, settings.root, router),
+            ui=_ui(console, err, settings, router),
             store=store,
             audit=AuditLog(store, redactor),
             session_id=session_id,
@@ -722,16 +791,17 @@ def _open(store: Store) -> None:
         raise StoreOpenError(store.path, exc) from exc
 
 
-def _ui(console: Console | None, root: str, router: Router) -> UI:
+def _ui(console: Console | None, err: Console, settings: _Settings, router: Router) -> UI:
     """The front end for the session: none that asks, for headless, and ConsoleUI for the REPL.
 
-    ConsoleUI is told where the project is, so that it shows ``src/a.py`` and not an absolute
-    path, and how to find the model behind a role, so that its waiting indicator names the
-    model and not the role.
+    Headless declines what would have been asked and says so on ``err``, naming the mode so
+    that its advice is not to turn on what is on. ConsoleUI is told where the project is, so
+    that it shows ``src/a.py`` and not an absolute path, and how to find the model behind a
+    role, so that its waiting indicator names the model and not the role.
     """
     if console is None:
-        return AutoDecline()
-    return ConsoleUI(console, root=root, model_of=_model_of(router))
+        return ReportingDecline(err, root=settings.root, mode=settings.mode)
+    return ConsoleUI(console, root=settings.root, model_of=_model_of(router))
 
 
 def _model_of(router: Router) -> Callable[[str], str]:
@@ -774,15 +844,19 @@ def _which_session(args: argparse.Namespace, store: Store, root: str) -> tuple[s
 async def _run_interactive(
     args: argparse.Namespace, settings: _Settings, home: Path, console: Console
 ) -> int:
-    session = _build_session(args, settings, home, console)
+    session = _build_session(args, settings, home, console, _stderr_console(args.no_color))
     try:
         return await run_repl(session, console, str(home / CONFIG_DIRNAME / "history"))
     finally:
         await session.aclose()
 
 
-async def _run_headless(args: argparse.Namespace, settings: _Settings, home: Path) -> _Outcome:
-    session = _build_session(args, settings, home, None)
+async def _run_headless(
+    args: argparse.Namespace, settings: _Settings, home: Path, err: Console, run: _Run
+) -> _Outcome:
+    session = _build_session(args, settings, home, None, err)
+    # Kept where main can see it: a run that fails still has what it spent to report.
+    run.session = session
     try:
         try:
             done = await session.follow_up(args.prompt)
@@ -797,11 +871,14 @@ async def _run_headless(args: argparse.Namespace, settings: _Settings, home: Pat
             if kept is None:
                 raise ModelError(line) from exc
             # That text is the result there is, and the run still failed.
+            code = EXIT_CODES["provider"]
             return _Outcome(
-                payload=_payload(session, kept, "cut_off", session.state.turn, is_error=True),
+                payload=_payload(
+                    session, kept, "cut_off", session.state.turn, error=line, code=code
+                ),
                 text=kept,
                 error=line,
-                code=EXIT_CODES["provider"],
+                code=code,
             )
         return _finished(session, done)
     finally:
@@ -827,11 +904,13 @@ def _finished(session: Session, done: Done) -> _Outcome:
     # message are the program's own, and belong on stderr.
     models_words = reason in (StopReason.COMPLETED, StopReason.REFUSAL, StopReason.MAX_TOKENS)
     result = _as_written(done) if models_words else done.text
+    error = _stop_line(session, done)
+    code = EXIT_CODES["completed" if completed else "stopped"]
     return _Outcome(
-        payload=_payload(session, result, reason.value, done.state.turn, is_error=not completed),
+        payload=_payload(session, result, reason.value, done.state.turn, error=error, code=code),
         text=result if models_words else "",
-        error=_stop_line(session, done),
-        code=EXIT_CODES["completed" if completed else "stopped"],
+        error=error,
+        code=code,
     )
 
 
@@ -871,11 +950,24 @@ def _stop_line(session: Session, done: Done) -> str | None:
 
 
 def _payload(
-    session: Session, result: str, stop_reason: str, turns: int, *, is_error: bool
+    session: Session | None,
+    result: str,
+    stop_reason: str,
+    turns: int,
+    *,
+    error: str | None,
+    code: int,
 ) -> dict[str, Any]:
-    usage = session.router.total_usage()
+    """The one object ``--output-format json`` prints.
+
+    Every run has the same keys, so that a script reads them without asking which kind of
+    run it was: ``error`` is the stderr line without its prefix (None for a run that
+    finished) and ``exit_code`` the process's. ``session`` is None for a run that failed
+    before there was one, which spent nothing.
+    """
+    usage = session.router.total_usage() if session is not None else Usage()
     return {
-        "session_id": session.session_id,
+        "session_id": session.session_id if session is not None else None,
         "result": result,
         "stop_reason": stop_reason,
         "turns": turns,
@@ -884,8 +976,10 @@ def _payload(
             "output_tokens": usage.output_tokens,
             "cache_read_tokens": usage.cache_read_tokens,
         },
-        "cost_usd": session.router.total_cost(),
-        "is_error": is_error,
+        "cost_usd": session.router.total_cost() if session is not None else 0.0,
+        "is_error": error is not None,
+        "error": None if error is None else error_text(error),
+        "exit_code": code,
     }
 
 

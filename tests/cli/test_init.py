@@ -1559,11 +1559,15 @@ def test_init_takes_no_flag_that_shapes_a_session_and_does_not_ignore_one(
     reached = not_called(monkeypatch)
     code, out, err = run_ncc(capsys, *argv)
     assert code == EXIT_CODES["usage"]
-    assert out == ""
     assert err == (
         f"error: ncc init takes no {flag} \u2014 run it on its own "
         "(--no-color is the only flag that goes with it)\n"
     )
+    if flag == "--output-format":
+        # JSON was asked for, and with it that stdout is one object whatever happens.
+        assert json.loads(out)["exit_code"] == EXIT_CODES["usage"]
+    else:
+        assert out == ""
     assert reached == []
 
 

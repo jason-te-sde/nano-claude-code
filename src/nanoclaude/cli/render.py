@@ -163,17 +163,24 @@ ERROR_PREFIX = "error: "
 _LINE_BREAKS = re.compile(r"[ \t]*\n\s*")
 
 
+def error_text(message: str) -> str:
+    """What follows ``error: `` on an error line: ``message`` as one line, safe to print.
+
+    The prefix is taken off if it came with the message, a line break becomes a space, so
+    that nothing quoted in it can start a line of its own, and what a terminal would act on
+    is removed. The JSON a failed ``-p`` prints carries this same text as ``error``.
+    """
+    return _LINE_BREAKS.sub(" ", sanitize(message.removeprefix(ERROR_PREFIX))).strip()
+
+
 def show_error(console: Console, message: str) -> None:
     """``error: <what happened> — <what to do>``: spec 17.9's form for a person.
 
     ``message`` is what follows the prefix, or the whole line: either way the prefix is on
     the line exactly once, so no caller can print an error line without it, and it is one
-    line: a line break in ``message`` becomes a space, so that nothing it quotes can start a
-    line of its own, with a second ``error:`` in front of it, say. ``message`` is data:
-    never read as markup.
+    line (see :func:`error_text`). ``message`` is data: never read as markup.
     """
-    body = _LINE_BREAKS.sub(" ", sanitize(message.removeprefix(ERROR_PREFIX))).strip()
-    console.print(Text.assemble((ERROR_PREFIX, "red"), body))
+    console.print(Text.assemble((ERROR_PREFIX, "red"), error_text(message)))
 
 
 def _shorten(text: str) -> str:

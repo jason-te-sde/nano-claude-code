@@ -28,7 +28,7 @@ from nanoclaude.providers.retry import classify_status
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, cut_off, says
 from nanoclaude.testing.session import ScriptedClient
-from tests.cli.helpers import INTERRUPTED, run_ncc
+from tests.cli.helpers import INTERRUPTED, assert_failed_run_stdout, run_ncc
 
 BAD_CALL = '<tool name="Read">{"path": </tool>'
 
@@ -150,6 +150,8 @@ def test_json_output_has_a_stable_shape(ncc_home, project, serve, capsys):
         "usage",
         "cost_usd",
         "is_error",
+        "error",
+        "exit_code",
     }
     assert re.fullmatch(r"[0-9a-f]{12}", payload["session_id"])
     assert payload["result"] == "done"
@@ -307,11 +309,15 @@ def test_a_reply_cut_off_before_any_text_has_nothing_to_write(ncc_home, project,
     assert err.startswith("error: the reply was cut off") and "what arrived is kept" not in err
 
 
-def test_a_reply_cut_off_before_any_text_has_no_json_either(ncc_home, project, serve, capsys):
+def test_a_reply_cut_off_before_any_text_is_a_json_error_without_a_result(
+    ncc_home, project, serve, capsys
+):
     serve(m=[cut_off("")])
-    code, out, _ = run_ncc(capsys, "--root", str(project), "-p", "q", "--output-format", "json")
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "q", "--output-format", "json")
     assert code == EXIT_CODES["provider"]
-    assert out == ""
+    # Nothing arrived, so there is no result to carry, and still one object that says why.
+    assert_failed_run_stdout(["json"], out, err, code)
+    assert json.loads(out)["result"] == ""
 
 
 # --------------------------------------------------------------------------
@@ -393,7 +399,7 @@ def test_a_missing_key_is_a_configuration_error_that_names_the_variable(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
     assert code == EXIT_CODES["config"]
-    assert out == ""
+    assert_failed_run_stdout(fmt, out, err, code)
     assert err == (
         "error: role 'main' uses model 'm', which needs ANTHROPIC_API_KEY "
         "\u2014 set it, or run: ncc init\n"
@@ -430,7 +436,7 @@ def test_a_key_the_provider_rejects_is_a_configuration_error_too(
     serve(m=[classify_status(status, '{"error":{"message":"invalid x-api-key"}}')])
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
     assert code == EXIT_CODES["config"]
-    assert out == ""
+    assert_failed_run_stdout(fmt, out, err, code)
     assert err == (
         f"error: the provider rejected your credentials (HTTP {status}): invalid x-api-key "
         "\u2014 check the key, or run: ncc init\n"
@@ -445,7 +451,8 @@ def test_any_other_provider_failure_is_still_a_provider_error(
     serve(m=[classify_status(status, '{"error":{"message":"nope"}}')])
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
     assert code == EXIT_CODES["provider"]
-    assert out == "" and err.startswith("error: ")
+    assert_failed_run_stdout(fmt, out, err, code)
+    assert err.startswith("error: ")
 
 
 def test_a_model_window_too_small_for_the_prompt_is_a_configuration_error(

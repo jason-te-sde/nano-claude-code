@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import io
+import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import pytest
 from rich.console import Console, RenderableType
@@ -168,6 +169,23 @@ def run_ncc(capsys: pytest.CaptureFixture[str], *argv: str) -> tuple[int, str, s
     code = main(list(argv))
     captured = capsys.readouterr()
     return code, captured.out, captured.err
+
+
+def assert_failed_run_stdout(
+    fmt: Sequence[str], out: str, err: str, code: int, *, text: str = ""
+) -> None:
+    """What stdout holds after a run that failed: ``text`` in text mode, one object in JSON.
+
+    The object says it is an error, carries the process's exit code, and its ``error`` is the
+    line on stderr without its prefix, so that what a script reads in the one place and what
+    a person reads in the other cannot differ.
+    """
+    if "json" not in fmt:
+        assert out == text
+        return
+    payload = json.loads(out)
+    assert payload["is_error"] is True and payload["exit_code"] == code
+    assert err == f"error: {payload['error']}\n"
 
 
 #: What ncc says when it is stopped with Ctrl+C: one line on stderr, like every other.
