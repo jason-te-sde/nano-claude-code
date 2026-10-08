@@ -80,8 +80,24 @@ _PROVIDER_ADVICE = "try again, or choose another model with --model"
 
 
 def nanoclaude_home() -> Path:
-    """The directory that holds ``.nanoclaude``: the person's home, unless told otherwise."""
-    return Path(os.environ.get("NANOCLAUDE_HOME", str(Path.home())))
+    """The directory that holds ``.nanoclaude``: the person's home, unless told otherwise.
+
+    ``NANOCLAUDE_HOME`` may start with ``~``, as every other path a person writes may, and
+    it is expanded here: the loader expands it too, so a path left as it was would be one
+    place for what writes the config and another for what reads it.
+
+    Raises :class:`~nanoclaude.config.load.ConfigError` for ``~name`` with no such user.
+    """
+    given = os.environ.get("NANOCLAUDE_HOME")
+    if given is None:
+        return Path.home()
+    try:
+        return Path(given).expanduser()
+    except RuntimeError as exc:
+        raise ConfigError(
+            f"NANOCLAUDE_HOME is {given!r}, which starts with ~ but names no home directory "
+            "\u2014 write the full path, or unset it"
+        ) from exc
 
 
 class UsageError(Exception):
@@ -261,8 +277,8 @@ def main(argv: list[str] | None = None) -> int:
         show_error(_stderr_console(flagged), str(exc))
         return EXIT_CODES["usage"]
     err = _stderr_console(args.no_color)
-    home = nanoclaude_home()
     try:
+        home = nanoclaude_home()
         if args.command == "init":
             return _init(args, home, err, sys.argv[1:] if argv is None else argv)
         if args.prompt is not None and not args.prompt.strip():

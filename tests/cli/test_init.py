@@ -49,7 +49,7 @@ from nanoclaude.cli.init import (
     run_init,
     verify,
 )
-from nanoclaude.cli.main import EXIT_CODES
+from nanoclaude.cli.main import EXIT_CODES, main, nanoclaude_home
 from nanoclaude.config.load import ConfigError, load_config
 from nanoclaude.config.schema import ROLES, Config, PermissionsConfig
 from nanoclaude.conversation.transcript import Transcript, user_text
@@ -60,6 +60,7 @@ from nanoclaude.providers.capabilities import (
     capabilities_for,
 )
 from nanoclaude.providers.openai_compat import OpenAICompatClient
+from nanoclaude.testing.scripted import says
 from tests.cli.helpers import INTERRUPTED, colour_codes, plain_console, run_ncc
 
 
@@ -1457,6 +1458,19 @@ def test_init_takes_no_flag_that_shapes_a_session_and_does_not_ignore_one(
     assert reached == []
 
 
+def test_a_flag_is_refused_when_ncc_is_run_as_the_console_script_runs_it(
+    machine, monkeypatch, capsys
+):
+    # The script calls main() with no arguments, and main reads what was typed from sys.argv.
+    monkeypatch.setattr(sys, "argv", ["ncc", "init", "--model", "m"])
+    reached = not_called(monkeypatch)
+    code = main()
+    captured = capsys.readouterr()
+    assert code == EXIT_CODES["usage"] and captured.out == ""
+    assert captured.err.startswith("error: ncc init takes no --model")
+    assert reached == []
+
+
 @pytest.mark.parametrize("argv", [["init", "--no-color"], ["--no-color", "init"]])
 def test_init_takes_no_color(machine, monkeypatch, capsys, key, argv):
     scripted(monkeypatch, "1", key, None, verify=Verifier())
@@ -1535,6 +1549,46 @@ def test_a_config_that_cannot_be_written_is_one_line_and_a_configuration_error(
     assert code == EXIT_CODES["config"]
     assert err.startswith("error: cannot write ") and err.count("\n") == 1
     assert key not in out + err
+
+
+# -- where ncc keeps its files -----------------------------------------------------------
+
+
+def test_the_home_ncc_is_told_about_may_start_with_a_tilde(machine, monkeypatch):
+    monkeypatch.setenv("NANOCLAUDE_HOME", "~/ncc")
+    assert nanoclaude_home() == machine.home / "ncc"
+
+
+def test_with_no_home_given_ncc_keeps_its_files_in_the_users_home(machine, monkeypatch):
+    monkeypatch.delenv("NANOCLAUDE_HOME")
+    assert nanoclaude_home() == machine.home
+
+
+def test_init_in_a_home_given_with_a_tilde_writes_in_the_home_directory_and_ncc_finds_it(
+    machine, monkeypatch, capsys, key, serve
+):
+    # Written in <cwd>/~/ncc, and then not found by the loader, which expands the tilde: init
+    # reported success and the next command said to run ncc init.
+    monkeypatch.setenv("NANOCLAUDE_HOME", "~/ncc")
+    scripted(monkeypatch, "1", key, None, verify=Verifier())
+    code, out, err = run_ncc(capsys, "init")
+    assert (code, err) == (0, "")
+    assert config_path(machine.home / "ncc").is_file()
+    assert not (machine.project / "~").exists()
+    assert str(machine.home / "ncc") in out
+    serve(anthropic=[says("fine")])
+    assert run_ncc(capsys, "--root", str(machine.project), "-p", "hi")[:2] == (0, "fine\n")
+
+
+def test_a_home_that_names_nobodys_home_directory_is_one_line_and_a_configuration_error(
+    machine, monkeypatch, capsys
+):
+    monkeypatch.setenv("NANOCLAUDE_HOME", "~nobody_by_this_name_exists/ncc")
+    reached = not_called(monkeypatch)
+    code, out, err = run_ncc(capsys, "init")
+    assert code == EXIT_CODES["config"] and out == ""
+    assert err.startswith("error: NANOCLAUDE_HOME is '~nobody_by_this_name_exists/ncc'")
+    assert err.count("\n") == 1 and reached == []
 
 
 # -- the key, from the command's side: where it can be found afterwards -------------------
