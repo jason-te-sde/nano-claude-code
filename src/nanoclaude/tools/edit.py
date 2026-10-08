@@ -256,7 +256,10 @@ class EditTool:
 
         stamp = write_atomic(resolved, updated)
         diff = unified_diff(snapshot.content, updated, shown)
-        return ok(call_id, f"Edited {shown}\n{diff}", ((resolved, stamp),))
+        # The diff carries the lines around the edit as context, and those reach the
+        # model and the transcript like any tool output, so they are scrubbed alike.
+        scrubbed, _ = ctx.redactor.scrub(diff)
+        return ok(call_id, f"Edited {shown}\n{scrubbed}", ((resolved, stamp),))
 
 
 def _require_path(arguments: Mapping[str, Any]) -> str:

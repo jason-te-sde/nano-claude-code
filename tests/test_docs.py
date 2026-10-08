@@ -18,8 +18,10 @@ import pytest
 from nanoclaude.cli.commands import COMMANDS
 from nanoclaude.cli.init import PRESETS
 from nanoclaude.cli.main import EXIT_CODES, main
+from nanoclaude.cli.repl import TEXT_TOOL_BANNER
 from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, load_config
 from nanoclaude.config.schema import ROLES, LimitsConfig, ModelConfig, PermissionsConfig, UiConfig
+from nanoclaude.context.projectmap import project_map
 from nanoclaude.permissions.danger.regex import RegexClassifier
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CONSERVATIVE_DEFAULT, capabilities_for
 from nanoclaude.tools.registry import default_registry
@@ -569,14 +571,47 @@ def test_ncc_has_no_audit_command_and_the_scope_note_says_so(capsys):
     assert "`ncc audit`" in _text(DESIGN / "0001-scope.md")
 
 
-def test_the_regex_classifier_does_not_yet_mark_its_clear_verdicts_as_unreliable():
-    """The architecture document says so, as something the shell tool's task has to do."""
+def test_the_regex_classifier_marks_its_clear_verdicts_as_unreliable():
+    """A safe from a list of patterns means "nothing refused this", and says so."""
     verdict = RegexClassifier().classify("ls -la")
-    assert verdict.authoritative is True, (
-        "the regex classifier now marks its safe verdicts as not authoritative; "
-        "correct the paragraph on the danger classifier in docs/architecture.md"
+    assert verdict.authoritative is False, (
+        "the regex classifier's safe verdicts are marked authoritative; "
+        "docs/architecture.md says they are not"
     )
-    assert "does not mark its verdicts so yet" in _text(ARCHITECTURE)
+    assert "marked not authoritative" in _text(ARCHITECTURE)
+
+
+def test_the_project_map_lists_credentials_files_by_name_as_the_documents_say(tmp_path):
+    """A known gap: the map hides what .gitignore hides and nothing of its own."""
+    (tmp_path / ".env").write_text("TOKEN=x\n")
+    (tmp_path / "app.py").write_text("")
+    listing = project_map(str(tmp_path))
+    assert ".env" in listing.splitlines(), (
+        "the project map now hides credentials files; correct docs/design/0013-thin-context.md, "
+        "SECURITY.md and CHANGELOG.md, which say that it lists them by name"
+    )
+    for document in (DESIGN / "0013-thin-context.md", SECURITY, CHANGELOG):
+        assert "credentials files" in _text(document)
+
+
+def test_the_text_tool_banner_the_documents_quote_is_the_one_the_repl_prints():
+    assert TEXT_TOOL_BANNER in _text(DESIGN / "0004-text-tool-protocol.md")
+    assert TEXT_TOOL_BANNER in _text(CONFIGURATION)
+
+
+def test_every_test_a_document_names_exists():
+    """A document that says a test pins something has to name a test that is there."""
+    defined = set()
+    for path in (ROOT / "tests").rglob("*.py"):
+        defined |= set(re.findall(r"^\s*(?:async )?def (test_\w+)", _text(path), re.MULTILINE))
+    named = 0
+    for document in _every_document():
+        for name in set(re.findall(r"`(test_\w+)`", _text(document))):
+            named += 1
+            assert name in defined, (
+                f"{document.relative_to(ROOT)} names {name}, which is not a test"
+            )
+    assert named >= 40, f"only {named} tests are named in the documents, so few were checked"
 
 
 # --------------------------------------------------------------------------

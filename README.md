@@ -65,7 +65,7 @@ compact = "cheap"
 
 The idea is that reading a codebase to work out what to change is much of the tokens in a session and little of its difficulty, so `explore` is the role meant for a cheap or a local model while `main`, which writes the change, stays strong. A role you leave out follows `main`. `--model <alias>` replaces `main` for one run, and `--role <role>=<alias>` replaces one role.
 
-**Today two roles are used.** `main` answers the conversation, and `compact` writes the summary when a long conversation is compacted; that request carries the whole older history, so a cheap model there already saves money. `explore`, `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request yet: they wait for sub-agents and for post-edit verification, which are not built. Neither that premise nor what routing exploration to a cheap model would save, or cost in the quality of what comes back, has been measured. `/cost` shows what each role spent.
+**Today two roles are used.** `main` answers the conversation, and `compact` writes the summary when a long conversation is compacted; that request carries the whole older history, so a cheap model there already saves money. `explore`, `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request yet: routing them is v0.3 scope, with sub-agents. Neither that premise nor what routing exploration to a cheap model would save, or cost in the quality of what comes back, has been measured. `/cost` shows what each role spent.
 
 ## Safety
 
@@ -95,7 +95,7 @@ The idea is that reading a codebase to work out what to change is much of the to
 | Credentials: paths such as `.env`, `*.pem` and SSH keys are refused, and what looks like a key is scrubbed from what tools return, before it is stored | Built, with gaps listed in [`SECURITY.md`](SECURITY.md) |
 | Your own `deny`, `ask` and `allow` rules, with `deny` always winning | Built |
 | A record of every call, written before the call runs, in `~/.nanoclaude/sessions.db` | Built; nothing reads it back yet |
-| Classifying a shell command as dangerous | **Not measured yet.** The regex classifier is written and has known blind spots, each checked by a test, and there is no corpus of dangerous commands to say how many it misses (`tests/corpus/dangerous.jsonl` does not exist), so there is no figure. The syntax-tree classifier, an optional extra meant to be the authority, is not built, and nothing calls either until `Bash` exists. |
+| Classifying a shell command as dangerous | **Not measured yet.** The regex classifier is written and has known blind spots, each checked by a test, and there is no corpus of dangerous commands to say how many it misses (`tests/corpus/dangerous.jsonl` does not exist), so there is no figure. The syntax-tree classifier, an optional extra meant to be the authority, is not built, and nothing calls either until `Bash` exists. A command the regex classifier finds nothing in is not treated as cleared. |
 | Undoing an edit | Not built. A write is confirmed first, and `git` is how you undo one. |
 
 ## Configuration
@@ -136,10 +136,10 @@ Each figure is produced by `python scripts/measure.py`, which also writes `metri
 
 | Figure | Key | Value | Produced by |
 | --- | --- | --- | --- |
-| Tests collected by pytest | `tests` | 2,901 | `python scripts/measure.py` |
+| Tests collected by pytest | `tests` | 2,911 | `python scripts/measure.py` |
 | Share of `nanoclaude` the tests run | `coverage_percent` | 99.9% | `python scripts/measure.py` |
-| Lines of Python in `src/` | `lines.src` | 11,389 | `python scripts/measure.py` |
-| Lines of Python in `tests/` | `lines.tests` | 30,251 | `python scripts/measure.py` |
+| Lines of Python in `src/` | `lines.src` | 11,401 | `python scripts/measure.py` |
+| Lines of Python in `tests/` | `lines.tests` | 30,349 | `python scripts/measure.py` |
 | Tools in the default registry | `tools` | 6 | `python scripts/measure.py` |
 | Adapters the configuration accepts | `adapters` | 3 | `python scripts/measure.py` |
 | Dangerous commands the regex classifier misses | `danger_corpus` | not measured yet | `python scripts/measure.py` |

@@ -18,7 +18,7 @@ The model has to search, and searching is turns: finding where something is defi
 
 The environment block is joined to the same system string as the rest, so when the git state changes (a file edited, a branch switched) the system text changes and a provider's cache of it is missed. The tool list, which comes first in the request, keeps its own breakpoint and still hits. The separation in `context/assemble.py` keeps the block out of the instructions; it does not keep it out of the system string.
 
-The project map costs tokens on every request whether or not it is needed, up to 200 lines, and a repository with a deep layout is shown only to the third level.
+The project map costs tokens on every request whether or not it is needed, up to 200 lines, and a repository with a deep layout is shown only to the third level. It also names credentials files: it hides what `.gitignore` hides and applies no rule of its own, so a `.env` or an `id_rsa` that is not ignored appears in the map by name (run against a directory holding both, and a `.aws/credentials`, it lists all of them). Names only, never content, and the model still cannot read them; but the names go to the provider.
 
 Instructions are read from the disk at every request. A change to `NANO.md` mid-session takes effect at the next prompt, which is a feature, and an enormous file is truncated and not refused, with a marker.
 

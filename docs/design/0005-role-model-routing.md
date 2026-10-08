@@ -16,7 +16,7 @@ Pinned by `test_each_role_can_be_routed_to_its_own_model`, `test_every_role_defa
 
 ## Costs
 
-In v0.1 two roles are consulted. `main` answers the conversation and `compact` writes the summary when a conversation is compacted. `explore`, `plan`, `verify` and `title` are accepted, checked and routed, and then nothing sends them a request: exploring is done by the main model's own calls to Grep and Glob, and the sub-agents, the post-edit verification and the session titles that would use the other four are later work. Pointing `explore` at a cheap model today changes nothing. Pointing `compact` at one already saves money, because the summary request carries the whole older history.
+In v0.1 two roles are consulted. `main` answers the conversation and `compact` writes the summary when a conversation is compacted. `explore`, `plan`, `verify` and `title` are accepted, checked and routed, and then nothing sends them a request: exploring is done by the main model's own calls to Grep and Glob, and routing the other four is v0.3 scope, with sub-agents. Pointing `explore` at a cheap model today changes nothing. Pointing `compact` at one already saves money, because the summary request carries the whole older history.
 
 That request can also fail for a reason the main model would not hit: a summary asked of a model with a small window may not fit the history. The session reports it as the compact role's error and names the role, and the history is kept intact. Pinned by `test_a_summary_that_fails_stops_the_turn_and_leaves_the_history_alone` and `test_an_overflow_on_the_summary_request_is_the_compact_roles_error_not_a_retry`.
 

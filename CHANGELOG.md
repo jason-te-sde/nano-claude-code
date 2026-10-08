@@ -24,7 +24,7 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
 - Roles, with `main` and `compact` consulted so far, and `--model` and `--role`.
 - Compaction (old tool results shrunk at 70% of the room, older history summarised at 85%), and
   SQLite sessions with `--continue` and `--resume`, a message archive and an audit record.
-- Credentials kept out of the transcript: refused by path, and scrubbed by shape.
+- Credentials kept out of the transcript: refused by path, and scrubbed by shape from what `Read`, `Grep`, `Edit` and mentions return.
 - Configuration in two files, with the project's file treated as untrusted: it may add `deny`
   and `ask` rules and choose models, and may not add `allow` rules, name a `base_url` or an
   `api_key_env`, re-point one of your models or raise the turn, timeout and output limits.
@@ -44,8 +44,8 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
 - A retry of a provider request is shown and not stored.
 - A small `compact` model can fail to summarise a long history; the conversation is left as it
   was, and the error names the role.
-- The diff that `Edit` returns is not scrubbed of credentials.
-- The roles `explore`, `plan`, `verify` and `title` are accepted and no request is sent to them.
+- The project map sent with every request names credentials files that `.gitignore` does not hide.
+- The roles `explore`, `plan`, `verify` and `title` are accepted and no request is sent to them; routing them is v0.3 scope, with sub-agents.
 - Models that are not in the capability table, other than local ones that can be probed, use the
-  text protocol until `native_tools` is set.
+  text protocol until `native_tools` is set; the REPL says so when it starts.
 - Every provider cassette in the tests is hand-written; none was recorded from a real server.

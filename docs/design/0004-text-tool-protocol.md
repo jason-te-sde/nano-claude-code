@@ -28,7 +28,7 @@ Every request carries the definitions of every tool in the system prompt, and th
 
 The reply of a model on this path is not shown while it arrives, since a half-written tag cannot be shown as prose and parsed later. The person sees it once it is whole.
 
-There is no start-up banner saying that a model is in text-tool mode; the only sign is that the system prompt names the protocol, and a session that is failing is told which model to replace.
+The REPL says so when it starts, if the main model has no native tool calling: `⚠ text-tool mode (model lacks native tool calling)` (`test_a_main_model_without_native_tool_calling_is_flagged_at_start`, and `test_a_main_model_with_native_tool_calling_gets_no_such_warning` for the other way). `ncc -p` prints no such line, and a model on the `compact` or another role is not checked.
 
 Which models get this path is a consequence of 0003: any model the table does not know and the probe could not vouch for. That includes every OpenAI-compatible model that is not in the table, whether or not its server could call tools, until `native_tools = true` is set for it.
 

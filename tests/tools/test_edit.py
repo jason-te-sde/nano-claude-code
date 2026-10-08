@@ -324,3 +324,20 @@ async def test_the_diff_an_edit_reports_marks_a_last_line_without_a_newline(ctx,
     assert (
         not outcome.is_error and "-x = 1\n\\ No newline at end of file\n+x = 2\n" in outcome.content
     )
+
+
+async def test_the_diff_an_edit_returns_is_scrubbed_like_every_other_tool_output(ctx, tmp_repo):
+    # The diff carries the lines around the edit as context, and those go to the model
+    # and the transcript. A credential beside the edited line must not ride along.
+    key = "AKIA" + "QZ3Y7W2X9V4T6R8P"  # built here: a literal trips push protection
+    target = tmp_repo / "settings.py"
+    target.write_text(f'aws_key = "{key}"\ndebug = False\n')
+    outcome = await EditTool().run(
+        having_read(ctx, target),
+        "t1",
+        {"path": "settings.py", "edits": [{"old_string": "False", "new_string": "True"}]},
+    )
+    assert not outcome.is_error
+    assert key not in outcome.content
+    assert "[redacted:aws-key]" in outcome.content
+    assert target.read_text() == f'aws_key = "{key}"\ndebug = True\n'

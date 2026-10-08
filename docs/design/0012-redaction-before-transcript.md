@@ -12,7 +12,7 @@ The content rules are narrow on purpose. Nine patterns for eight kinds of creden
 
 The tests that matter most are the ones that say what must not be hit: `test_ordinary_content_is_left_alone`, `test_a_low_entropy_assignment_is_left_alone` and `test_paths_that_merely_look_similar_are_not`. A scrubber that is tested only on what it catches cannot be told from one that catches everything.
 
-The same scrubber is applied wherever a tool's text could carry a credential in: `Read` and `Grep` output, a mentioned file (scrubbed before it is cut to its size limit, so a key that straddles the cut cannot survive as an unrecognised half), the text of an internal error, and the arguments of a call as they are written to the audit table. The last matters because the audit row is the one place a secret could survive: it records what the model asked for and not what the tool returned (`test_arguments_are_stored_redacted`).
+The same scrubber is applied wherever a tool's text could carry a credential in: `Read` and `Grep` output, the diff that `Edit` returns (it holds the lines around the edit as they are on disk, `test_the_diff_an_edit_returns_is_scrubbed_like_every_other_tool_output`), a mentioned file (scrubbed before it is cut to its size limit, so a key that straddles the cut cannot survive as an unrecognised half), the text of an internal error, and the arguments of a call as they are written to the audit table. The last matters because the audit row is the one place a secret could survive: it records what the model asked for and not what the tool returned (`test_arguments_are_stored_redacted`).
 
 `--allow-secrets` turns both layers off together, with a warning at start, and an allow rule for one path does not (the path rule comes before every allow rule). One redactor is shared by the tools and the audit, so the switch cannot turn one off and leave the other on (`test_allow_secrets_stops_the_redaction_and_the_refusal_of_credentials_files`).
 
@@ -20,9 +20,7 @@ The same scrubber is applied wherever a tool's text could carry a credential in:
 
 A pattern catches what it knows the shape of. A database URL with the password inline, a token in a provider's own format, a password in prose: none is caught. `expand_mentions` says as much about itself and refuses secret-looking paths for that reason, rather than relying on the content rules.
 
-What the person types is theirs and is not scrubbed, and neither is what the model writes: the prompt and the model's own text and tool arguments go into the transcript as they are. Redaction covers what `Read`, `Grep`, mentions and internal errors return, and the audit's copy of what the model asked for.
-
-The diff that `Edit` returns is not scrubbed. It holds the lines around the edit as they are on disk, so a credential that sits near the line being changed in a source file reaches the transcript in clear, though `Read` showed it redacted. The path rule keeps the usual credential files out of reach of `Edit`, since a file cannot be edited before it has been read; this is the gap in the content layer that remains, and it is not covered by a test.
+What the person types is theirs and is not scrubbed, and neither is what the model writes: the prompt and the model's own text and tool arguments go into the transcript as they are. Redaction covers what `Read`, `Grep`, `Edit`, mentions and internal errors return, and the audit's copy of what the model asked for.
 
 A false positive costs something. A line replaced by a marker is a line the model cannot quote, so an edit that needs it fails to match and that line is changed by hand.
 

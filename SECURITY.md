@@ -23,7 +23,8 @@ complete confidence. Defended by the sandbox, by confirmation before anything ch
 file, by `plan` mode, and by the rules that no mode switches off (see below). A regex
 classifier for destructive commands is written and not yet reachable, since nothing runs a
 command; it has known blind spots, each checked by a test, and there is no corpus to say how
-many dangerous commands it misses. Checkpoints that would make an edit cheap to undo are not
+many dangerous commands it misses. A command it finds nothing in is not treated as cleared: an
+`allow` rule or an "always" answer does not skip the question for it. Checkpoints that would make an edit cheap to undo are not
 built: `git` is how an edit is undone, and an edit is confirmed first.
 
 **2. A project's configuration file.** `.nanoclaude/config.toml` arrives with a repository,
@@ -63,9 +64,10 @@ read, whatever the mode and whatever your `allow` rules say, and what a tool ret
 scanned and what looks like a credential is replaced before it enters the transcript, so the
 stored session and a resumed one are clean too. The gaps: the scan recognises known shapes
 (cloud and vendor keys, tokens, private-key headers, three-part web tokens) and a name that
-says secret beside a random-looking value, and a credential in another form passes; the diff
-that `Edit` returns is not scanned; and what you type and what the model writes are not
-scanned. `--allow-secrets` turns the path rule and the scan off together and prints a warning.
+says secret beside a random-looking value, and a credential in another form passes; the
+project map sent with every request lists credentials files by name, since it hides only what
+`.gitignore` hides (the content is never read); and what you type and what the model writes are
+not scanned. `--allow-secrets` turns the path rule and the scan off together and prints a warning.
 
 **5. Terminal injection.** Text that comes from outside (a file, a command's output, a
 provider's error, a path) can contain escape sequences that retitle a window, clear the
