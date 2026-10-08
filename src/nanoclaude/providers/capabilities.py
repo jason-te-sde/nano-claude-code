@@ -57,6 +57,16 @@ _KNOWN: dict[tuple[str, str], Capabilities] = {
     # The alias and the dated id it points to.
     ("anthropic", "claude-haiku-4-5"): _HAIKU_4_5,
     ("anthropic", "claude-haiku-4-5-20251001"): _HAIKU_4_5,
+    # The model ncc init offers for OpenRouter. Checked 2026-10-07 against OpenRouter's public
+    # model list (https://openrouter.ai/api/v1/models): tools and tool_choice are supported
+    # and the entry prices cached reads, so the capabilities are the "deepseek" family's;
+    # what differs is the window, 1_024_000 against the family's 64_000. Without this row the
+    # model would be compacted as if its window were 64K. The listing's own output ceiling is
+    # 384_000, but OpenRouter can route a request to another host that caps lower, so the
+    # budget is the lower figure 64_000, which a routed host is more likely to meet.
+    ("openai_compat", "deepseek/deepseek-v4-pro"): Capabilities(
+        True, True, "automatic", 1_024_000, 64_000
+    ),
 }
 
 #: Prefix rules for families whose members all behave alike. Checked in order.

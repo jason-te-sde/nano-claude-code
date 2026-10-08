@@ -1469,3 +1469,16 @@ CHECKED_DEFAULTS = {
 @pytest.mark.parametrize(("name", "model"), sorted(CHECKED_DEFAULTS.items()))
 def test_a_presets_default_model_is_one_its_provider_lists(name, model):
     assert PRESETS[name].default_model == model
+
+
+@pytest.mark.parametrize("name", [n for n, p in PRESETS.items() if p.needs_key])
+def test_the_default_model_of_a_hosted_preset_is_one_the_program_knows(name):
+    # A model the program knows nothing about gets the conservative default: an 8K window and
+    # no tools, which is not what anybody who pressed Enter at the model question meant.
+    preset = PRESETS[name]
+    assert capabilities_for(preset.adapter, preset.default_model) != CONSERVATIVE_DEFAULT
+
+
+def test_the_default_openrouter_model_is_given_the_window_it_has():
+    preset = PRESETS["openrouter"]
+    assert capabilities_for(preset.adapter, preset.default_model).context_window == 1_024_000
