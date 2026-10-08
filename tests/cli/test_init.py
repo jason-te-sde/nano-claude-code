@@ -1251,16 +1251,15 @@ def test_the_check_waits_a_minute_for_a_provider_and_no_longer():
     assert init_module.VERIFY_TIMEOUT_S == 60.0
 
 
-def test_the_timeout_is_said_in_seconds_as_it_is_set(tmp_path, key, wire, monkeypatch):
-    monkeypatch.setattr(init_module, "VERIFY_TIMEOUT_S", 0.25)
+def test_the_timeout_is_said_in_whole_seconds_when_it_is_whole(tmp_path, key, wire, monkeypatch):
+    # Without waiting the minute: the wait is cut short, and what is said is what is set.
+    async def gives_up(awaited: Any, _seconds: float) -> None:
+        awaited.close()
+        raise TimeoutError
 
-    async def never(_request: httpx.Request) -> httpx.Response:
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
-
-    wire.answer = never
+    monkeypatch.setattr(asyncio, "wait_for", gives_up)
     problem = asyncio.run(verify(config_for(tmp_path, "anthropic", key), "anthropic"))
-    assert problem == "no answer within 0.25 seconds \u2014 check your network connection"
+    assert problem == "no answer within 60 seconds \u2014 check your network connection"
 
 
 @pytest.mark.parametrize("fails", [False, True])
