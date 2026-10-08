@@ -16,10 +16,17 @@ from pathlib import Path
 
 import pytest
 
+from nanoclaude.agent.loop import Done, LoopState, StopReason
 from nanoclaude.cli import main as ncc_main
 from nanoclaude.cli.main import EXIT_CODES
-from nanoclaude.conversation.transcript import TextBlock
-from nanoclaude.providers.base import ModelReply, StopKind, Usage
+from nanoclaude.conversation.transcript import (
+    Message,
+    TextBlock,
+    Transcript,
+    assistant_text,
+    user_text,
+)
+from nanoclaude.providers.base import ModelError, ModelReply, StopKind, Usage
 from nanoclaude.testing.scripted import calls, cut_off, says
 from tests.cli.helpers import run_ncc
 
@@ -53,6 +60,20 @@ def test_nothing_of_the_reply_is_trimmed_and_a_newline_is_added_only_where_there
     serve(m=[says(reply)])
     _, out, _ = run_ncc(capsys, "--root", str(project), "-p", "go")
     assert out == written
+
+
+def _done(*messages: Message, text: str) -> Done:
+    state = LoopState(Transcript(messages), turn=0, max_turns=40)
+    return Done(state, text, StopReason.COMPLETED)
+
+
+def test_the_text_as_written_is_the_last_assistant_message_and_otherwise_what_the_loop_said():
+    said = _done(user_text("hi"), assistant_text("  x\n"), text="x")
+    assert ncc_main._as_written(said) == "  x\n"
+    # Nothing a loop that finished leaves looks like these two, and the loop's words are
+    # better than none if something does.
+    assert ncc_main._as_written(_done(user_text("hi"), text="fallback")) == "fallback"
+    assert ncc_main._as_written(_done(text="fallback")) == "fallback"
 
 
 def test_the_json_result_is_the_same_text(ncc_home, project, serve, capsys):
@@ -147,9 +168,20 @@ def test_a_cause_that_has_a_dash_in_it_does_not_cut_the_line_in_the_wrong_place(
     )
 
 
-def test_an_ordinary_provider_error_keeps_its_own_words(ncc_home, project, serve, capsys):
-    from nanoclaude.providers.base import ModelError
+def test_an_error_that_was_raised_from_another_is_not_taken_for_a_reply_that_broke_off(
+    ncc_home, project, serve, capsys
+):
+    # The session raises "the conversation does not fit" from the provider's own overflow
+    # error, which is a ModelError that holds no reply. It is not advised to continue.
+    overflow = ModelError("too long", retryable=False, context_overflow=True)
+    serve(m=[overflow])
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "q")
+    assert (code, out) == (EXIT_CODES["provider"], "")
+    assert err.startswith("error: the conversation does not fit the context window of ")
+    assert "ncc --continue" not in err
 
+
+def test_an_ordinary_provider_error_keeps_its_own_words(ncc_home, project, serve, capsys):
     serve(m=[ModelError("the provider is down", retryable=False)])
     _, _, err = run_ncc(capsys, "--root", str(project), "-p", "q")
     assert "continue" not in err and err.startswith("error: the provider is down — ")

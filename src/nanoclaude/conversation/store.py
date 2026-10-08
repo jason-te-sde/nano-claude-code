@@ -399,10 +399,7 @@ class Store:
             "WHERE EXISTS (SELECT 1 FROM messages WHERE messages.session_id = sessions.id) "
             "ORDER BY started_at DESC, rowid DESC"
         )
-        known: dict[str, bool] = {}
         for row in talked:
-            if row["cwd"] not in known:
-                known[row["cwd"]] = same_directory(row["cwd"], cwd)
-            if known[row["cwd"]]:
+            if same_directory(row["cwd"], cwd):
                 return str(row["id"])
         return None

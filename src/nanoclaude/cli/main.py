@@ -262,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
                 _run_interactive(args, settings, home, _stdout_console(args.no_color))
             )
         outcome = asyncio.run(_run_headless(args, settings, home))
-        _report(outcome, args.output_format or "text", err)
+        _report(outcome, as_json=args.output_format == "json", err=err)
         return outcome.code
     except (UsageError, UnknownSessionError) as exc:
         show_error(err, str(exc))
@@ -455,8 +455,8 @@ def _with_advice(message: str, advice: str) -> str:
     return detail if " — " in detail else f"{detail} — {advice}"
 
 
-def _report(outcome: _Outcome, output_format: str, err: Console) -> None:
-    if output_format == "json":
+def _report(outcome: _Outcome, *, as_json: bool, err: Console) -> None:
+    if as_json:
         print(json.dumps(outcome.payload, indent=2))
     else:
         _write_result(outcome.text)
@@ -476,10 +476,9 @@ def _write_result(text: str) -> None:
     shown = sanitize(text) if sys.stdout.isatty() else text
     if not shown:
         return
-    data = (shown if shown.endswith("\n") else shown + "\n").encode("utf-8", errors="replace")
-    sys.stdout.flush()  # what was printed before is first
-    sys.stdout.buffer.write(data)
-    sys.stdout.buffer.flush()
+    sys.stdout.buffer.write(
+        (shown if shown.endswith("\n") else shown + "\n").encode("utf-8", errors="replace")
+    )
 
 
 def _abandon_stdout() -> None:

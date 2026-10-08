@@ -325,6 +325,9 @@ def test_same_directory_is_the_comparison_resume_uses_too(tmp_path):
     assert same_directory(str(link), str(real))
     assert not same_directory(str(real), str(tmp_path))
     assert same_directory("/does/not/exist", "/does/not/exist")
+    # Gone, and reached through a link that is not: the place the link leads to.
+    assert same_directory(str(link / "gone"), str(real / "gone"))
+    assert not same_directory(str(link / "gone"), str(tmp_path / "gone"))
     # Gone, and spelled differently: where each was, once the dots are resolved.
     assert same_directory("/does/not/../not/exist", "/does/not/exist")
     assert not same_directory("/does/not/exist", "/does/not/exist-too")
