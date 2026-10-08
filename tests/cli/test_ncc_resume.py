@@ -377,3 +377,15 @@ def test_the_advice_to_run_ncc_from_another_directory_quotes_it_for_a_shell(
         f"error: session {in_there} was started in {there}, not in {here} "
         f"\u2014 run ncc from '{there}' (or pass --root '{there}'), or leave out --resume\n"
     )
+
+
+def test_a_session_is_resumed_from_a_directory_spelled_in_another_case_where_the_disk_agrees(
+    ncc_home, tmp_path, serve, capsys
+):
+    (tmp_path / "Project").mkdir()
+    if not (tmp_path / "project").exists():
+        pytest.skip("this file system tells Project from project")
+    serve(m=[says("a"), says("b")])
+    first = start(capsys, tmp_path / "Project")
+    code, out, _ = run_ncc(capsys, "--root", str(tmp_path / "project"), "-r", first, "-p", "again")
+    assert (code, out) == (EXIT_CODES["completed"], "b\n")
