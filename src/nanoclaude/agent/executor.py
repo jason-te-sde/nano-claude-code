@@ -51,6 +51,7 @@ they are approving, has to render these two safely itself.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
@@ -152,6 +153,10 @@ class Executor:
     session_id: str = "session"
     grants: Grants = field(default_factory=Grants)
     redactor: Redactor = field(default_factory=Redactor)
+    #: The calls of the batch under way whose decision is in the audit log and whose outcome
+    #: is not yet, with that decision: the ones that, if the batch is stopped, are still owed
+    #: one. Insertion order, so that they are closed in the order they were decided.
+    _unfinished: dict[str, PermissionResult] = field(default_factory=dict, init=False, repr=False)
 
     def context(self, state: LoopState) -> ToolContext:
         return ToolContext(
@@ -170,7 +175,58 @@ class Executor:
         ``turn`` is the number the audit records the batch under. It defaults to the
         state's own count, which starts again with every prompt: a session that
         wants its audit numbered across prompts says which turn this is.
+
+        A batch that is stopped (the person pressed Ctrl+C at a confirmation, or while a
+        tool ran) or that fails leaves nothing decided without an outcome: each call that
+        was audited and had not finished is recorded as ``cancelled``, or as ``error``
+        when it was not a cancellation, and the exception goes on. The row of a call from
+        an earlier batch, or an earlier process, is not this batch's to close.
         """
+        self._unfinished = {}
+        try:
+            return await self._run_batch(calls, state, turn)
+        except BaseException as exc:
+            self._close_unfinished(exc)
+            raise
+        finally:
+            self._unfinished = {}
+
+    def _close_unfinished(self, stopped_by: BaseException) -> None:
+        """Record an outcome for every call of the batch that was decided and not finished.
+
+        A call that was refused, or whose tool broke while being asked, was final when it
+        was decided: the loop that records those had not reached it, and is recording what
+        it would have. Every other call is owed the reason it did not finish. Nothing was
+        delivered to the model for any of them, so ``bytes_out`` is 0.
+        """
+        cancelled = isinstance(stopped_by, asyncio.CancelledError | KeyboardInterrupt)
+        stopped_error = None
+        if not cancelled:
+            stopped_error, _ = self.redactor.scrub(
+                sanitize(f"{type(stopped_by).__name__}: {stopped_by}")
+            )
+        for call_id, result in tuple(self._unfinished.items()):
+            if result.decision is Decision.DENY and result.rule == INTERNAL_ERROR_RULE:
+                outcome, error = "error", result.reason
+            elif result.decision is Decision.DENY:
+                outcome, error = "refused", None
+            elif cancelled:
+                outcome, error = "cancelled", None
+            else:
+                outcome, error = "error", stopped_error
+            # Best effort: this runs while something else is being raised, and a store that
+            # cannot take the row must not replace that with its own error. The row stays
+            # NULL, which is what a call nobody could record is.
+            try:
+                self._audit_outcome(
+                    call_id, outcome=outcome, duration_ms=0, bytes_out=0, error=error
+                )
+            except sqlite3.Error:
+                continue
+
+    async def _run_batch(
+        self, calls: Sequence[ToolUseBlock], state: LoopState, turn: int | None
+    ) -> tuple[ToolOutcome, ...]:
         ctx = self.context(state)
         audit_turn = state.turn if turn is None else turn
         # Every call's _Plan is built from this one snapshot of self.grants,
@@ -357,6 +413,9 @@ class Executor:
             decision=result.decision,
             rule=result.rule,
         )
+        # After the insert, so that a call whose decision was not stored is not owed an
+        # outcome for a row that is not there.
+        self._unfinished[call.id] = result
 
     def _audit_outcome(
         self, call_id: str, *, outcome: str, duration_ms: int, bytes_out: int, error: str | None
@@ -380,6 +439,7 @@ class Executor:
             bytes_out=bytes_out,
             error=error,
         )
+        self._unfinished.pop(call_id, None)
 
     async def _run(self, ctx: ToolContext, plan: _Plan) -> ToolOutcome:
         assert plan.tool is not None  # noqa: S101 - refused plans never reach here

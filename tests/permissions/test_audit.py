@@ -6,7 +6,11 @@ protection rejects a push containing a string shaped like a live credential,
 even a fake one (the same convention tests/permissions/test_redact.py uses).
 """
 
+import sqlite3
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from nanoclaude.conversation.store import Store
 from nanoclaude.permissions.audit import AuditLog
@@ -110,3 +114,51 @@ def test_a_custom_redactor_is_used_instead_of_the_default(tmp_path):
     )
     row = log.store.db.execute("SELECT args_json FROM tool_calls").fetchone()
     assert GITHUB_TOKEN in row["args_json"]
+
+
+def _decision(log: AuditLog, call_id: str, *, session: str = "s1", **fields: object) -> None:
+    given: dict[str, Any] = {
+        "turn": 0,
+        "tool_use_id": call_id,
+        "tool": "Bash",
+        "arguments": {"command": "ls"},
+        "decision": Decision.ALLOW,
+        "rule": "rule.allow",
+    } | fields
+    log.record_decision(session, **given)
+
+
+def test_a_repeated_tool_use_id_is_an_error_and_the_first_decision_stands(tmp_path):
+    """The audit trail only grows. Minted ids are unique, so a second decision under one is a
+    bug somewhere else, and replacing the first row would hide it and the decision with it."""
+    log = audit(tmp_path)
+    _decision(log, "t1", decision=Decision.DENY, rule="rule.deny", arguments={"command": "rm"})
+    with pytest.raises(sqlite3.IntegrityError):
+        _decision(log, "t1", decision=Decision.ALLOW, rule="rule.allow")
+    row = log.store.db.execute("SELECT decision, rule, args_json FROM tool_calls").fetchone()
+    assert (row["decision"], row["rule"], row["args_json"]) == (
+        "deny",
+        "rule.deny",
+        '{"command": "rm"}',
+    )
+
+
+def test_the_same_id_in_another_session_is_another_call(tmp_path):
+    log = audit(tmp_path)
+    log.store.create_session("s2", cwd="/p", roles={})
+    _decision(log, "t1", session="s1")
+    _decision(log, "t1", session="s2")
+    count = log.store.db.execute("SELECT COUNT(*) AS n FROM tool_calls").fetchone()["n"]
+    assert count == 2
+
+
+def test_an_outcome_still_fills_in_the_row_it_belongs_to(tmp_path):
+    """Insert-only does not mean the outcome is a second row."""
+    log = audit(tmp_path)
+    _decision(log, "t1")
+    _decision(log, "t2")
+    log.record_outcome("s1", "t2", outcome="cancelled", duration_ms=0, bytes_out=0, error=None)
+    rows = {
+        r["tool_use_id"]: r["outcome"] for r in log.store.db.execute("SELECT * FROM tool_calls")
+    }
+    assert rows == {"t1": None, "t2": "cancelled"}

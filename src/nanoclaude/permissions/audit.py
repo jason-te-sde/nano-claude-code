@@ -3,7 +3,14 @@
 The decision is written *before* the tool runs and the outcome fills in the same
 row afterwards. A crash between the two leaves a row saying "this was allowed
 and we do not know what happened", which is the honest state; writing the row
-after execution would lose it entirely.
+after execution would lose it entirely. A process that is still alive does not
+leave one: whatever stops a call (a refusal, a decline, an error, the person
+cancelling) records its own outcome, so a missing one means a crash and nothing else.
+
+The trail only grows. A decision is inserted, never replaced: ids are minted to be
+unique, so a second decision under the same (session, tool_use_id) is a bug somewhere
+else, and replacing the first row would hide the bug and the decision with it. The
+``IntegrityError`` is the report.
 
 Arguments pass through the redactor on the way in. The audit table is the one
 place a secret could survive the transcript scrubbing, because it stores what
@@ -40,7 +47,7 @@ class AuditLog:
     ) -> None:
         payload, _ = self._redactor.scrub(json.dumps(dict(arguments), sort_keys=True))
         self.store.db.execute(
-            "INSERT OR REPLACE INTO tool_calls "
+            "INSERT INTO tool_calls "
             "(session_id, turn, tool_use_id, ts, tool, args_json, decision, rule) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (session_id, turn, tool_use_id, time.time(), tool, payload, str(decision), rule),

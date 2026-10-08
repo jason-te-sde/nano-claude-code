@@ -704,6 +704,30 @@ async def test_a_bug_in_one_tool_does_not_end_the_session(tmp_repo, monkeypatch)
     assert (row["outcome"], row["session_id"]) == ("error", session.session_id)
 
 
+async def test_a_cancelled_confirmation_leaves_the_audit_row_with_the_outcome_cancelled(tmp_repo):
+    """What Ctrl+C at a confirmation does, end to end: the REPL catches the cancellation and
+    carries on, so the row of the call it cancelled must say so, and the next prompt, which
+    mends the transcript, finds nothing in the audit left open."""
+
+    class Cancelling(AutoApprove):
+        async def confirm(self, *_args: object) -> Approval:
+            raise asyncio.CancelledError
+
+    session = build_session(
+        tmp_repo,
+        [calls("Write", {"path": "a.txt", "content": "A"}, call_id="t1")],
+        ui=Cancelling(),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await session.run("write it")
+    assert session.store is not None
+    row = session.store.db.execute(
+        "SELECT outcome, decision FROM tool_calls WHERE tool_use_id = 't1'"
+    ).fetchone()
+    assert (row["outcome"], row["decision"]) == ("cancelled", "ask")
+    assert not (tmp_repo / "a.txt").exists()
+
+
 # --------------------------------------------------------------------------
 # Carried note: the retry policy and ui.on_retry
 # --------------------------------------------------------------------------

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import sqlite3
 from collections.abc import Hashable, Mapping
 from dataclasses import replace
 from pathlib import Path
@@ -950,9 +951,192 @@ async def test_cancelling_a_running_tool_still_cancels_the_batch(policy, tmp_rep
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    # Decided, never finished: the row's outcome stays NULL, which is the only
-    # thing a NULL there is allowed to mean.
-    assert _audit_row(store, "t1")["outcome"] is None
+    # Decided, then stopped by the person with the process still alive: that is known,
+    # and said. A NULL outcome is left to mean the one thing nobody could record.
+    row = _audit_row(store, "t1")
+    assert (row["outcome"], row["decision"], row["error"]) == ("cancelled", "ask", None)
+
+
+class _Answers(SilentUI):
+    """Answers each confirmation from a script: an Approval, or an exception to raise."""
+
+    def __init__(self, answers: Mapping[str, Approval | BaseException]) -> None:
+        self.answers = dict(answers)
+
+    async def confirm(
+        self, call: ToolUseBlock, _request: PermissionRequest, _result: PermissionResult
+    ) -> Approval:
+        answer = self.answers[call.id]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+
+def _outcomes(store: Store) -> dict[str, str | None]:
+    rows = store.db.execute("SELECT tool_use_id, outcome FROM tool_calls")
+    return {row["tool_use_id"]: row["outcome"] for row in rows}
+
+
+def _write_call(call_id: str) -> ToolUseBlock:
+    return ToolUseBlock(call_id, "Write", {"path": f"{call_id}.txt", "content": call_id})
+
+
+async def test_a_call_cancelled_at_its_confirmation_ends_with_the_outcome_cancelled(
+    policy, tmp_repo
+):
+    """Ctrl+C at a confirmation: the REPL carries on, so a NULL outcome would say the
+    process died. Every call of the batch that was decided and did not get to run is
+    closed the same way; the ones that already had an outcome keep it."""
+    store = _store(tmp_repo)
+    (tmp_repo / "a.py").write_text("x")
+    ui = _Answers({"t2": Approval.NO, "t3": asyncio.CancelledError(), "t4": Approval.ONCE})
+    ex = executor(policy, ui, store)
+    calls = (
+        ToolUseBlock("t0", "Read", {"path": "/etc/passwd"}),  # refused
+        ToolUseBlock("t1", "Read", {"path": "a.py"}),  # allowed; has not run when the cancel comes
+        _write_call("t2"),  # declined
+        _write_call("t3"),  # the confirmation is cancelled
+        _write_call("t4"),  # decided, never asked
+        ToolUseBlock("t5", "Read", {"path": "/etc/hosts"}),  # refused, after the cancel
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await ex.run_batch(calls, start("hi"))
+    assert _outcomes(store) == {
+        "t0": "refused",
+        "t1": "cancelled",
+        "t2": "declined",
+        "t3": "cancelled",
+        "t4": "cancelled",
+        "t5": "refused",  # final when it was decided; the cancel does not make it a cancel
+    }
+    row = _audit_row(store, "t3")
+    assert (row["decision"], row["rule"], row["error"], row["duration_ms"]) == (
+        "ask",
+        "rule.ask",
+        None,
+        0,
+    )
+    assert not (tmp_repo / "t3.txt").exists() and not (tmp_repo / "t4.txt").exists()
+
+
+async def test_a_call_whose_tool_broke_before_the_cancel_is_still_an_error_not_a_cancel(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    real = ReadTool.permission_request
+
+    def breaks_for_boom(
+        self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]
+    ) -> PermissionRequest:
+        if arguments["path"] == "boom.py":
+            raise RuntimeError("the tool broke")
+        return real(self, ctx, arguments)
+
+    monkeypatch.setattr(ReadTool, "permission_request", breaks_for_boom)
+    store = _store(tmp_repo)
+    ex = executor(policy, _Answers({"t1": asyncio.CancelledError()}), store)
+    calls = (_write_call("t1"), ToolUseBlock("t2", "Read", {"path": "boom.py"}))
+    with pytest.raises(asyncio.CancelledError):
+        await ex.run_batch(calls, start("hi"))
+    assert _outcomes(store) == {"t1": "cancelled", "t2": "error"}
+    assert "RuntimeError: the tool broke" in _audit_row(store, "t2")["error"]
+
+
+async def test_a_store_that_cannot_take_the_outcome_does_not_replace_the_cancellation(
+    policy, tmp_repo, monkeypatch
+):
+    """The close-out runs while the cancellation is being raised: a locked database must not
+    turn Ctrl+C into a sqlite error. The row is then NULL, which is what an unrecorded call is."""
+
+    def locked(*_args: object, **_kwargs: object) -> Never:
+        raise sqlite3.OperationalError("database is locked")
+
+    store = _store(tmp_repo)
+    ex = executor(policy, _Answers({"t1": asyncio.CancelledError()}), store)
+    monkeypatch.setattr(AuditLog, "record_outcome", locked)
+    with pytest.raises(asyncio.CancelledError):
+        await ex.run_batch((_write_call("t1"), _write_call("t2")), start("hi"))
+    assert _outcomes(store) == {"t1": None, "t2": None}
+
+
+async def test_a_row_the_close_out_could_not_record_is_not_closed_by_the_next_batch(
+    policy, tmp_repo, monkeypatch
+):
+    real = AuditLog.record_outcome
+    locked = True
+
+    def sometimes_locked(self: AuditLog, *args: Any, **kwargs: Any) -> None:
+        if locked:
+            raise sqlite3.OperationalError("database is locked")
+        real(self, *args, **kwargs)
+
+    store = _store(tmp_repo)
+    ex = executor(
+        policy, _Answers({"t1": asyncio.CancelledError(), "t2": asyncio.CancelledError()}), store
+    )
+    monkeypatch.setattr(AuditLog, "record_outcome", sometimes_locked)
+    with pytest.raises(asyncio.CancelledError):
+        await ex.run_batch((_write_call("t1"),), start("hi"))
+    locked = False
+    with pytest.raises(asyncio.CancelledError):
+        await ex.run_batch((_write_call("t2"),), start("hi"))
+    assert _outcomes(store) == {"t1": None, "t2": "cancelled"}
+
+
+async def test_a_row_left_by_an_earlier_crash_is_not_closed_by_a_later_cancellation(
+    policy, tmp_repo
+):
+    """NULL still means the process died, and this batch did not witness that one."""
+    store = _store(tmp_repo)
+    AuditLog(store).record_decision(
+        "s1",
+        turn=0,
+        tool_use_id="old",
+        tool="Write",
+        arguments={},
+        decision=Decision.ASK,
+        rule="rule.ask",
+    )
+    ex = executor(policy, _Answers({"t1": asyncio.CancelledError()}), store)
+    with pytest.raises(asyncio.CancelledError):
+        await ex.run_batch((_write_call("t1"),), start("hi"))
+    assert _outcomes(store) == {"old": None, "t1": "cancelled"}
+
+
+async def test_the_next_batch_does_not_inherit_what_a_cancelled_one_left_open(policy, tmp_repo):
+    store = _store(tmp_repo)
+    ui = _Answers({"t1": asyncio.CancelledError(), "t2": Approval.ONCE})
+    ex = executor(policy, ui, store)
+    with pytest.raises(asyncio.CancelledError):
+        await ex.run_batch((_write_call("t1"),), start("hi"))
+    await ex.run_batch((_write_call("t2"),), start("hi"))
+    assert _outcomes(store) == {"t1": "cancelled", "t2": "ok"}
+
+
+async def test_a_confirmation_that_fails_otherwise_ends_the_decided_calls_as_errors(
+    policy, tmp_repo
+):
+    store = _store(tmp_repo)
+    ex = executor(policy, _Answers({"t1": RuntimeError("the front end broke")}), store)
+    with pytest.raises(RuntimeError, match="the front end broke"):
+        await ex.run_batch((_write_call("t1"), _write_call("t2")), start("hi"))
+    assert _outcomes(store) == {"t1": "error", "t2": "error"}
+    assert "RuntimeError: the front end broke" in _audit_row(store, "t1")["error"]
+
+
+def test_a_keyboard_interrupt_at_a_confirmation_also_ends_the_call_as_cancelled(policy, tmp_repo):
+    """As in the test of a tool raising it: inside pytest's own loop it would end the run."""
+    store = _store(tmp_repo)
+    ex = executor(policy, _Answers({"t1": KeyboardInterrupt()}), store)
+    batch = ex.run_batch((_write_call("t1"),), start("hi"))
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            loop.run_until_complete(batch)
+    finally:
+        loop.close()
+    assert _outcomes(store) == {"t1": "cancelled"}
 
 
 async def test_an_exception_that_is_not_an_exception_still_propagates(
