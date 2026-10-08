@@ -351,7 +351,8 @@ def run_init(
 
     # What the check uses is what ncc will use: the file just written, loaded as ncc loads it,
     # with the key it was given. It is added to this copy of the environment and nowhere else.
-    config = load_config(home=str(home), project=None, env={**environment, preset.key_env: key})
+    held = {preset.key_env: key} if key else {}
+    config = load_config(home=str(home), project=None, env={**environment, **held})
     _say(console, "[dim]checking with one small request...[/dim]")
     problem = asyncio.run(verify(config, alias))
     if problem:
