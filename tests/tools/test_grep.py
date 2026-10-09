@@ -243,7 +243,7 @@ async def test_context_lines_never_come_from_a_secret_file(
 ):
     _maybe_force_python_fallback(monkeypatch, force_python_fallback)
     (tmp_repo / ".env").write_text(
-        "before\nDATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod\nafter\n"
+        "before\nDATABASE_URL=postgres://db.internal:5432/prod?password=hunter2\nafter\n"
     )
     outcome = await GrepTool().run(ctx, "t1", {"pattern": "DATABASE_URL", "-C": 1})
     assert not outcome.is_error
@@ -275,13 +275,16 @@ async def test_secret_files_are_dropped_from_matches_by_default(
 ):
     """Spec Sec.4's threat model: a broad search must not surface an un-ignored
     .env's contents just because the model never named the file directly. The
-    line below is deliberately not shaped like anything _SHAPES or _ASSIGNED
-    (permissions/redact.py) would catch on its own -- this is pinning the
+    line below is deliberately not shaped like anything _SHAPES, _ASSIGNED or
+    the URL rule (permissions/redact.py) would catch on its own -- a password
+    in a query string, not in the URL's userinfo -- this is pinning the
     file-level filter, not the content-level one, which is covered separately
     by test_secrets_in_matched_lines_are_redacted above.
     """
     _maybe_force_python_fallback(monkeypatch, force_python_fallback)
-    (tmp_repo / ".env").write_text("DATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod\n")
+    (tmp_repo / ".env").write_text(
+        "DATABASE_URL=postgres://db.internal:5432/prod?password=hunter2\n"
+    )
     outcome = await GrepTool().run(ctx, "t1", {"pattern": "DATABASE_URL"})
     assert not outcome.is_error
     assert ".env" not in outcome.content
@@ -293,7 +296,9 @@ async def test_allow_secrets_lets_secret_file_matches_through(
     ctx, tmp_repo, monkeypatch, force_python_fallback
 ):
     _maybe_force_python_fallback(monkeypatch, force_python_fallback)
-    (tmp_repo / ".env").write_text("DATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod\n")
+    (tmp_repo / ".env").write_text(
+        "DATABASE_URL=postgres://db.internal:5432/prod?password=hunter2\n"
+    )
     allowed_ctx = replace(ctx, policy=replace(ctx.policy, allow_secrets=True))
     outcome = await GrepTool().run(allowed_ctx, "t1", {"pattern": "DATABASE_URL"})
     assert not outcome.is_error
@@ -335,7 +340,7 @@ async def test_a_link_inside_the_sandbox_to_a_credentials_file_surfaces_nothing(
     layout, monkeypatch, force_python_fallback
 ):
     _maybe_force_python_fallback(monkeypatch, force_python_fallback)
-    (layout.project / ".env").write_text("needle=postgres://admin:hunter2@db.internal/prod\n")
+    (layout.project / ".env").write_text("needle=postgres://db.internal/prod?password=hunter2\n")
     (layout.project / "notes.txt").symlink_to(layout.project / ".env")
     outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle", "-C": 1})
     assert "hunter2" not in outcome.content

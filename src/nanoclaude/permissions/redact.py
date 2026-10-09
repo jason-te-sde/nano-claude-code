@@ -26,6 +26,12 @@ What this does *not* cover, so that nobody relies on it for more:
   it, or in any other case and has the keyword as a word of its own (``api_key``,
   ``clientSecret``, ``Password``). ``dbpassword`` in lower case, with no break to find the
   word by, is not read as one.
+* ``_KEY`` ends a secret's name only in capitals (``STRIPE_KEY``): ``stripe_key`` is left
+  alone, because ``cache_key`` and ``primary_key`` are everywhere and are not secrets.
+* A bearer token written as one case of letters and separators with no digit
+  (``YOUR_API_TOKEN_HERE``) is read as a placeholder, and so is the password of a URL that is a
+  reference (``${DB_PASSWORD}``, ``<password>``); a real token or password of that shape is
+  left as it is.
 * A name that says secret, followed by a bare word, is redacted when the word is random
   enough, because an identifier cannot be told from a password typed without quotes
   (``password = a_long_function_name`` looks like ``password = Xy7Kp2mQ9vL4nR8t``). That is
@@ -79,6 +85,16 @@ SECRET_PATH_PATTERNS: tuple[str, ...] = (
     "**/*.keystore",
     "**/*.tfstate",
     "**/*.tfstate.backup",
+    # Files named for what they hold, wherever a tool or a person left them.
+    "**/*.env",
+    "**/.env-*",
+    "**/.env_*",
+    "**/*.tfvars",
+    "**/.pgpass",
+    "**/.htpasswd",
+    "**/.vault-token",
+    "**/.my.cnf",
+    "**/.gnupg/**",
 )
 
 _PEM_BEGIN = r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----"
@@ -103,12 +119,26 @@ _PRIVATE_KEY = re.compile(
     re.DOTALL,
 )
 
+#: The lengths below are the ones the vendors document where there is one to find (an AWS
+#: key id is twenty characters, a SendGrid key is ``SG.`` and two parts of 22 and 43, an npm
+#: token ``npm_`` and 36, a Hugging Face token ``hf_`` and 34, a GitLab token ``glpat-`` and
+#: 20); where there is none (a PyPI token is a long macaroon, a Stripe live key is at least 24
+#: after its prefix, a project key of OpenAI's has been about 150) the figure is a conservative
+#: floor, low enough to catch a real one and high enough that the prefix alone, in the name of a
+#: package or a function, is left alone.
 _SHAPES: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("aws-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("aws-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("npm-token", re.compile(r"\bnpm_[A-Za-z0-9]{36,}\b")),
+    ("gitlab-token", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])")),
+    ("stripe-key", re.compile(r"\bsk_live_[A-Za-z0-9]{24,}\b")),
+    ("sendgrid-key", re.compile(r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])")),
+    ("huggingface-token", re.compile(r"\bhf_[A-Za-z0-9]{34,}\b")),
+    ("pypi-token", re.compile(r"\bpypi-[A-Za-z0-9_-]{50,}(?![A-Za-z0-9_-])")),
     ("github-token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b")),
     ("github-token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{22,}\b")),
     ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9\-_]{20,}\b")),
-    ("openai-key", re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9]{32,}\b")),
+    ("openai-key", re.compile(r"\bsk-proj-[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-])")),
+    ("openai-key", re.compile(r"\bsk-[A-Za-z0-9]{32,}\b")),
     ("slack-token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
     ("google-key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")),
     ("private-key", _PRIVATE_KEY),
@@ -124,12 +154,31 @@ _NAME_REACH = 64
 #: (JSON, a Python dict) and in any case; whether it *says* secret is decided by
 #: :func:`_names_a_secret`, which needs the name as the pattern found it.
 _ASSIGNED = re.compile(
-    rf"\b(?P<name>[A-Z0-9_]{{0,{_NAME_REACH}}}"
-    r"(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY)"
-    rf"[A-Z0-9_]{{0,{_NAME_REACH}}})"
+    rf"\b(?P<name>[A-Z0-9_-]{{0,{_NAME_REACH}}}"
+    r"(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|[_-]KEY)"
+    rf"[A-Z0-9_-]{{0,{_NAME_REACH}}})"
     r"(?P<sep>[\"']?\s*[=:]\s*[\"']?)"
     r"(?P<value>[A-Za-z0-9+/=_\-]{16,})",
     re.IGNORECASE,
+)
+
+#: ``Authorization: Bearer <token>``, in a header, a curl argument, a JSON object or a dict. The
+#: header's name and the scheme are what a reader needs to see, so only the token goes.
+_BEARER = re.compile(
+    r"(?P<prefix>\bAuthorization[\"']?\]?\s*[=:]\s*[\"']?Bearer\s+)(?P<token>[A-Za-z0-9._~+/=-]{16,})",
+    re.IGNORECASE,
+)
+#: What documentation writes where a token goes (``YOUR_API_TOKEN_HERE``, ``my-token-goes-here``):
+#: one case of letters and the separators between words, and no digit. A token somebody was
+#: issued has digits, or both cases, in sixteen characters or more.
+_PLACEHOLDER = re.compile(r"[A-Z_-]+|[a-z_-]+")
+
+#: ``scheme://user:password@host``: the password. A password in a URL has to have its ``/``,
+#: ``?``, ``#`` and ``@`` written as ``%xx``, so none of them is in one, and the user may be
+#: empty (``redis://:password@host``). Each part ends at a character the next may not hold, so
+#: a line of colons or of schemes costs no more than its length.
+_URL_PASSWORD = re.compile(
+    r"(?P<prefix>\b[A-Za-z][A-Za-z0-9]{1,31}://[^\s:/@?#]*:)(?P<password>[^\s@/?#]+)(?=@)"
 )
 
 #: Words that are a value in code, not a secret: what a language writes for nothing, for yes
@@ -154,6 +203,11 @@ def _is_code_expression(value: str, after: str) -> bool:
     return value in _CODE_WORDS or _CODE_AFTER.match(after) is not None
 
 
+#: The keywords a name in capitals is read for anywhere in it. ``_KEY`` is not among them: a
+#: name has to end in it (``STRIPE_KEY``), so that ``STRIPE_KEY_ID`` and ``MONKEY`` are not read
+#: as secrets', and the pattern above cannot say that, since it only finds the keyword.
+_UPPER_KEYWORD = re.compile(r"SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY")
+
 _NAME_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 _SECRET_WORDS = frozenset({"secret", "token", "password", "passwd", "apikey"})
 _SECRET_WORD_PAIRS = frozenset({("api", "key"), ("private", "key")})
@@ -163,13 +217,14 @@ def _names_a_secret(name: str) -> bool:
     """Whether ``name``, which contains a secret keyword somewhere, is a secret's name.
 
     In capitals there are no word breaks to go by, so the keyword anywhere in it counts
-    (``AUTHTOKEN``, ``DBPASSWORD``), as it always has. In any other case it has to be a
-    word of the name, split at underscores and at humps: ``api_key``, ``clientSecret`` and
-    ``Password`` are, ``tokenizer``, ``max_tokens`` and ``secretary`` are not, and a
-    redactor that called them one would mangle every machine-learning script it read.
+    (``AUTHTOKEN``, ``DBPASSWORD``), as it always has, and so does ending in ``_KEY``
+    (``STRIPE_KEY``). In any other case it has to be a word of the name, split at
+    underscores, hyphens and humps: ``api_key``, ``client-secret`` and ``Password`` are,
+    ``tokenizer``, ``max_tokens`` and ``secretary`` are not, and a redactor that called them
+    one would mangle every machine-learning script it read.
     """
     if name.isupper():
-        return True
+        return _UPPER_KEYWORD.search(name) is not None or name.endswith(("_KEY", "-KEY"))
     words = [word.lower() for word in _NAME_WORD.findall(name)]
     return any(word in _SECRET_WORDS for word in words) or any(
         pair in _SECRET_WORD_PAIRS for pair in pairwise(words)
@@ -217,6 +272,24 @@ class Redactor:
             # (or the model) tells what was there.
             return f"{match['name']}{match['sep']}[redacted:assigned-secret]"
 
+        def _bearer(match: re.Match[str]) -> str:
+            nonlocal replacements
+            token = match["token"]
+            if shannon_entropy(token) < ENTROPY_FLOOR or _PLACEHOLDER.fullmatch(token):
+                return match.group(0)
+            replacements += 1
+            return f"{match['prefix']}[redacted:bearer-token]"
+
+        def _url_password(match: re.Match[str]) -> str:
+            nonlocal replacements
+            # A reference to where the password lives, not the password.
+            if match["password"].startswith(("$", "{", "<")):
+                return match.group(0)
+            replacements += 1
+            return f"{match['prefix']}[redacted:url-password]"
+
+        text = _BEARER.sub(_bearer, text)
+        text = _URL_PASSWORD.sub(_url_password, text)
         text = _ASSIGNED.sub(_assigned, text)
         return text, replacements
 

@@ -519,3 +519,418 @@ def test_more_credentials_by_convention_are_secret_paths(path):
 )
 def test_public_material_and_things_that_only_look_similar_stay_readable(path):
     assert not Redactor().is_secret_path(f"/p/{path}", path)
+
+
+# ---- more credentials by path
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "prod.env",
+        "config/local.env",
+        "staging.Env",
+        ".env-production",
+        "svc/.env_local",
+        "infra/prod.tfvars",
+        "terraform.tfvars",
+        "home/.pgpass",
+        ".htpasswd",
+        "web/.htpasswd",
+        ".vault-token",
+        "home/.vault-token",
+        ".my.cnf",
+        "home/.my.cnf",
+        ".gnupg/pubring.kbx",
+        "home/.gnupg/private-keys-v1.d/ABCD.key",
+        ".gnupg/trustdb.gpg",
+    ],
+)
+def test_the_credentials_paths_of_the_second_list_are_secret_paths(path):
+    assert Redactor().is_secret_path(f"/p/{path}", path)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/envelope.py",
+        "docs/dotenv.md",
+        ".environment",
+        ".envision/notes.txt",
+        "infra/tfvars.md",
+        "infra/main.tf",
+        "my.cnf",
+        "etc/my.cnf.d/readme.md",
+        "docs/pgpass.md",
+        ".htpasswd.md.txt/readme",
+        "vault-token.py",
+        "docs/gnupg.md",
+        "gnupg/readme.md",
+        ".gnupgrc",
+    ],
+)
+def test_names_that_only_look_like_the_second_list_stay_readable(path):
+    assert not Redactor().is_secret_path(f"/p/{path}", path)
+
+
+def test_every_path_pattern_the_second_list_names_is_in_the_list():
+    for pattern in (
+        "**/*.env",
+        "**/.env-*",
+        "**/.env_*",
+        "**/*.tfvars",
+        "**/.pgpass",
+        "**/.htpasswd",
+        "**/.vault-token",
+        "**/.my.cnf",
+        "**/.gnupg/**",
+    ):
+        assert pattern in SECRET_PATH_PATTERNS, pattern
+
+
+# ---- more credential shapes
+
+
+def _hex(seed: str, length: int) -> str:
+    """``length`` characters of a hash of ``seed``: letters and digits no token generator
+    would mistake for anything, built when the test runs so that no credential-shaped literal
+    is in the file."""
+    digest = hashlib.sha256(seed.encode()).hexdigest()
+    assert length <= len(digest)
+    return digest[:length]
+
+
+def _urlsafe(seed: str, length: int) -> str:
+    """Letters, digits, ``-`` and ``_``, in the mix a token has them."""
+    raw = base64.urlsafe_b64encode(hashlib.sha256(seed.encode()).digest() * 4).decode()
+    return raw[:length].replace("=", "x")
+
+
+AWS_TEMPORARY = "ASIA" + _hex("asia", 16).upper()
+NPM_TOKEN = "npm_" + _hex("npm", 36)
+GITLAB_TOKEN = "glpat-" + _hex("glpat", 20)
+STRIPE_LIVE = "sk_live_" + _hex("stripe", 24)
+SENDGRID_KEY = "SG." + _hex("sg-id", 22) + "." + _hex("sg-secret", 43)
+HUGGING_FACE = "hf_" + _hex("hf", 34)
+PYPI_TOKEN = "pypi-" + _urlsafe("pypi", 70).replace("=", "x")
+OPENAI_PROJECT = (
+    "sk-proj-" + _hex("proj-a", 24) + "_" + _hex("proj-b", 20) + "-" + _hex("proj-c", 20)
+)
+
+
+@pytest.mark.parametrize(
+    ("text", "label"),
+    [
+        pytest.param(AWS_TEMPORARY, "aws-key", id="aws-temporary"),
+        pytest.param(NPM_TOKEN, "npm-token", id="npm"),
+        pytest.param(GITLAB_TOKEN, "gitlab-token", id="gitlab"),
+        pytest.param(STRIPE_LIVE, "stripe-key", id="stripe-live"),
+        pytest.param(SENDGRID_KEY, "sendgrid-key", id="sendgrid"),
+        pytest.param(HUGGING_FACE, "huggingface-token", id="hugging-face"),
+        pytest.param(PYPI_TOKEN, "pypi-token", id="pypi"),
+        pytest.param(OPENAI_PROJECT, "openai-key", id="openai-project"),
+    ],
+)
+def test_more_known_secret_shapes_are_replaced(text, label):
+    cleaned, count = Redactor().scrub(f"prefix {text} suffix")
+    assert cleaned == f"prefix [redacted:{label}] suffix"
+    assert count == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ASIA" + _hex("short", 15).upper(),  # one character short
+        "ASIA" + _hex("lowercase-body", 16),  # the body of a key id is capitals and digits
+        "ASIA" + _hex("long", 17).upper(),  # one character too long
+        "ASIAN_MARKETS_REPORT",  # a name that starts the same
+        "asia" + _hex("lower", 16),  # key ids are in capitals
+        "AKIA" + _hex("short", 15).upper(),
+        "npm_" + _hex("npm-short", 35),
+        "npm_config_registry",
+        "npm_package_version",
+        "glpat-" + _hex("glpat-short", 19),
+        "glpat-token-name",
+        "sk_live_" + _hex("stripe-short", 23),
+        "sk_live_mode_enabled",
+        "sk_test_" + _hex("stripe-test", 24),  # a test key is not a live one
+        "SG." + _hex("sg-short", 22) + "." + _hex("sg-short2", 42),
+        "SG" + _hex("sg-no-dots", 22) + _hex("sg-no-dots-2", 43),  # the dots are part of it
+        "SG. Smith joined the Singapore office",
+        "see SG.docs.example",
+        "hf_" + _hex("hf-short", 33),
+        "hf_hub_download",
+        "hf_model_name_or_path_for_tokenizer",
+        "pypi-" + _urlsafe("pypi-short", 49),
+        "pypi-server",
+        "pypi-mirror-url-for-the-internal-index-hosts-in-ci",
+        "sk-proj-" + _hex("proj-short", 31),
+        "sk-project-name-for-the-billing-team",
+    ],
+)
+def test_text_that_only_looks_like_one_of_the_new_shapes_is_left_alone(text):
+    assert Redactor().scrub(f"x {text} y") == (f"x {text} y", 0)
+
+
+def test_an_openai_project_key_with_underscores_and_hyphens_is_redacted_whole():
+    """The old pattern stopped at the first underscore, so the rest was left behind."""
+    cleaned, _ = Redactor().scrub(OPENAI_PROJECT)
+    assert cleaned == "[redacted:openai-key]"
+
+
+# ---- an Authorization header, and the password in a URL
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "Authorization: Bearer {v}",
+        "authorization: bearer {v}",
+        "AUTHORIZATION: BEARER {v}",
+        "curl -H 'Authorization: Bearer {v}' https://api.example.test/x",
+        '{{"Authorization": "Bearer {v}"}}',
+        "headers['Authorization'] = 'Bearer {v}'",
+        "Authorization=Bearer {v}",
+    ],
+)
+def test_a_bearer_token_after_authorization_is_redacted(template):
+    value = fake_secret(template, 32)
+    cleaned, count = Redactor().scrub(template.format(v=value))
+    assert value not in cleaned and count == 1, cleaned
+    assert "[redacted:bearer-token]" in cleaned
+    assert "earer" in cleaned.lower() and "uthorization" in cleaned.lower()
+
+
+def test_what_surrounds_a_redacted_bearer_token_is_kept():
+    value = fake_secret("surround", 32)
+    cleaned, _ = Redactor().scrub(f"curl -H 'Authorization: Bearer {value}' https://x.test")
+    assert cleaned == "curl -H 'Authorization: Bearer [redacted:bearer-token]' https://x.test"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Authorization: Bearer ${API_TOKEN}",
+        "Authorization: Bearer <your-token-here>",
+        "Authorization: Bearer YOUR_API_TOKEN_HERE",
+        "Authorization: Bearer my-token-goes-here-please",
+        "Authorization: Bearer " + "a1" * 16,  # long enough, and nothing like random
+        "Authorization: Bearer " + _hex("fifteen", 15),  # one short of what a token needs
+        "Authorization: Bearer token",
+        "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+        "the bearer of this letter is authorized to collect it",
+        "Bearer " + "a" * 40,  # no header name: only the header is looked for
+        "Authorization: " + "a" * 40,
+    ],
+)
+def test_text_that_only_looks_like_an_authorization_header_is_left_alone(text):
+    assert Redactor().scrub(text) == (text, 0)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "postgres://admin:{v}@db.internal:5432/prod",
+        "DATABASE_URL=mysql://root:{v}@localhost/app",
+        "https://user:{v}@example.test/path?x=1",
+        "redis://:{v}@cache.internal:6379/0",
+        "git+https://ci:{v}@git.example.test/org/repo.git",
+        "see amqps://svc:{v}@queue.example.test, and",
+    ],
+)
+def test_the_password_in_a_url_is_redacted_and_the_rest_of_the_url_is_not(template):
+    value = "hunter2" + _hex(template, 6)
+    cleaned, count = Redactor().scrub(template.format(v=value))
+    assert value not in cleaned and count == 1, cleaned
+    assert "[redacted:url-password]@" in cleaned
+    # the scheme, the user and the host are what a reader needs to see which service it was
+    assert cleaned == template.format(v="[redacted:url-password]")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://user@example.test/path",
+        "ssh://git@github.com/org/repo.git",
+        "http://localhost:8080/path",
+        "https://example.test:443/a:b@c",
+        "https://example.test/users/ada:lovelace@home",
+        "postgres://admin:${DB_PASSWORD}@db.internal/prod",
+        "postgres://admin:{password}@db.internal/prod",
+        "postgres://admin:<password>@db.internal/prod",
+        "mailto:ada@example.test",
+        "scheme://",
+        "xy://b:c d@e",
+        "go to xy://host and mail ada:hunter2@example.test",  # a space ends what could be a URL
+        "C://data:hunter2@host",  # one letter is a drive, not a scheme
+    ],
+)
+def test_a_url_with_a_user_and_no_password_or_with_no_userinfo_is_left_alone(text):
+    assert Redactor().scrub(text) == (text, 0)
+
+
+# ---- names with hyphens, and names ending in _KEY
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "api-key: {v}",
+        "client-secret = {v}",
+        "X-API-KEY: {v}",
+        "--api-key={v}",
+        '"api-key": "{v}"',
+        "access-token: {v}",
+        "db-password: '{v}'",
+        "private-key = {v}",
+    ],
+)
+def test_an_assignment_to_a_name_with_hyphens_is_redacted(template):
+    value = fake_secret(template)
+    cleaned, count = Redactor().scrub(template.format(v=value))
+    assert value not in cleaned and count == 1, cleaned
+    assert "[redacted:assigned-secret]" in cleaned
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "tokenizer-config: {v}",
+        "max-tokens: {v}",
+        "secretary-general = {v}",
+        "api-keys-count: {v}",
+        "the-key: {v}",
+    ],
+)
+def test_a_hyphenated_name_that_only_contains_a_secret_word_is_not_a_secret(template):
+    text = template.format(v=fake_secret(template))
+    assert Redactor().scrub(text) == (text, 0)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "STRIPE_KEY={v}",
+        "export SENDGRID_KEY={v}",
+        "OPENAI_KEY: {v}",
+        'GOOGLE_MAPS_KEY = "{v}"',
+        "X-STRIPE-KEY: {v}",
+    ],
+)
+def test_a_name_in_capitals_ending_in_key_is_a_secret(template):
+    value = fake_secret(template)
+    cleaned, count = Redactor().scrub(template.format(v=value))
+    assert value not in cleaned and count == 1, cleaned
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "MONKEY={v}",
+        "KEYBOARD={v}",
+        "KEY={v}",
+        "STRIPE_KEY_ID={v}",
+        "KEY_ID={v}",
+        "stripe_key = {v}",
+        "cache_key = {v}",
+        "primaryKey = {v}",
+        "TURKEY_SANDWICH={v}",
+    ],
+)
+def test_a_name_that_merely_has_key_in_it_is_not_a_secret(template):
+    text = template.format(v=fake_secret(template))
+    assert Redactor().scrub(text) == (text, 0)
+
+
+def test_a_bearer_token_in_one_case_with_digits_in_it_is_not_taken_for_a_placeholder():
+    value = _hex("lowercase-bearer", 32)
+    assert value == value.lower() and any(c.isdigit() for c in value)
+    cleaned, count = Redactor().scrub(f"Authorization: Bearer {value}")
+    assert (cleaned, count) == ("Authorization: Bearer [redacted:bearer-token]", 1)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "TOKEN-" * 10_000,
+        "api-" * 20_000,
+        "x://" + "a:" * 100_000,
+        "x://" * 50_000,
+        "x://" + "a" * 200_000,
+        "Authorization: Bearer " * 10_000,
+        "Authorization: Bearer " + "a." * 100_000,
+        "_KEY" * 50_000,
+        "A-" * 30_000 + "_KEY",
+    ],
+    ids=lambda text: f"{text[:12]!r}x{len(text):,}",
+)
+def test_the_new_rules_scrub_adversarial_lines_in_linear_time(text):
+    """Each of these takes well under a second; the bound is a wide one, for a slow machine,
+    and a pattern that squares the work on them takes minutes."""
+    started = time.perf_counter()
+    Redactor().scrub(text)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 5, f"{elapsed:.1f}s to scrub {len(text):,} characters"
+
+
+@pytest.mark.parametrize(
+    ("make", "label"),
+    [
+        (lambda n: "pypi-" + _urlsafe("floor-pypi", n), "pypi-token"),
+        (lambda n: "sk-proj-" + _urlsafe("floor-proj", n), "openai-key"),
+        (lambda n: "glpat-" + _urlsafe("floor-gl", n), "gitlab-token"),
+    ],
+    ids=["pypi", "openai-project", "gitlab"],
+)
+def test_a_token_exactly_as_long_as_the_floor_is_redacted_and_one_less_is_not(make, label):
+    floor = {"pypi-token": 50, "openai-key": 32, "gitlab-token": 20}[label]
+    assert Redactor().scrub(make(floor)) == (f"[redacted:{label}]", 1)
+    assert Redactor().scrub(make(floor - 1))[1] == 0
+
+
+@pytest.mark.parametrize("last", ["-", "_"])
+@pytest.mark.parametrize(
+    ("prefix", "body", "label"),
+    [
+        ("pypi-", 59, "pypi-token"),
+        ("sk-proj-", 39, "openai-key"),
+        ("glpat-", 39, "gitlab-token"),
+    ],
+)
+def test_a_token_that_ends_in_a_hyphen_or_an_underscore_is_redacted_to_its_last_character(
+    prefix, body, label, last
+):
+    token = prefix + _hex(prefix, body) + last
+    assert Redactor().scrub(f"x {token} y") == (f"x [redacted:{label}] y", 1)
+
+
+def test_a_sendgrid_key_whose_last_character_is_a_hyphen_is_redacted_whole():
+    key = "SG." + _hex("sg-a", 22) + "." + _hex("sg-b", 42) + "-"
+    assert Redactor().scrub(f"x {key} y") == ("x [redacted:sendgrid-key] y", 1)
+
+
+def test_a_bearer_token_of_sixteen_characters_is_redacted_and_one_of_fifteen_is_not():
+    sixteen = "AbCdEfGhIjKlMnO1"
+    assert len(set(sixteen)) == 16
+    assert Redactor().scrub(f"Authorization: Bearer {sixteen}")[1] == 1
+    assert Redactor().scrub(f"Authorization: Bearer {sixteen[:15]}")[1] == 0
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "AUTH-TOKEN-VALUE: {v}",
+        "auth-token-value: {v}",
+        "X-API-KEY-ID: {v}",
+        "PRIVATE-KEY-PASSPHRASE = {v}",
+        "access-secret-id: {v}",
+    ],
+)
+def test_a_hyphenated_name_with_the_keyword_in_the_middle_is_a_secret_as_it_is_with_underscores(
+    template,
+):
+    value = fake_secret(template)
+    cleaned, count = Redactor().scrub(template.format(v=value))
+    assert value not in cleaned and count == 1, cleaned
+    underscored = template.replace("-", "_").format(v=value)
+    assert Redactor().scrub(underscored)[1] == 1, underscored
