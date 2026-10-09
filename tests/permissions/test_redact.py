@@ -298,6 +298,38 @@ def test_a_text_with_thousands_of_begin_lines_and_no_end_is_scrubbed_in_linear_t
     assert elapsed < 5, f"{elapsed:.1f}s to scrub 20,000 BEGIN lines"
 
 
+def test_a_long_line_of_keywords_is_scrubbed_in_linear_time():
+    """The name part of the assignment rule used to be unbounded on both sides of the
+    keyword: in one long identifier with the keyword in it many times, each occurrence
+    scanned to the end of the line and back, which squares the work (about fifteen seconds
+    for the 60,000 characters here; two minutes for 200,000)."""
+    text = "TOKEN" * 12_000
+    started = time.perf_counter()
+    cleaned, count = Redactor().scrub(text)
+    elapsed = time.perf_counter() - started
+    assert (cleaned, count) == (text, 0)
+    assert elapsed < 2, f"{elapsed:.1f}s to scrub {len(text):,} characters"
+
+
+def test_a_long_line_with_no_keyword_and_a_long_line_of_separators_are_scrubbed_in_linear_time():
+    for text in ("a" * 200_000, "token" + " " * 200_000 + "x", "token=" + "a" * 200_000):
+        started = time.perf_counter()
+        Redactor().scrub(text)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 2, f"{elapsed:.1f}s to scrub {len(text):,} characters"
+
+
+def test_a_name_longer_than_the_bound_on_either_side_of_its_keyword_is_not_read_as_one():
+    """Known and documented: the name is looked for within 64 characters of the keyword."""
+    value = fake_secret("long-name")
+    long_prefix = "A" * 70 + "_TOKEN"
+    long_suffix = "TOKEN_" + "B" * 70
+    for name in (long_prefix, long_suffix):
+        assert Redactor().scrub(f"{name}={value}") == (f"{name}={value}", 0)
+    within = "A" * 60 + "_TOKEN_" + "B" * 60
+    assert Redactor().scrub(f"{within}={value}")[1] == 1
+
+
 def test_a_block_cut_off_before_its_end_has_its_body_masked_anyway():
     """What Grep -A or a Read window shows is a block with no end line, and the body is the
     key."""

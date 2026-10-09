@@ -19,6 +19,9 @@ What this does *not* cover, so that nobody relies on it for more:
 * A secret in a position no name labels -- a bare string in a list, an argument on a
   command line, a line in a file of values -- is only caught if it has one of the
   recognisable shapes above.
+* A name is looked for within 64 characters on each side of its keyword (a name longer than
+  that is not read as a secret's), so that scrubbing a line takes time in proportion to its
+  length.
 * A name is read as a secret's when it is in capitals and has the keyword anywhere in
   it, or in any other case and has the keyword as a word of its own (``api_key``,
   ``clientSecret``, ``Password``). ``dbpassword`` in lower case, with no break to find the
@@ -106,11 +109,18 @@ _SHAPES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
 )
 
+#: How many characters of a name the assignment rule looks at on each side of its keyword.
+#: Unbounded, a line that is one long identifier with the keyword in it many times is read
+#: from every occurrence to the end of the line and back, which squares the work.
+_NAME_REACH = 64
+
 #: NAME=value where NAME says secret and value looks random. The name may be in quotes
 #: (JSON, a Python dict) and in any case; whether it *says* secret is decided by
 #: :func:`_names_a_secret`, which needs the name as the pattern found it.
 _ASSIGNED = re.compile(
-    r"\b(?P<name>[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY)[A-Z0-9_]*)"
+    rf"\b(?P<name>[A-Z0-9_]{{0,{_NAME_REACH}}}"
+    r"(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY)"
+    rf"[A-Z0-9_]{{0,{_NAME_REACH}}})"
     r"(?P<sep>[\"']?\s*[=:]\s*[\"']?)"
     r"(?P<value>[A-Za-z0-9+/=_\-]{16,})",
     re.IGNORECASE,
