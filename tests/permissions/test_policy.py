@@ -688,6 +688,86 @@ def test_the_read_verdict_is_the_one_read_itself_gets():
         assert (refusal is not None) == (direct.decision is Decision.DENY), path
 
 
+# ---- a refusal covers every spelling the filesystem treats as the same file
+
+# "e" with an acute accent, composed (NFC) and as "e" followed by a combining accent (NFD).
+CAFE_NFC = "caf\u00e9"
+CAFE_NFD = "cafe\u0301"
+
+
+@pytest.mark.parametrize("name", [".ENV", ".Env", ".eNv.Local", "ID_RSA", "Id_Rsa"])
+def test_a_credentials_file_is_refused_whatever_its_letter_case(name):
+    refusal = read_refusal(policy(secret_paths=("**/.env", "**/.env.*", "**/id_rsa")), f"/p/{name}")
+    assert refusal is not None and refusal.rule == "secret.path", name
+
+
+def test_a_credentials_pattern_written_in_capitals_still_refuses_the_lowercase_spelling():
+    refusal = read_refusal(policy(secret_paths=("**/.ENV",)), "/p/.env")
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
+@pytest.mark.parametrize("path", ["/p/SECRETS/x", "/p/Secrets/x", "/p/secrets/X", "/p/SeCrEtS/a/b"])
+def test_a_read_deny_rule_covers_every_letter_case_of_the_path(path):
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(secrets/**)"]))
+    refusal = read_refusal(p, path)
+    assert refusal is not None and refusal.rule == "rule.deny", path
+    assert "Read(secrets/**)" in refusal.reason
+
+
+def test_a_deny_rule_written_in_capitals_covers_the_lowercase_path():
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(SECRETS/**)"]))
+    refusal = read_refusal(p, "/p/secrets/x")
+    assert refusal is not None and refusal.rule == "rule.deny"
+
+
+@pytest.mark.parametrize(
+    ("rule_name", "path_name"),
+    [(CAFE_NFC, CAFE_NFD), (CAFE_NFD, CAFE_NFC), (CAFE_NFD, CAFE_NFD.upper())],
+    ids=["nfc-rule-nfd-path", "nfd-rule-nfc-path", "nfd-rule-uppercase-nfd-path"],
+)
+def test_a_deny_rule_covers_a_path_spelled_in_the_other_unicode_form(rule_name, path_name):
+    """APFS opens one file under both spellings, so a rule that names one names both."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=[f"Read({rule_name}/**)"]))
+    refusal = read_refusal(p, f"/p/{path_name}/notes.txt")
+    assert refusal is not None and refusal.rule == "rule.deny", (rule_name, path_name)
+
+
+def test_a_credentials_pattern_matches_a_path_spelled_in_the_other_unicode_form():
+    p = policy(secret_paths=(f"**/{CAFE_NFC}/**",))
+    refusal = read_refusal(p, f"/p/{CAFE_NFD}/notes.txt")
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
+def test_a_deny_rule_for_any_tool_folds_not_only_for_read():
+    p = policy(rules=RuleSet.build(deny=["Write(secrets/**)", "Grep(token:*)"]))
+    write = evaluate(write_req("Write", "/p/SECRETS/x"), p, Grants())
+    assert (write.decision, write.rule) == (Decision.DENY, "rule.deny")
+    grep = evaluate(req("Grep", "TOKEN", ()), p, Grants())
+    assert (grep.decision, grep.rule) == (Decision.DENY, "rule.deny")
+
+
+def test_an_allow_rule_still_compares_exactly():
+    """A looser match for what runs without asking would widen it."""
+    p = policy(rules=RuleSet.build(allow=["Write(docs/**)"]))
+    assert evaluate(write_req("Write", "/p/docs/x"), p, Grants()).rule == "rule.allow"
+    for path in ("/p/DOCS/x", "/p/Docs/x"):
+        result = evaluate(write_req("Write", path), p, Grants())
+        assert (result.decision, result.rule) == (Decision.ASK, "default.ask"), path
+
+
+def test_an_allow_rule_does_not_allow_the_other_unicode_form():
+    p = policy(rules=RuleSet.build(allow=[f"Write({CAFE_NFC}/**)"]))
+    assert evaluate(write_req("Write", f"/p/{CAFE_NFC}/x"), p, Grants()).rule == "rule.allow"
+    result = evaluate(write_req("Write", f"/p/{CAFE_NFD}/x"), p, Grants())
+    assert (result.decision, result.rule) == (Decision.ASK, "default.ask")
+
+
+def test_an_ask_rule_still_compares_exactly():
+    p = policy(rules=RuleSet.build(ask=["Write(docs/**)"]))
+    assert evaluate(write_req("Write", "/p/docs/x"), p, Grants()).rule == "rule.ask"
+    assert evaluate(write_req("Write", "/p/DOCS/x"), p, Grants()).rule == "default.ask"
+
+
 # ---- a newline in a name is not a way past a refusal
 
 ODD = "/p/odd\ndir"

@@ -179,4 +179,4 @@ class Redactor:
         # The shared matcher rather than a pathspec of its own: it already tries
         # each candidate with and without leading slashes, and it keeps the
         # deprecated pathspec factory name in exactly one place.
-        return glob_matches_any(SECRET_PATH_PATTERNS, (relative, absolute))
+        return glob_matches_any(SECRET_PATH_PATTERNS, (relative, absolute), fold=True)

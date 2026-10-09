@@ -419,6 +419,39 @@ async def test_a_read_deny_rule_also_keeps_grep_out_of_the_files_it_covers(
         assert "open.txt" in outcome.content, f"{mode}: {outcome.content}"
 
 
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+@pytest.mark.parametrize(
+    ("directory", "name"),
+    [("SECRETS", "notes.txt"), ("Secrets", "notes.txt")],
+)
+async def test_a_deny_rule_keeps_grep_out_of_a_file_whatever_the_case_of_its_path(
+    ctx, tmp_repo, monkeypatch, force_python_fallback, directory, name
+):
+    """The default macOS volume opens ``SECRETS/x`` as ``secrets/x``, so a rule that
+    names one is a rule about the other."""
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / directory).mkdir()
+    (tmp_repo / directory / name).write_text("needle: launch code 1234\n")
+    (tmp_repo / "open.txt").write_text("needle: public\n")
+    outcome = await GrepTool().run(
+        _deny_reading(ctx, "Read(secrets/**)"), "t1", {"pattern": "needle"}
+    )
+    assert "launch code" not in outcome.content, outcome.content
+    assert "open.txt" in outcome.content, outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_the_credentials_list_keeps_grep_out_of_an_uppercase_env_file(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / ".ENV").write_text("needle: not for the model\n")
+    (tmp_repo / "open.txt").write_text("needle: fine\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle"})
+    assert "not for the model" not in outcome.content, outcome.content
+    assert "open.txt" in outcome.content, outcome.content
+
+
 async def test_a_deny_rule_for_another_tool_does_not_hide_files_from_grep(ctx, tmp_repo):
     (tmp_repo / "secrets").mkdir()
     (tmp_repo / "secrets" / "notes.txt").write_text("needle\n")

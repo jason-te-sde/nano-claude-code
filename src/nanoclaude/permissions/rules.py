@@ -11,11 +11,19 @@ Three shapes:
 For path-taking tools the subject is also treated as a glob and matched against
 both the absolute resolved path and the path relative to the sandbox root, so a
 user can write either and be understood.
+
+A rule compares exactly, except when it is asked to refuse something: ``deny`` rules and
+the credentials list compare after :func:`fold_spelling`, because the filesystems people
+use most open one file under every spelling that folds to the same string, and a refusal
+that only knew one of them would be a refusal a different spelling walks past. ``allow``
+and ``ask`` rules compare exactly: a looser match there would widen what runs without
+asking, which is the wrong direction to err in.
 """
 
 from __future__ import annotations
 
 import functools
+import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 
@@ -41,6 +49,20 @@ GLOB_PATTERN_FACTORY = "gitwildmatch"
 #: that names ``read`` matches no call to ``Read``, and for a deny rule that is a refusal
 #: the person believes is in force and is not. A test pins this list to the registry.
 KNOWN_TOOLS = ("Bash", "Edit", "Git", "Glob", "Grep", "Read", "TodoWrite", "Write")
+
+
+def fold_spelling(text: str) -> str:
+    """``text`` in the form two spellings of one file share, for comparing in a refusal.
+
+    The default macOS volume (APFS) is case-insensitive and normalization-insensitive:
+    ``.ENV`` opens ``.env``, and a name in NFD opens the file made under its NFC spelling.
+    Both sides of a comparison go through this, so any pair of spellings the filesystem
+    treats as one compare equal. It is Unicode's canonical caseless matching (the
+    decomposed form is case-folded, then composed again), and it is only ever used to refuse:
+    on a case-sensitive filesystem it can refuse a file that is distinct from the one a rule
+    names, which errs towards refusing.
+    """
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFD", text).casefold())
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,16 +100,25 @@ class Rule:
             return Rule(_known_tool(tool.strip()), prefix, True, raw)
         return Rule(_known_tool(tool.strip()), subject, False, raw)
 
-    def matches(self, tool: str, subject: str, relative_subject: str) -> bool:
+    def matches(
+        self, tool: str, subject: str, relative_subject: str, *, fold: bool = False
+    ) -> bool:
+        """Whether this rule covers the call. ``fold`` compares the subject (in all three
+        of the rule's forms) after :func:`fold_spelling`; the tool's name is compared as it
+        is, since the registry's names are exact."""
         if tool != self.tool:
             return False
         if self.subject is None:
             return True
+        rule_subject = self.subject
+        if fold:
+            rule_subject = fold_spelling(rule_subject)
+            subject, relative_subject = fold_spelling(subject), fold_spelling(relative_subject)
         if self.prefix:
-            return _prefix_match(subject, self.subject)
-        if subject == self.subject:
+            return _prefix_match(subject, rule_subject)
+        if subject == rule_subject:
             return True
-        return glob_matches_any((self.subject,), (subject, relative_subject))
+        return glob_matches_any((rule_subject,), (subject, relative_subject))
 
 
 def _known_tool(name: str) -> str:
@@ -121,8 +152,13 @@ def _compiled(patterns: tuple[str, ...]) -> pathspec.PathSpec[PathspecPattern]:
     return pathspec.PathSpec.from_lines(GLOB_PATTERN_FACTORY, patterns)
 
 
-def glob_matches_any(patterns: tuple[str, ...], candidates: tuple[str, ...]) -> bool:
+def glob_matches_any(
+    patterns: tuple[str, ...], candidates: tuple[str, ...], *, fold: bool = False
+) -> bool:
     """True if any of ``candidates`` matches any of ``patterns``.
+
+    ``fold`` compares both after :func:`fold_spelling`: what a refusal asks for, so that
+    every spelling of a file the filesystem treats as one matches the pattern that names it.
 
     Shared by :meth:`Rule.matches` (one pattern, a rule's own subject) and
     policy.py's secret-path check (many patterns, ``Policy.secret_paths``) --
@@ -133,6 +169,9 @@ def glob_matches_any(patterns: tuple[str, ...], candidates: tuple[str, ...]) -> 
     """
     if not patterns:
         return False
+    if fold:
+        patterns = tuple(fold_spelling(pattern) for pattern in patterns)
+        candidates = tuple(fold_spelling(candidate) for candidate in candidates)
     spec = _compiled(patterns)
     # A newline becomes NUL, which no path holds and a glob treats as any other
     # character. The regular expression a leading ``**/`` becomes starts with ``.+``,
@@ -173,7 +212,10 @@ class RuleSet:
         # the RuleKind literal, and each of those names a tuple[Rule, ...]
         # field on this dataclass.
         rules: tuple[Rule, ...] = getattr(self, kind)
+        # Only what refuses is compared by what the filesystem would treat as the same
+        # file; allow and ask rules are compared exactly (see the module docstring).
+        fold = kind == "deny"
         for rule in rules:
-            if rule.matches(tool, subject, relative_subject):
+            if rule.matches(tool, subject, relative_subject, fold=fold):
                 return rule
         return None

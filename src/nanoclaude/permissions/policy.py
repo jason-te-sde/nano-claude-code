@@ -24,7 +24,7 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 
 from nanoclaude.permissions.danger import DangerLevel, DangerVerdict
-from nanoclaude.permissions.rules import RuleSet, glob_matches_any
+from nanoclaude.permissions.rules import RuleSet, fold_spelling, glob_matches_any
 from nanoclaude.permissions.sandbox import Sandbox, is_within
 
 #: Tools that cannot change anything, and so never need confirming on their own.
@@ -45,8 +45,8 @@ EDIT_TOOLS = frozenset({"Edit", "Write"})
 #: assembly makes, or the next commit the person makes), and ncc reads its own
 #: configuration, its capability cache and its session store from ``.nanoclaude``. A write
 #: to one is a way for a tool call to run code that no confirmation described, so it is
-#: refused whatever the mode. Names are compared without regard to case, since the
-#: filesystems people use most (macOS's default among them) treat ``.GIT`` as ``.git``;
+#: refused whatever the mode. Names are compared after ``fold_spelling`` (rules.py), since
+#: the filesystems people use most (macOS's default among them) treat ``.GIT`` as ``.git``;
 #: that errs towards refusing, which is the safe side for a refusal.
 PROTECTED_DIRECTORIES = (".git", ".nanoclaude")
 
@@ -59,8 +59,9 @@ def protected_directory(path: str) -> str | None:
     ``.github`` and ``.gitignore`` are nothing to do with it.
     """
     for part in PurePosixPath(path).parts:
-        if part.casefold() in PROTECTED_DIRECTORIES:
-            return part.casefold()
+        folded = fold_spelling(part)
+        if folded in PROTECTED_DIRECTORIES:
+            return folded
     return None
 
 
@@ -256,7 +257,7 @@ def evaluate(
     # 2. secret.path
     if not policy.allow_secrets:
         for path in request.resolved_paths:
-            if glob_matches_any(policy.secret_paths, (path, policy.relative(path))):
+            if glob_matches_any(policy.secret_paths, (path, policy.relative(path)), fold=True):
                 return PermissionResult(
                     Decision.DENY,
                     "secret.path",

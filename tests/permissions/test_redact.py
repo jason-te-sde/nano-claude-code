@@ -112,6 +112,13 @@ def test_secret_paths_are_recognised(path):
     assert Redactor().is_secret_path(f"/p/{path}", path)
 
 
+@pytest.mark.parametrize(
+    "path", [".ENV", "svc/.Env.Local", "ID_RSA", ".SSH/known_hosts", "Key.PEM"]
+)
+def test_secret_paths_are_recognised_whatever_their_letter_case(path):
+    assert Redactor().is_secret_path(f"/p/{path}", path)
+
+
 @pytest.mark.parametrize("path", ["src/environment.py", "docs/env.md", "keyboard.py"])
 def test_paths_that_merely_look_similar_are_not(path):
     assert not Redactor().is_secret_path(f"/p/{path}", path)
