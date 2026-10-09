@@ -376,3 +376,99 @@ def test_neither_backend_reads_through_a_symlink(backend, tmp_path):
     found = [m.path for m in backend("needle", root=str(project), glob=None, limit=100)]
 
     assert [Path(p).relative_to(project).as_posix() for p in found] == ["real/inside.txt"]
+
+
+# ---- keep: paths a caller does not want are dropped before the limit is applied
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            ripgrep_search,
+            marks=pytest.mark.skipif(not ripgrep_available(), reason="ripgrep not on PATH"),
+        ),
+        python_search,
+    ],
+)
+def test_matches_of_a_path_that_is_not_kept_do_not_use_up_the_limit(backend, tmp_path):
+    (tmp_path / "aaa").mkdir()
+    (tmp_path / "aaa" / "x.txt").write_text("needle\n" * 30)
+    (tmp_path / "zzz.txt").write_text("needle\n" * 5)
+    found = backend(
+        "needle",
+        root=str(tmp_path),
+        glob=None,
+        limit=4,
+        keep=lambda path: "/aaa/" not in path,
+    )
+    assert [Path(m.path).name for m in found] == ["zzz.txt"] * 4
+
+
+def test_the_fallback_does_not_even_read_a_file_that_is_not_kept(tmp_path, monkeypatch):
+    (tmp_path / "refused.txt").write_text("needle\n")
+    (tmp_path / "open.txt").write_text("needle\n")
+    opened: list[str] = []
+    real = Path.read_bytes
+
+    def watching(self: Path) -> bytes:
+        opened.append(self.name)
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", watching)
+    found = python_search(
+        "needle", root=str(tmp_path), glob=None, keep=lambda path: not path.endswith("refused.txt")
+    )
+    assert [Path(m.path).name for m in found] == ["open.txt"]
+    assert opened == ["open.txt"]
+
+
+def _canned_ripgrep(monkeypatch: pytest.MonkeyPatch, *events: dict[str, object]) -> None:
+    """``rg --json`` having printed ``events``: the search itself is not run."""
+    import json
+    import subprocess
+    from types import SimpleNamespace
+
+    stdout = "\n".join(json.dumps(event) for event in events) + "\n"
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
+    )
+
+
+def _match(path: str, number: int, text: str) -> dict[str, object]:
+    return {
+        "type": "match",
+        "data": {"path": {"text": path}, "lines": {"text": text}, "line_number": number},
+    }
+
+
+def test_ripgrep_matches_of_a_path_that_is_not_kept_are_dropped_before_the_limit(monkeypatch):
+    """Whatever order ripgrep reports files in, the refused file's matches come first here."""
+    _canned_ripgrep(
+        monkeypatch,
+        *[_match("/p/refused.txt", n, "needle\n") for n in range(1, 11)],
+        *[_match("/p/open.txt", n, "needle\n") for n in range(1, 4)],
+    )
+    found = ripgrep_search(
+        "needle", root="/p", glob=None, limit=3, keep=lambda path: "refused" not in path
+    )
+    assert [(m.path, m.line_no) for m in found] == [("/p/open.txt", n) for n in (1, 2, 3)]
+
+
+def test_ripgrep_context_of_a_path_that_is_not_kept_is_dropped_too(monkeypatch):
+    context: dict[str, object] = {
+        "type": "context",
+        "data": {"path": {"text": "/p/refused.txt"}, "lines": {"text": "ctx\n"}, "line_number": 2},
+    }
+    _canned_ripgrep(monkeypatch, context, _match("/p/open.txt", 1, "needle\n"))
+    found = ripgrep_search(
+        "needle", root="/p", glob=None, before=1, keep=lambda path: "refused" not in path
+    )
+    assert [m.path for m in found] == ["/p/open.txt"]
+
+
+def test_with_no_keep_every_match_is_reported():
+    """The default is what it always was: asking about every path is the caller's choice."""
+    assert python_search("needle", root="/does/not/exist", glob=None) == []

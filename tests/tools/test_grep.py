@@ -457,6 +457,85 @@ async def test_the_credentials_list_keeps_grep_out_of_an_uppercase_env_file(
     assert "open.txt" in outcome.content, outcome.content
 
 
+# ---- the limit counts what is shown: a refused file's matches never use it up
+
+
+def _many_matches_in_a_refused_file_and_some_in_an_open_one(tmp_repo: Path) -> None:
+    """The refused file sorts first by path, and has more matches than any limit below."""
+    (tmp_repo / "aaa").mkdir()
+    (tmp_repo / "aaa" / "notes.txt").write_text("needle refused\n" * 40)
+    (tmp_repo / "zzz.txt").write_text("".join(f"needle open {i}\n" for i in range(6)))
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+@pytest.mark.parametrize("limit", [1, 3, 5, 6])
+async def test_a_refused_files_matches_do_not_use_up_the_limit(
+    ctx, tmp_repo, monkeypatch, force_python_fallback, limit
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    _many_matches_in_a_refused_file_and_some_in_an_open_one(tmp_repo)
+    denying = _deny_reading(ctx, "Read(aaa/**)")
+    outcome = await GrepTool().run(denying, "t1", {"pattern": "needle", "head_limit": limit})
+    assert not outcome.is_error and "refused" not in outcome.content, outcome.content
+    assert f"{limit} match(es)" in outcome.content, outcome.content
+    assert outcome.content.count("zzz.txt:") == limit, outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_the_default_limit_counts_what_is_shown_too(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "aaa").mkdir()
+    (tmp_repo / "aaa" / "notes.txt").write_text("needle refused\n" * 250)
+    (tmp_repo / "zzz.txt").write_text("needle open\n" * 30)
+    denying = _deny_reading(ctx, "Read(aaa/**)")
+    outcome = await GrepTool().run(denying, "t1", {"pattern": "needle"})
+    assert "30 match(es)" in outcome.content, outcome.content[:80]
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_credentials_file_does_not_use_up_the_limit_either(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / ".env").write_text("needle refused\n" * 40)
+    (tmp_repo / "zzz.txt").write_text("needle open\n" * 6)
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "head_limit": 4})
+    assert "4 match(es)" in outcome.content and ".env" not in outcome.content, outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+@pytest.mark.parametrize("mode", ["files", "count"])
+async def test_the_limit_counts_what_is_shown_in_the_other_modes_too(
+    ctx, tmp_repo, monkeypatch, force_python_fallback, mode
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    _many_matches_in_a_refused_file_and_some_in_an_open_one(tmp_repo)
+    denying = _deny_reading(ctx, "Read(aaa/**)")
+    outcome = await GrepTool().run(
+        denying, "t1", {"pattern": "needle", "output_mode": mode, "head_limit": 3}
+    )
+    assert "3 match(es)" in outcome.content and "zzz.txt" in outcome.content, outcome.content
+    assert "aaa" not in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_the_limit_counts_matches_and_not_context_lines_after_refused_ones_are_dropped(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "aaa").mkdir()
+    (tmp_repo / "aaa" / "notes.txt").write_text("needle refused\nfiller\n" * 20)
+    spaced = "needle one\nf\nf\nf\nneedle two\nf\nf\nf\nneedle three\n"
+    (tmp_repo / "zzz.txt").write_text(spaced)
+    denying = _deny_reading(ctx, "Read(aaa/**)")
+    outcome = await GrepTool().run(denying, "t1", {"pattern": "needle", "head_limit": 2, "-C": 1})
+    assert "2 match(es)" in outcome.content, outcome.content
+    assert "needle one" in outcome.content and "needle two" in outcome.content
+    assert "needle three" not in outcome.content and "refused" not in outcome.content
+
+
 async def test_a_deny_rule_for_another_tool_does_not_hide_files_from_grep(ctx, tmp_repo):
     (tmp_repo / "secrets").mkdir()
     (tmp_repo / "secrets" / "notes.txt").write_text("needle\n")

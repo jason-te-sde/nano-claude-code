@@ -23,7 +23,7 @@ from __future__ import annotations
 import os
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from nanoclaude.permissions.policy import PermissionRequest, read_refusal
@@ -89,7 +89,11 @@ class GrepTool:
             re.compile(pattern)
         except re.error as exc:
             return failed(call_id, f"{pattern!r} is not a valid regular expression: {exc}")
+        readable = self._readability(ctx)
         try:
+            # The backends are told which paths to leave out, so that they leave them out
+            # before the limit is applied: a refused file with a great many matches must not
+            # use up a limit that the files that are shown would have filled.
             matches = search(
                 pattern,
                 root=root,
@@ -98,11 +102,14 @@ class GrepTool:
                 limit=limit,
                 before=before,
                 after=after,
+                keep=readable,
             )
         except RuntimeError as exc:
             return failed(call_id, f"search failed: {exc}")
 
-        matches = self._drop_unreadable(ctx, matches)
+        # And again here, on whatever a backend reported anyway: the verdict is not left to
+        # the backend having honoured the question.
+        matches = [m for m in matches if readable(m.path)]
 
         if not matches:
             return ok(call_id, f"No matches for {pattern}")
@@ -160,8 +167,8 @@ class GrepTool:
         return "\n".join(lines)
 
     @staticmethod
-    def _drop_unreadable(ctx: ToolContext, matches: list[Match]) -> list[Match]:
-        """Keep only matches in files the policy would let Read show the model.
+    def _readability(ctx: ToolContext) -> Callable[[str], bool]:
+        """Whether the policy would let Read show the model this file; a path is asked once.
 
         Requirement (added 2026-10-01, task-14-brief.md): a credentials-shaped file
         discovered while walking the tree must not have its contents surfaced, on
@@ -181,4 +188,4 @@ class GrepTool:
                 verdicts[path] = read_refusal(ctx.policy, path, os.path.realpath(path)) is None
             return verdicts[path]
 
-        return [m for m in matches if readable(m.path)]
+        return readable

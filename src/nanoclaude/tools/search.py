@@ -186,6 +186,7 @@ def ripgrep_search(
     limit: int = DEFAULT_LIMIT,
     before: int = 0,
     after: int = 0,
+    keep: Callable[[str], bool] | None = None,
 ) -> list[Match]:
     # --hidden and the /.git/ exclusion bring this in line with walk_files,
     # which already includes dotfiles (Grep's own secret-file filter depends
@@ -223,9 +224,15 @@ def ripgrep_search(
         if event_type not in ("match", "context"):
             continue
         data = event["data"]
+        path = data["path"]["text"]
+        # A path the caller does not want is dropped here, before the limit is applied
+        # and not after: a refused file's matches must not use up a limit that the files
+        # that are shown would have filled.
+        if keep is not None and not keep(path):
+            continue
         matches.append(
             Match(
-                data["path"]["text"],
+                path,
                 data["line_number"],
                 data["lines"]["text"].rstrip("\n"),
                 is_context=event_type == "context",
@@ -248,10 +255,13 @@ def python_search(
     limit: int = DEFAULT_LIMIT,
     before: int = 0,
     after: int = 0,
+    keep: Callable[[str], bool] | None = None,
 ) -> list[Match]:
     regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     matches: list[Match] = []
-    for path in sorted(walk_files(root, pattern=glob and f"**/{glob}", limit=10_000)):
+    # keep is asked while walking, before a file is opened and before any limit applies: a
+    # file the caller does not want is not read, and its matches cannot use up the limit.
+    for path in sorted(walk_files(root, pattern=glob and f"**/{glob}", limit=10_000, keep=keep)):
         try:
             # lstat, not stat: a link is not a regular file, so one is not opened, which
             # is what ripgrep does and what keeps a link from reading a file it leads to.
@@ -303,7 +313,14 @@ def search(
     limit: int = DEFAULT_LIMIT,
     before: int = 0,
     after: int = 0,
+    keep: Callable[[str], bool] | None = None,
 ) -> list[Match]:
+    """Matches of ``pattern`` under ``root``, with at most ``limit`` of them.
+
+    ``keep`` is asked about the path of each file that has a match, and a file it refuses
+    contributes nothing, matches or context, to the result or to the count the limit is
+    applied to.
+    """
     backend = ripgrep_search if ripgrep_available() else python_search
     return backend(
         pattern,
@@ -313,4 +330,5 @@ def search(
         limit=limit,
         before=before,
         after=after,
+        keep=keep,
     )
