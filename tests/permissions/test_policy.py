@@ -12,6 +12,7 @@ from nanoclaude.permissions.policy import (
     PermissionResult,
     Policy,
     evaluate,
+    read_refusal,
 )
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.permissions.sandbox import Sandbox
@@ -629,3 +630,353 @@ def test_a_session_grant_does_not_promote_the_regex_classifiers_own_safe_verdict
     )
     assert result.decision is Decision.ASK
     assert result.rule != "grant.session"
+
+
+# ---- the read verdict: what every way a file's contents reach the model asks first
+
+
+def test_a_path_a_read_deny_rule_covers_is_refused_for_reading():
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(secrets/**)"]))
+    refusal = read_refusal(p, "/p/secrets/notes.txt")
+    assert refusal is not None
+    assert (refusal.decision, refusal.rule) == (Decision.DENY, "rule.deny")
+    assert "Read(secrets/**)" in refusal.reason
+
+
+def test_a_credentials_path_is_refused_for_reading():
+    refusal = read_refusal(policy(), "/p/.env")
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
+def test_a_path_outside_the_sandbox_is_refused_for_reading():
+    refusal = read_refusal(policy(), "/etc/passwd")
+    assert refusal is not None and refusal.rule == "sandbox.outside-root"
+
+
+def test_an_ordinary_path_is_not_refused_for_reading():
+    assert read_refusal(policy(), "/p/src/a.py") is None
+
+
+def test_allow_secrets_lifts_the_credentials_refusal_but_not_the_deny_rule():
+    p = policy(allow_secrets=True, rules=RuleSet.build(allow=["Read"], deny=["Read(**/vault.txt)"]))
+    assert read_refusal(p, "/p/.env") is None
+    refusal = read_refusal(p, "/p/vault.txt")
+    assert refusal is not None and refusal.rule == "rule.deny"
+
+
+def test_only_a_deny_rule_for_read_governs_reading():
+    """A rule for another tool says nothing about what Read may show."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Write(secrets/**)", "Bash(cat:*)"]))
+    assert read_refusal(p, "/p/secrets/notes.txt") is None
+
+
+def test_the_first_spelling_that_is_refused_decides():
+    """A file reached through a link has two spellings, and either one being refused
+    is enough."""
+    p = policy()
+    assert read_refusal(p, "/p/notes.txt", "/p/.env") is not None
+    assert read_refusal(p, "/p/.env", "/p/notes.txt") is not None
+    assert read_refusal(p, "/p/notes.txt", "/p/real.txt") is None
+
+
+def test_the_read_verdict_is_the_one_read_itself_gets():
+    """Read and the verdict cannot drift apart: both ask evaluate."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(secrets/**)"]))
+    for path in ("/p/secrets/notes.txt", "/p/.env", "/etc/passwd", "/p/a.py"):
+        direct = evaluate(req(subject=path, paths=(path,)), p, Grants())
+        refusal = read_refusal(p, path)
+        assert (refusal is not None) == (direct.decision is Decision.DENY), path
+
+
+# ---- a refusal covers every spelling the filesystem treats as the same file
+
+# "e" with an acute accent, composed (NFC) and as "e" followed by a combining accent (NFD).
+CAFE_NFC = "caf\u00e9"
+CAFE_NFD = "cafe\u0301"
+
+
+@pytest.mark.parametrize("name", [".ENV", ".Env", ".eNv.Local", "ID_RSA", "Id_Rsa"])
+def test_a_credentials_file_is_refused_whatever_its_letter_case(name):
+    refusal = read_refusal(policy(secret_paths=("**/.env", "**/.env.*", "**/id_rsa")), f"/p/{name}")
+    assert refusal is not None and refusal.rule == "secret.path", name
+
+
+def test_a_credentials_pattern_written_in_capitals_still_refuses_the_lowercase_spelling():
+    refusal = read_refusal(policy(secret_paths=("**/.ENV",)), "/p/.env")
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
+@pytest.mark.parametrize("path", ["/p/SECRETS/x", "/p/Secrets/x", "/p/secrets/X", "/p/SeCrEtS/a/b"])
+def test_a_read_deny_rule_covers_every_letter_case_of_the_path(path):
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(secrets/**)"]))
+    refusal = read_refusal(p, path)
+    assert refusal is not None and refusal.rule == "rule.deny", path
+    assert "Read(secrets/**)" in refusal.reason
+
+
+def test_a_deny_rule_written_in_capitals_covers_the_lowercase_path():
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(SECRETS/**)"]))
+    refusal = read_refusal(p, "/p/secrets/x")
+    assert refusal is not None and refusal.rule == "rule.deny"
+
+
+@pytest.mark.parametrize(
+    ("rule_name", "path_name"),
+    [(CAFE_NFC, CAFE_NFD), (CAFE_NFD, CAFE_NFC), (CAFE_NFD, CAFE_NFD.upper())],
+    ids=["nfc-rule-nfd-path", "nfd-rule-nfc-path", "nfd-rule-uppercase-nfd-path"],
+)
+def test_a_deny_rule_covers_a_path_spelled_in_the_other_unicode_form(rule_name, path_name):
+    """APFS opens one file under both spellings, so a rule that names one names both."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=[f"Read({rule_name}/**)"]))
+    refusal = read_refusal(p, f"/p/{path_name}/notes.txt")
+    assert refusal is not None and refusal.rule == "rule.deny", (rule_name, path_name)
+
+
+def test_a_credentials_pattern_matches_a_path_spelled_in_the_other_unicode_form():
+    p = policy(secret_paths=(f"**/{CAFE_NFC}/**",))
+    refusal = read_refusal(p, f"/p/{CAFE_NFD}/notes.txt")
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
+def test_a_deny_rule_for_any_tool_folds_not_only_for_read():
+    p = policy(rules=RuleSet.build(deny=["Write(secrets/**)", "Grep(token:*)"]))
+    write = evaluate(write_req("Write", "/p/SECRETS/x"), p, Grants())
+    assert (write.decision, write.rule) == (Decision.DENY, "rule.deny")
+    grep = evaluate(req("Grep", "TOKEN", ()), p, Grants())
+    assert (grep.decision, grep.rule) == (Decision.DENY, "rule.deny")
+
+
+def test_an_allow_rule_still_compares_exactly():
+    """A looser match for what runs without asking would widen it."""
+    p = policy(rules=RuleSet.build(allow=["Write(docs/**)"]))
+    assert evaluate(write_req("Write", "/p/docs/x"), p, Grants()).rule == "rule.allow"
+    for path in ("/p/DOCS/x", "/p/Docs/x"):
+        result = evaluate(write_req("Write", path), p, Grants())
+        assert (result.decision, result.rule) == (Decision.ASK, "default.ask"), path
+
+
+def test_an_allow_rule_does_not_allow_the_other_unicode_form():
+    p = policy(rules=RuleSet.build(allow=[f"Write({CAFE_NFC}/**)"]))
+    assert evaluate(write_req("Write", f"/p/{CAFE_NFC}/x"), p, Grants()).rule == "rule.allow"
+    result = evaluate(write_req("Write", f"/p/{CAFE_NFD}/x"), p, Grants())
+    assert (result.decision, result.rule) == (Decision.ASK, "default.ask")
+
+
+def test_an_ask_rule_still_compares_exactly():
+    p = policy(rules=RuleSet.build(ask=["Write(docs/**)"]))
+    assert evaluate(write_req("Write", "/p/docs/x"), p, Grants()).rule == "rule.ask"
+    assert evaluate(write_req("Write", "/p/DOCS/x"), p, Grants()).rule == "default.ask"
+
+
+# ---- a newline in a name is not a way past a refusal
+
+ODD = "/p/odd\ndir"
+
+
+def test_a_newline_in_a_directory_name_does_not_hide_a_file_from_a_deny_rule():
+    """The leading ``**/`` of a glob needs ``.`` to match every character of a directory
+    name, and ``.`` does not match a newline: a name nobody would choose, and one a
+    repository can hold."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(**/vault.txt)"]))
+    refusal = read_refusal(p, f"{ODD}/vault.txt")
+    assert refusal is not None and refusal.rule == "rule.deny"
+
+
+def test_a_newline_in_a_directory_name_does_not_hide_a_credentials_file():
+    refusal = read_refusal(policy(), f"{ODD}/.env")
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
+def test_a_newline_in_a_name_does_not_make_an_ordinary_file_refused():
+    assert read_refusal(policy(), f"{ODD}/notes.txt") is None
+
+
+# ---- sandbox.protected-path: files that make git or ncc run something
+
+
+def write_req(tool: str, path: str) -> PermissionRequest:
+    return PermissionRequest(tool, path, (path,), is_write=True)
+
+
+PROTECTED = [
+    "/p/.git/config",
+    "/p/.git/hooks/pre-commit",
+    "/p/sub/.git/config",  # a repository nested inside the project
+    "/p/.git",  # the pointer file a worktree or a submodule has in place of the directory
+    "/p/.nanoclaude/config.toml",
+    "/p/.nanoclaude/sessions.db",
+    "/p/sub/.nanoclaude/capabilities.json",
+    "/p/.GIT/config",  # one directory, on a filesystem that ignores case
+    "/p/.Nanoclaude/config.toml",
+]
+
+NOT_PROTECTED = [
+    "/p/src/.github/workflows/ci.yml",
+    "/p/.gitignore",
+    "/p/.gitattributes",
+    "/p/.gitmodules",
+    "/p/gitconfig",
+    "/p/dotgit/config",
+    "/p/a.git/config",
+    "/p/.nanoclaudex/config.toml",
+    "/p/nanoclaude/config.toml",
+    "/p/src/nanoclaude.py",
+]
+
+MODES = [
+    PermissionMode.DEFAULT,
+    PermissionMode.ACCEPT_EDITS,
+    PermissionMode.BYPASS,
+]
+
+
+@pytest.mark.parametrize("path", PROTECTED)
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+@pytest.mark.parametrize("mode", MODES, ids=lambda mode: mode.value)
+def test_a_write_to_a_protected_path_is_refused_in_every_mode(mode, tool, path):
+    result = evaluate(write_req(tool, path), policy(mode=mode), Grants())
+    assert (result.decision, result.rule) == (Decision.DENY, "sandbox.protected-path"), path
+    assert path in result.reason
+
+
+@pytest.mark.parametrize("path", PROTECTED)
+def test_an_always_grant_does_not_reach_a_protected_path(path):
+    result = evaluate(write_req("Write", path), policy(), Grants(tools=frozenset({"Write"})))
+    assert result.rule == "sandbox.protected-path", path
+
+
+@pytest.mark.parametrize("path", PROTECTED)
+def test_an_allow_rule_does_not_reach_a_protected_path(path):
+    p = policy(rules=RuleSet.build(allow=["Write", "Edit", "Write(**)"]))
+    assert evaluate(write_req("Write", path), p, Grants()).rule == "sandbox.protected-path", path
+
+
+def test_a_protected_path_is_refused_in_plan_mode_too_under_its_own_id():
+    result = evaluate(
+        write_req("Write", "/p/.git/config"), policy(mode=PermissionMode.PLAN), Grants()
+    )
+    assert result.rule == "sandbox.protected-path"
+
+
+@pytest.mark.parametrize("path", PROTECTED)
+@pytest.mark.parametrize("mode", [*MODES, PermissionMode.PLAN], ids=lambda mode: mode.value)
+def test_reading_a_protected_path_is_unaffected(mode, path):
+    result = evaluate(req("Read", path, (path,)), policy(mode=mode), Grants())
+    assert result.decision is Decision.ALLOW, (path, result)
+
+
+@pytest.mark.parametrize("path", NOT_PROTECTED)
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+def test_a_write_to_a_path_that_only_looks_like_a_protected_one_is_not_refused(tool, path):
+    accepting = policy(mode=PermissionMode.ACCEPT_EDITS)
+    result = evaluate(write_req(tool, path), accepting, Grants())
+    assert (result.decision, result.rule) == (Decision.ALLOW, "mode.accept-edits"), path
+    asking = evaluate(write_req(tool, path), policy(), Grants())
+    assert (asking.decision, asking.rule) == (Decision.ASK, "rule.ask"), path
+
+
+def test_a_deny_rule_of_the_users_is_still_the_reason_given_when_it_covers_the_path_too():
+    p = policy(rules=RuleSet.build(deny=["Write(**/config)"]))
+    assert evaluate(write_req("Write", "/p/.git/config"), p, Grants()).rule == "rule.deny"
+
+
+def test_the_protected_path_row_sits_with_the_hard_denials_and_before_every_mode_row():
+    """The ids a call that matches several rows is given, for the rows either side of
+    where this one belongs: after the sandbox rows and before the danger rows, the plan
+    row and the first of the rows that let a call through."""
+    outside = evaluate(write_req("Write", "/etc/.git/config"), policy(), Grants())
+    assert outside.rule == "sandbox.outside-root"  # row 3 answers first
+    classified = req(
+        "Bash",
+        "x",
+        ("/p/.git/config",),
+        is_write=True,
+        danger=DangerVerdict(DangerLevel.BLOCKED, ("test",), "regex", "blocked for the test"),
+    )
+    assert evaluate(classified, policy(), Grants()).rule == "sandbox.protected-path"
+
+
+def test_every_path_of_a_request_is_checked_not_only_the_first():
+    both = PermissionRequest("Write", "/p/a.py", ("/p/a.py", "/p/.git/config"), is_write=True)
+    assert evaluate(both, policy(mode=PermissionMode.BYPASS), Grants()).rule == (
+        "sandbox.protected-path"
+    )
+
+
+# ---- sandbox.protected-path is about the project's own .git and .nanoclaude
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "/x/.git/work",
+        "/srv/u/.nanoclaude/app",
+        "/x/.GIT/work",
+        "/x/.git/.nanoclaude/p",
+        "/.nanoclaude",
+    ],
+)
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS])
+def test_a_root_under_a_directory_with_a_protected_name_can_still_be_written_to(root, mode):
+    """The names are looked for in the path *inside* the root. A project that lives under a
+    directory called ``.git`` or ``.nanoclaude`` is not thereby a place nothing may be
+    written."""
+    p = policy(sandbox=Sandbox((root,)), mode=mode)
+    result = evaluate(write_req("Write", f"{root}/src/a.py"), p, Grants())
+    assert result.rule != "sandbox.protected-path", (root, result)
+    assert result.decision is not Decision.DENY, (root, result)
+
+
+@pytest.mark.parametrize("root", ["/x/.git/work", "/srv/u/.nanoclaude/app", "/p"])
+@pytest.mark.parametrize(
+    "inside", [".git/config", ".git/hooks/pre-commit", ".nanoclaude/config.toml", "sub/.git/x"]
+)
+def test_the_roots_own_git_and_nanoclaude_are_protected_wherever_the_root_is(root, inside):
+    for mode in (PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.BYPASS):
+        p = policy(sandbox=Sandbox((root,)), mode=mode)
+        result = evaluate(write_req("Write", f"{root}/{inside}"), p, Grants())
+        assert (result.decision, result.rule) == (Decision.DENY, "sandbox.protected-path")
+        assert inside in result.reason
+
+
+def test_the_root_itself_is_never_a_protected_path():
+    p = policy(sandbox=Sandbox(("/x/.git/work",)))
+    result = evaluate(write_req("Write", "/x/.git/work"), p, Grants())
+    assert result.rule != "sandbox.protected-path"
+
+
+def test_a_path_in_any_root_is_judged_against_that_root_and_against_every_root_holding_it():
+    two = policy(sandbox=Sandbox(("/p", "/q/.git/work")))
+    assert evaluate(write_req("Write", "/p/.git/x"), two, Grants()).rule == "sandbox.protected-path"
+    assert evaluate(write_req("Write", "/q/.git/work/a.py"), two, Grants()).decision is not (
+        Decision.DENY
+    )
+    assert (
+        evaluate(write_req("Write", "/q/.git/work/.git/x"), two, Grants()).rule
+        == "sandbox.protected-path"
+    )
+    # one root inside another: the outer one sees .git in the path, and that is enough
+    nested = policy(sandbox=Sandbox(("/p", "/p/.git/vendor")))
+    result = evaluate(write_req("Write", "/p/.git/vendor/x.txt"), nested, Grants())
+    assert result.rule == "sandbox.protected-path"
+
+
+def test_a_sibling_that_only_shares_a_roots_prefix_is_not_inside_it():
+    """``/p-evil/.git/x`` is outside ``/p``; the sandbox rows answer that, not this one."""
+    result = evaluate(write_req("Write", "/p-evil/.git/x"), policy(), Grants())
+    assert result.rule == "sandbox.outside-root"
+
+
+def test_the_protected_path_row_sits_after_the_credentials_row():
+    """A write both rows refuse is reported by the one that comes first in the order."""
+    both = write_req("Write", "/p/.git/.env")
+    assert evaluate(both, policy(), Grants()).rule == "secret.path"
+    assert evaluate(both, policy(mode=PermissionMode.BYPASS), Grants()).rule == "secret.path"
+    # With the credentials row off, the next row answers.
+    opted_in = policy(allow_secrets=True)
+    assert evaluate(both, opted_in, Grants()).rule == "sandbox.protected-path"
+
+
+def test_the_protected_path_row_sits_after_a_deny_rule():
+    p = policy(rules=RuleSet.build(deny=["Write(**/.env)"]))
+    assert evaluate(write_req("Write", "/p/.git/.env"), p, Grants()).rule == "rule.deny"

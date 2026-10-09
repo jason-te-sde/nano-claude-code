@@ -222,6 +222,41 @@ async def test_what_is_typed_is_kept_for_the_next_session(keyboard, tmp_path):
     assert [line async for line in later.history.load()] == ["fix the parser"]
 
 
+async def test_the_history_file_and_its_directory_are_private_from_the_start(
+    keyboard, tmp_path, private_from_the_start
+):
+    from tests.conftest import mode_of
+
+    history = tmp_path / ".nanoclaude" / "history"
+    keyboard.send_text("fix the parser\r")
+    await session_on(keyboard, tmp_path, history).prompt_async("> ")
+    assert (mode_of(history.parent), mode_of(history)) == (0o700, 0o600)
+    assert "fix the parser" in history.read_text()
+
+
+def test_a_history_an_earlier_version_made_open_to_others_is_narrowed(keyboard, tmp_path):
+    from tests.conftest import mode_of
+
+    history = tmp_path / ".nanoclaude" / "history"
+    history.parent.mkdir()
+    history.parent.chmod(0o755)
+    history.write_text("\n# 2026-01-01 00:00:00\n+an earlier line\n")
+    history.chmod(0o644)
+    session_on(keyboard, tmp_path, history)
+    assert (mode_of(history.parent), mode_of(history)) == (0o700, 0o600)
+    assert "an earlier line" in history.read_text()
+
+
+def test_the_history_file_exists_and_is_private_before_anything_is_typed(
+    keyboard, tmp_path, private_from_the_start
+):
+    from tests.conftest import mode_of
+
+    history = tmp_path / ".nanoclaude" / "history"
+    session_on(keyboard, tmp_path, history)
+    assert mode_of(history) == 0o600
+
+
 async def test_an_earlier_line_can_be_found_by_searching_backwards(keyboard, tmp_path):
     session = session_on(keyboard, tmp_path)
     keyboard.send_text("alpha one\r")

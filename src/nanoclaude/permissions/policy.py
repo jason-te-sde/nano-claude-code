@@ -5,6 +5,13 @@ sequence of early returns, in the order given in spec 6.2. The first five checks
 are the hard-denial band: no mode, no rule and no session grant can get past
 them, which is why ``BYPASS`` sits *after* them rather than at the top.
 
+One rule id is not in spec 17.4's table: ``sandbox.protected-path``. It is a sixth row
+of the hard-denial band, between the sandbox rows and the danger rows, and it refuses a
+write to any file git or ncc itself reads its behaviour from (see
+:data:`PROTECTED_DIRECTORIES`). The table is extended the way ``tool.internal-error``
+extended it, because the spec's sandbox rows answer where a path is and none of them
+answers what it is.
+
 Nothing here touches the filesystem. Paths arriving in a
 :class:`PermissionRequest` are already resolved -- following a symlink after the
 permission check is how sandboxes get escaped.
@@ -17,7 +24,7 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 
 from nanoclaude.permissions.danger import DangerLevel, DangerVerdict
-from nanoclaude.permissions.rules import RuleSet, glob_matches_any
+from nanoclaude.permissions.rules import RuleSet, fold_spelling, glob_matches_any
 from nanoclaude.permissions.sandbox import Sandbox, is_within
 
 #: Tools that cannot change anything, and so never need confirming on their own.
@@ -32,6 +39,41 @@ ALLOWED_WITHOUT_ASKING = READ_ONLY_TOOLS | {"TodoWrite"}
 
 #: Tools ACCEPT_EDITS mode auto-approves.
 EDIT_TOOLS = frozenset({"Edit", "Write"})
+
+#: Directories whose files make git or ncc run something, or change how they behave: git
+#: runs what ``.git/config`` and ``.git/hooks`` name (a hook at the next commit the person
+#: makes, ``core.fsmonitor`` at the next ``git status`` they run), and ncc reads its own
+#: configuration, its capability cache and its session store from ``.nanoclaude``. A write
+#: to one is a way for a tool call to run code that no confirmation described, so it is
+#: refused whatever the mode. They are looked for in the part of a path inside a sandbox root
+#: (see :func:`protected_directory`). Names are compared after ``fold_spelling`` (rules.py), since
+#: the filesystems people use most (macOS's default among them) treat ``.GIT`` as ``.git``;
+#: that errs towards refusing, which is the safe side for a refusal.
+PROTECTED_DIRECTORIES = (".git", ".nanoclaude")
+
+
+def protected_directory(path: str, sandbox: Sandbox) -> str | None:
+    """The protected directory ``path`` is inside, or is, within a sandbox root, or None.
+
+    The names are looked for in the part of the path *inside* a root, not in the whole of
+    it: a project that lives under a directory called ``.git`` or ``.nanoclaude`` (a clone
+    kept in ``~/.nanoclaude/projects/app``, say) is not thereby a place nothing may be
+    written, while its own ``.git/`` is. A path is judged against every root that holds it,
+    and one of them seeing a protected name is enough, so that a root added inside another
+    (``--add-dir``) cannot be a way to write what the outer one protects.
+
+    A ``.git`` that is a file (a worktree's or a submodule's pointer to its repository)
+    counts: rewriting it points git somewhere else. Components are compared whole, so
+    ``.github`` and ``.gitignore`` are nothing to do with it.
+    """
+    for root in sandbox.roots:
+        if not is_within(root, path):
+            continue
+        for part in PurePosixPath(path).relative_to(root).parts:
+            folded = fold_spelling(part)
+            if folded in PROTECTED_DIRECTORIES:
+                return folded
+    return None
 
 
 class PermissionMode(StrEnum):
@@ -191,6 +233,28 @@ def _unpromotable(danger: DangerVerdict | None) -> bool:
     return danger is not None and danger.level is DangerLevel.SAFE and not danger.authoritative
 
 
+def read_refusal(policy: Policy, *paths: str) -> PermissionResult | None:
+    """Why ``policy`` refuses to show the model this file, or None when it does not.
+
+    The Read tool is one way a file's contents reach the model; Grep's matches, an ``@``
+    mention inlined into a prompt and whatever comes next are others, and a rule that
+    refuses the first has to hold for all of them. They all ask this, which asks
+    :func:`evaluate` the question Read itself would be asked, so that what they refuse can
+    never drift away from what Read refuses: a ``Read(...)`` deny rule, a credentials path
+    (unless ``allow_secrets``), a path outside the sandbox. Only the hard-denial rows can
+    answer no to a read, so a verdict that is anything but a deny is a yes.
+
+    A file reached through a link has more than one spelling -- the link's own, and what it
+    resolves to -- and any of them being refused refuses the file: ``paths`` are all
+    spellings of one file, and the first refusal is the one returned.
+    """
+    for path in paths:
+        verdict = evaluate(PermissionRequest("Read", path, (path,)), policy)
+        if verdict.decision is Decision.DENY:
+            return verdict
+    return None
+
+
 def evaluate(
     request: PermissionRequest, policy: Policy, grants: Grants = _NO_GRANTS
 ) -> PermissionResult:
@@ -204,7 +268,7 @@ def evaluate(
     # 2. secret.path
     if not policy.allow_secrets:
         for path in request.resolved_paths:
-            if glob_matches_any(policy.secret_paths, (path, policy.relative(path))):
+            if glob_matches_any(policy.secret_paths, (path, policy.relative(path)), fold=True):
                 return PermissionResult(
                     Decision.DENY,
                     "secret.path",
@@ -243,6 +307,19 @@ def evaluate(
                     f"{path} is outside the working directory ({roots}). Use --add-dir to widen it."
                 )
             return PermissionResult(Decision.DENY, violation, message)
+
+    # 3b. sandbox.protected-path -- not in spec 17.4's table; see the module docstring.
+    if request.is_write:
+        for path in request.resolved_paths:
+            protected = protected_directory(path, policy.sandbox)
+            if protected is not None:
+                return PermissionResult(
+                    Decision.DENY,
+                    "sandbox.protected-path",
+                    f"{path} is inside {protected}, where git or ncc keeps files it runs or "
+                    "obeys. No mode or rule allows a write there. Make that change yourself, "
+                    "outside the agent.",
+                )
 
     # 4. bash.dangerous / bash.unparseable
     if request.danger is not None:

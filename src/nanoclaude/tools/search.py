@@ -7,17 +7,23 @@ fallback does the same job slowly, because "install ripgrep first" is not an
 acceptable thing to say to someone who just ran pipx install.
 
 The two backends are covered by the same test so the fallback cannot quietly
-become a different tool with the same name.
+become a different tool with the same name. That includes links: ripgrep does not
+follow a symbolic link, to a file or to a directory, so a file is searched under the
+name it really has and never through a link to it. The fallback does the same.
+Following links is how a link inside the project to a file outside it would have its
+lines returned.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +52,21 @@ class Match:
     is_context: bool = False
 
 
+def _decoded(field: Mapping[str, str], *, as_path: bool) -> str:
+    """The text of a path or a line in ripgrep's JSON: ``{"text": ...}``, or ``{"bytes": ...}``.
+
+    ripgrep reports the second for a name or a line that is not valid UTF-8, as base64 of the
+    bytes. A path is decoded the way the operating system decodes a name (undecodable bytes
+    become lone surrogates, which ``os.fsencode`` turns back into the same bytes), so that
+    it is judged and opened as what it is; a line is decoded with replacement characters,
+    since it is only shown.
+    """
+    if "text" in field:
+        return field["text"]
+    raw = base64.b64decode(field["bytes"])
+    return os.fsdecode(raw) if as_path else raw.decode("utf-8", errors="replace")
+
+
 def ripgrep_available() -> bool:
     return shutil.which("rg") is not None
 
@@ -58,8 +79,20 @@ def _ignore_spec(root: str) -> pathspec.PathSpec[PathspecPattern]:
     return pathspec.PathSpec.from_lines(GLOB_PATTERN_FACTORY, lines)
 
 
-def walk_files(root: str, *, pattern: str | None = None, limit: int = DEFAULT_LIMIT) -> list[str]:
-    """Absolute paths under ``root``, gitignore-aware, most recently modified first."""
+def walk_files(
+    root: str,
+    *,
+    pattern: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    keep: Callable[[str], bool] | None = None,
+) -> list[str]:
+    """Absolute paths under ``root``, gitignore-aware, most recently modified first.
+
+    ``keep`` is asked about each path that would otherwise be listed, and a path it
+    refuses is not. It is asked before ``limit`` is applied, not after: a refusal made
+    on the capped list would let a directory of refused entries crowd out every other.
+    A link to a directory is not entered, whatever it leads to.
+    """
     ignore = _ignore_spec(root)
     glob_spec = pathspec.PathSpec.from_lines(GLOB_PATTERN_FACTORY, [pattern]) if pattern else None
     found: list[tuple[float, str]] = []
@@ -81,6 +114,8 @@ def walk_files(root: str, *, pattern: str | None = None, limit: int = DEFAULT_LI
             if ignore.match_file(relative):
                 continue
             if glob_spec is not None and not glob_spec.match_file(relative):
+                continue
+            if keep is not None and not keep(absolute):
                 continue
             try:
                 found.append((os.path.getmtime(absolute), absolute))  # noqa: PTH204
@@ -167,6 +202,7 @@ def ripgrep_search(
     limit: int = DEFAULT_LIMIT,
     before: int = 0,
     after: int = 0,
+    keep: Callable[[str], bool] | None = None,
 ) -> list[Match]:
     # --hidden and the /.git/ exclusion bring this in line with walk_files,
     # which already includes dotfiles (Grep's own secret-file filter depends
@@ -204,11 +240,17 @@ def ripgrep_search(
         if event_type not in ("match", "context"):
             continue
         data = event["data"]
+        path = _decoded(data["path"], as_path=True)
+        # A path the caller does not want is dropped here, before the limit is applied
+        # and not after: a refused file's matches must not use up a limit that the files
+        # that are shown would have filled.
+        if keep is not None and not keep(path):
+            continue
         matches.append(
             Match(
-                data["path"]["text"],
+                path,
                 data["line_number"],
-                data["lines"]["text"].rstrip("\n"),
+                _decoded(data["lines"], as_path=False).rstrip("\n"),
                 is_context=event_type == "context",
             )
         )
@@ -229,14 +271,19 @@ def python_search(
     limit: int = DEFAULT_LIMIT,
     before: int = 0,
     after: int = 0,
+    keep: Callable[[str], bool] | None = None,
 ) -> list[Match]:
     regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     matches: list[Match] = []
-    for path in sorted(walk_files(root, pattern=glob and f"**/{glob}", limit=10_000)):
+    # keep is asked while walking, before a file is opened and before any limit applies: a
+    # file the caller does not want is not read, and its matches cannot use up the limit.
+    for path in sorted(walk_files(root, pattern=glob and f"**/{glob}", limit=10_000, keep=keep)):
         try:
-            status = Path(path).stat()
+            # lstat, not stat: a link is not a regular file, so one is not opened, which
+            # is what ripgrep does and what keeps a link from reading a file it leads to.
             # Only a regular file is opened: reading a FIFO waits for a writer, and a
             # device may never end.
+            status = Path(path).lstat()
             if not stat.S_ISREG(status.st_mode) or status.st_size > MAX_SEARCH_BYTES:
                 continue
             data = Path(path).read_bytes()
@@ -282,7 +329,14 @@ def search(
     limit: int = DEFAULT_LIMIT,
     before: int = 0,
     after: int = 0,
+    keep: Callable[[str], bool] | None = None,
 ) -> list[Match]:
+    """Matches of ``pattern`` under ``root``, with at most ``limit`` of them.
+
+    ``keep`` is asked about the path of each file that has a match, and a file it refuses
+    contributes nothing, matches or context, to the result or to the count the limit is
+    applied to.
+    """
     backend = ripgrep_search if ripgrep_available() else python_search
     return backend(
         pattern,
@@ -292,4 +346,5 @@ def search(
         limit=limit,
         before=before,
         after=after,
+        keep=keep,
     )

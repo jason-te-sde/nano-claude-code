@@ -24,6 +24,7 @@ from nanoclaude.tools.base import (
     require_str,
 )
 from nanoclaude.tools.fs import FileSystemError, read_text
+from nanoclaude.tools.keyblocks import mask_window
 
 DEFAULT_LIMIT = 2000
 MAX_LINE_CHARS = 2000
@@ -95,8 +96,16 @@ class ReadTool:
         header = f"{shown} ({len(lines)} lines)"
         if len(window) < len(lines):
             header += f", showing {offset}-{offset + len(window) - 1}"
+        # The extent of a private key block is worked out on the whole file and the window is
+        # cut afterwards: scrubbed on its own, a window that begins or ends inside a block
+        # shows the key, since nothing in it says it is one.
         body = (
-            "\n".join(f"{offset + i}\t{_clip(line)}" for i, line in enumerate(window))
+            "\n".join(
+                f"{number}\t{_clip(text)}"
+                for number, text in mask_window(
+                    ctx.redactor, snapshot.content, lines, offset, limit
+                )
+            )
             if lines
             else "(empty file)"
         )
