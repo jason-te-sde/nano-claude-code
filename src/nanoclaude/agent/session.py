@@ -364,6 +364,8 @@ class Session:
             self.root,
             cwd=self.root,
             home=self.home,
+            policy=self.policy,
+            redactor=self.redactor,
             tool_protocol=None if native else render_tools(specs),
         )
         return f"{context.system}\n\n{context.environment}", specs if native else ()

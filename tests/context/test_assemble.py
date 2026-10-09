@@ -6,26 +6,27 @@ from typing import Any
 
 import pytest
 
-from nanoclaude.context.assemble import assemble, environment_block, git_state
+from nanoclaude.context.assemble import environment_block, git_state
 from nanoclaude.context.git import EMPTY_TREE, run_git
+from tests.context.helpers import assemble_in
 
 
 def test_the_system_prompt_is_identical_across_two_assemblies(tmp_repo):
     """Prompt caching needs a byte-stable prefix; a timestamp here would cost it."""
-    first = assemble(str(tmp_repo), cwd=str(tmp_repo), home=None)
-    second = assemble(str(tmp_repo), cwd=str(tmp_repo), home=None)
+    first = assemble_in(tmp_repo)
+    second = assemble_in(tmp_repo)
     assert first.system == second.system
 
 
 def test_git_state_is_in_the_environment_block_not_the_system_prompt(tmp_repo):
     """It changes during a session, so it must sit outside the cached prefix."""
-    context = assemble(str(tmp_repo), cwd=str(tmp_repo), home=None)
+    context = assemble_in(tmp_repo)
     assert "git branch" not in context.system
 
 
 def test_instructions_reach_the_system_prompt(tmp_repo):
     (tmp_repo / "NANO.md").write_text("Never touch migrations/.\n")
-    assert "migrations" in assemble(str(tmp_repo), cwd=str(tmp_repo), home=None).system
+    assert "migrations" in assemble_in(tmp_repo).system
 
 
 def test_a_directory_that_is_not_a_git_repository_still_works(tmp_path):
@@ -71,7 +72,7 @@ def test_real_git_state_stays_out_of_the_system_prompt_and_in_the_environment(tm
     claims to verify. This repeats it with real content.
     """
     _init_real_repo(tmp_repo)
-    context = assemble(str(tmp_repo), cwd=str(tmp_repo), home=None)
+    context = assemble_in(tmp_repo)
     assert "git branch" not in context.system
     assert "git branch: main" in context.environment
 
@@ -125,7 +126,7 @@ def _assert_runs_it_plain_and_not_when_assembling(
 
     if stale is not None:
         _make_stale(stale)
-    context = assemble(str(repo), cwd=str(repo), home=None)
+    context = assemble_in(repo)
 
     assert not marker.exists(), "assembling the context ran a program the repository named"
     # Not kept from running by git failing altogether.
@@ -244,7 +245,7 @@ def test_the_only_git_commands_assembling_context_runs_are_rev_parse_forms(repo,
         return real(argv, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", recording)
-    assemble(str(repo), cwd=str(repo), home=None)
+    assemble_in(repo)
     git_calls = [argv for argv in seen if argv and argv[0] == "git"]
     assert git_calls, "assembling the context asked git nothing; the test proves nothing"
     assert {argv[3] for argv in git_calls} == {"rev-parse"}, git_calls

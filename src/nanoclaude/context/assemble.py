@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from nanoclaude.context.git import run_git
 from nanoclaude.context.instructions import load_instructions
 from nanoclaude.context.projectmap import project_map
+from nanoclaude.permissions.policy import Policy
+from nanoclaude.permissions.redact import Redactor
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,11 +56,18 @@ def environment_block(root: str, *, depth: int = 3) -> str:
 
 
 def assemble(
-    root: str, *, cwd: str, home: str | None, tool_protocol: str | None = None, depth: int = 3
+    root: str,
+    *,
+    cwd: str,
+    home: str | None,
+    policy: Policy,
+    redactor: Redactor,
+    tool_protocol: str | None = None,
+    depth: int = 3,
 ) -> AssembledContext:
     from nanoclaude.prompts import build_system_prompt
 
-    instructions = load_instructions(root, cwd=cwd, home=home)
+    instructions = load_instructions(root, cwd=cwd, home=home, policy=policy, redactor=redactor)
     return AssembledContext(
         system=build_system_prompt(root, instructions=instructions, tool_protocol=tool_protocol),
         environment=environment_block(root, depth=depth),

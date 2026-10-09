@@ -19,6 +19,7 @@ a delay of a millisecond, and cancellation is driven with events.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import json
 import re
@@ -2354,6 +2355,42 @@ async def test_global_instructions_come_from_the_sessions_home(tmp_repo):
     session = build_session(tmp_repo, [says("ok")], home=home)
     await session.run("hello")
     assert "Always answer in haiku." in session.model.requests[0].system
+
+
+async def test_an_instruction_file_that_leads_out_of_the_root_is_not_in_the_request(tmp_repo):
+    outside = tmp_repo.parent / f"{tmp_repo.name}-outside"
+    outside.mkdir()
+    (outside / "private.txt").write_text("outside secret: orange\n")
+    (tmp_repo / "NANO.md").symlink_to(outside / "private.txt")
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    assert "orange" not in session.model.requests[0].system
+
+
+async def test_the_instructions_in_the_request_are_scrubbed_by_the_sessions_redactor(tmp_repo):
+    token = "ghp_" + hashlib.sha256(b"session").hexdigest()[:36]
+    (tmp_repo / "NANO.md").write_text(f"Deploy with {token}.\n")
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert token not in system and "Deploy with" in system
+
+
+async def test_the_instructions_are_scrubbed_by_the_redactor_the_session_holds(tmp_repo):
+    token = "ghp_" + hashlib.sha256(b"session-own").hexdigest()[:36]
+    (tmp_repo / "NANO.md").write_text(f"Deploy with {token}.\n")
+    session = build_session(tmp_repo, [says("ok")])
+    session.redactor = replace(session.redactor, enabled=False)
+    await session.run("hello")
+    assert token in session.model.requests[0].system
+
+
+async def test_a_read_deny_rule_keeps_an_instruction_file_out_of_the_request(tmp_repo):
+    (tmp_repo / "NANO.md").write_text("Never mention the orange.\n")
+    session = build_session(tmp_repo, [says("ok")])
+    session.policy = replace(session.policy, rules=RuleSet.build(deny=["Read(NANO.md)"]))
+    await session.run("hello")
+    assert "orange" not in session.model.requests[0].system
 
 
 async def test_the_todo_list_the_model_writes_is_the_one_the_session_holds(tmp_repo):
