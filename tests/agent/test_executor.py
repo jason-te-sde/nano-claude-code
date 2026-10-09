@@ -1139,6 +1139,183 @@ def test_a_keyboard_interrupt_at_a_confirmation_also_ends_the_call_as_cancelled(
     assert _outcomes(store) == {"t1": "cancelled"}
 
 
+# --- The close-out: audit first, no shared state, nothing replaces the original exception
+
+
+class _Watching(AutoApprove):
+    """Looks in the audit at the moment it is told of an outcome."""
+
+    def __init__(self, store: Store, *, raises: Exception | None = None) -> None:
+        self.store = store
+        self.raises = raises
+        self.seen: dict[str, str | None] = {}
+
+    def on_outcome(self, call: ToolUseBlock, _outcome: ToolOutcome) -> None:
+        self.seen[call.id] = _outcomes(self.store).get(call.id, "no row")
+        if self.raises is not None:
+            raise self.raises
+
+
+async def test_a_calls_outcome_is_in_the_audit_before_the_ui_is_told_of_it(policy, tmp_repo):
+    store = _store(tmp_repo)
+    (tmp_repo / "a.py").write_text("a\n")
+    ui = _Watching(store)
+    await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}), _write_call("t2")), start("hi")
+    )
+    assert ui.seen == {"t1": "ok", "t2": "ok"}
+
+
+async def test_an_error_outcome_is_in_the_audit_before_the_ui_is_told_of_it(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    def breaks(self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]) -> PermissionRequest:
+        raise RuntimeError("the tool broke")
+
+    monkeypatch.setattr(ReadTool, "permission_request", breaks)
+    store = _store(tmp_repo)
+    ui = _Watching(store)
+    await executor(policy, ui, store).run_batch(
+        (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+    )
+    assert ui.seen == {"t1": "error"}
+
+
+async def test_a_ui_that_raises_when_told_of_an_outcome_leaves_the_calls_own_outcome(
+    policy, tmp_repo
+):
+    """The call ran and succeeded; the front end then broke. The audit says what happened to
+    the call, and the call that never got to run is closed as an error."""
+    store = _store(tmp_repo)
+    ui = _Watching(store, raises=RuntimeError("the screen broke"))
+    ex = executor(policy, ui, store)
+    with pytest.raises(RuntimeError, match="the screen broke"):
+        await ex.run_batch((_write_call("t1"), _write_call("t2")), start("hi"))
+    outcomes = _outcomes(store)
+    assert outcomes["t1"] == "ok"
+    assert outcomes["t2"] == "error"
+    assert (tmp_repo / "t1.txt").exists()
+
+
+async def test_a_ui_that_raises_for_a_call_that_broke_leaves_that_calls_error(
+    policy, tmp_repo, monkeypatch
+):
+    from nanoclaude.tools.read import ReadTool
+
+    def breaks(self: ReadTool, ctx: ToolContext, arguments: Mapping[str, Any]) -> PermissionRequest:
+        raise RuntimeError("the tool broke")
+
+    monkeypatch.setattr(ReadTool, "permission_request", breaks)
+    store = _store(tmp_repo)
+    ui = _Watching(store, raises=RuntimeError("the screen broke"))
+    with pytest.raises(RuntimeError, match="the screen broke"):
+        await executor(policy, ui, store).run_batch(
+            (ToolUseBlock("t1", "Read", {"path": "a.py"}),), start("hi")
+        )
+    row = _audit_row(store, "t1")
+    assert row["outcome"] == "error" and "the tool broke" in row["error"]
+
+
+async def test_the_executor_keeps_no_record_of_a_batch_between_one_run_and_the_next(
+    policy, tmp_repo
+):
+    ex = executor(policy, AutoApprove(), _store(tmp_repo))
+    await ex.run_batch((_write_call("t1"),), start("hi"))
+    assert not hasattr(ex, "_unfinished")
+
+
+async def test_two_batches_on_one_executor_do_not_close_each_others_calls(policy, tmp_repo):
+    """A batch that is still waiting at a confirmation while another runs through must find
+    its own calls owed an outcome when it is cancelled; the other batch finishing is not a
+    reason to forget them."""
+    store = _store(tmp_repo)
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+
+    class Slow(SilentUI):
+        async def confirm(
+            self, call: ToolUseBlock, _request: PermissionRequest, _result: PermissionResult
+        ) -> Approval:
+            if call.id == "slow":
+                waiting.set()
+                await release.wait()
+            return Approval.ONCE
+
+    ex = executor(policy, Slow(), store)
+    first = asyncio.create_task(ex.run_batch((_write_call("slow"),), start("hi")))
+    await asyncio.wait_for(waiting.wait(), timeout=5)
+    await ex.run_batch((_write_call("quick"),), start("hi"))
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert _outcomes(store) == {"slow": "cancelled", "quick": "ok"}
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        RuntimeError("boom"),
+        ValueError("boom"),
+        TypeError("boom"),
+        OSError("boom"),
+        KeyError("boom"),
+    ],
+    ids=lambda failure: type(failure).__name__,
+)
+async def test_nothing_the_close_out_raises_replaces_the_exception_that_stopped_the_batch(
+    policy, tmp_repo, monkeypatch, failure
+):
+    def failing(*_args: object, **_kwargs: object) -> Never:
+        raise failure
+
+    store = _store(tmp_repo)
+    ex = executor(policy, _Answers({"t1": asyncio.CancelledError()}), store)
+    monkeypatch.setattr(AuditLog, "record_outcome", failing)
+    with pytest.raises(asyncio.CancelledError):
+        await ex.run_batch((_write_call("t1"), _write_call("t2")), start("hi"))
+
+
+async def test_a_call_the_close_out_could_not_record_does_not_stop_it_recording_the_others(
+    policy, tmp_repo, monkeypatch
+):
+    real = AuditLog.record_outcome
+
+    def fails_for_the_first(self: AuditLog, session_id: str, call_id: str, **kwargs: Any) -> None:
+        if call_id == "t1":
+            raise ValueError("the first row is bad")
+        real(self, session_id, call_id, **kwargs)
+
+    store = _store(tmp_repo)
+    ex = executor(policy, _Answers({"t1": asyncio.CancelledError()}), store)
+    monkeypatch.setattr(AuditLog, "record_outcome", fails_for_the_first)
+    with pytest.raises(asyncio.CancelledError):
+        await ex.run_batch((_write_call("t1"), _write_call("t2")), start("hi"))
+    assert _outcomes(store) == {"t1": None, "t2": "cancelled"}
+
+
+def test_a_keyboard_interrupt_raised_by_the_close_out_is_not_swallowed(
+    policy, tmp_repo, monkeypatch
+):
+    """Only what is an Exception is held back; the person pressing Ctrl+C again while the
+    close-out runs is the person stopping it."""
+
+    def interrupted(*_args: object, **_kwargs: object) -> Never:
+        raise KeyboardInterrupt
+
+    store = _store(tmp_repo)
+    ex = executor(policy, _Answers({"t1": RuntimeError("the front end broke")}), store)
+    monkeypatch.setattr(AuditLog, "record_outcome", interrupted)
+    batch = ex.run_batch((_write_call("t1"),), start("hi"))
+    loop = asyncio.new_event_loop()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            loop.run_until_complete(batch)
+    finally:
+        loop.close()
+
+
 async def test_an_exception_that_is_not_an_exception_still_propagates(
     policy, tmp_repo, monkeypatch
 ):
