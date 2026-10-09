@@ -24,11 +24,13 @@ import os
 import re
 from collections import Counter
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from nanoclaude.permissions.policy import PermissionRequest, read_refusal
 from nanoclaude.providers.base import ToolSpec
 from nanoclaude.tools.base import ToolContext, ToolOutcome, failed, ok, optional_int, require_str
+from nanoclaude.tools.keyblocks import PRIVATE_KEY_MARKER, masked_line_numbers
 from nanoclaude.tools.search import Match, search
 
 DESCRIPTION = """Search file contents with a regular expression.
@@ -114,6 +116,9 @@ class GrepTool:
         if not matches:
             return ok(call_id, f"No matches for {pattern}")
 
+        if mode == "content":
+            matches = self._mask_private_keys(ctx, matches)
+
         match_count = sum(1 for m in matches if not m.is_context)
         if mode == "files":
             body = "\n".join(sorted({ctx.display(m.path) for m in matches}))
@@ -165,6 +170,29 @@ class GrepTool:
             lines.append(f"{display}{sep}{m.line_no}{sep}{m.line.strip()}")
             previous = (m.path, m.line_no)
         return "\n".join(lines)
+
+    @staticmethod
+    def _mask_private_keys(ctx: ToolContext, matches: list[Match]) -> list[Match]:
+        """Replace the text of every shown line that is inside a private key block.
+
+        Matches and context lines alike. Whether a line is inside a block is a fact about the
+        whole file, which no scrub of the lines shown can know: a search for a piece of a key's
+        body shows a line of base64 that is not recognisable as anything. It is worked out only
+        for the files that have lines to show, after the limit has been applied, reading each
+        as a stream as far as the last line shown from it.
+        """
+        last: dict[str, int] = {}
+        for match in matches:
+            last[match.path] = max(last.get(match.path, 0), match.line_no)
+        masked = {
+            path: masked_line_numbers(ctx.redactor, path, upto=upto) for path, upto in last.items()
+        }
+        return [
+            replace(match, line=PRIVATE_KEY_MARKER)
+            if match.line_no in masked[match.path]
+            else match
+            for match in matches
+        ]
 
     @staticmethod
     def _readability(ctx: ToolContext) -> Callable[[str], bool]:

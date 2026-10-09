@@ -99,6 +99,13 @@ SECRET_PATH_PATTERNS: tuple[str, ...] = (
 
 _PEM_BEGIN = r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----"
 _PEM_END = r"-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----"
+#: The two ends of a block, for what has to find them without running the whole recogniser
+#: (``tools/keyblocks.py`` reads a file as a stream, and runs it over each block it gathers).
+PRIVATE_KEY_BEGIN = re.compile(_PEM_BEGIN)
+PRIVATE_KEY_END = re.compile(_PEM_END)
+#: What a private key block is replaced with: the whole of it by :meth:`Redactor.scrub`, and the
+#: lines of it that a window of a file shows by ``tools/keyblocks.py``.
+PRIVATE_KEY_MARKER = "[redacted:private-key]"
 #: One break between lines of a block, as a file has it or as a string holding it does
 #: (a JSON value has ``\n`` written out).
 _PEM_BREAK = r"(?:[ \t]*\r?\n|\\r\\n|\\n)[ \t]*"
@@ -292,6 +299,18 @@ class Redactor:
         text = _URL_PASSWORD.sub(_url_password, text)
         text = _ASSIGNED.sub(_assigned, text)
         return text, replacements
+
+    def private_key_spans(self, text: str) -> tuple[tuple[int, int], ...]:
+        """The ranges of ``text`` (start, end, as ``re`` gives them) that are private key blocks.
+
+        These are exactly the ranges :meth:`scrub` masks as ``private-key``, found by the same
+        regular expression, and none when redaction is off. A window of a file is cut from the
+        whole of it and its lines masked by these ranges: the extent of a block cannot be told
+        from a window that begins or ends inside it.
+        """
+        if not self.enabled:
+            return ()
+        return tuple(match.span() for match in _PRIVATE_KEY.finditer(text))
 
     def is_secret_path(self, absolute: str, relative: str) -> bool:
         # The shared matcher rather than a pathspec of its own: it already tries

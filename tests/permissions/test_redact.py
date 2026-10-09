@@ -934,3 +934,48 @@ def test_a_hyphenated_name_with_the_keyword_in_the_middle_is_a_secret_as_it_is_w
     assert value not in cleaned and count == 1, cleaned
     underscored = template.replace("-", "_").format(v=value)
     assert Redactor().scrub(underscored)[1] == 1, underscored
+
+
+# ---- the ranges the scrubber masks, for what has to cut a window out of a whole file
+
+
+def test_private_key_spans_are_the_ranges_scrub_masks():
+    block, _ = _pem(lines=3)
+    text = f"before\n{block}\nafter"
+    ((start, end),) = Redactor().private_key_spans(text)
+    assert text[start:end] == block
+    assert Redactor().scrub(text)[0] == text[:start] + "[redacted:private-key]" + text[end:]
+
+
+def test_there_is_a_span_for_each_key_and_none_for_a_public_key():
+    first, _ = _pem(lines=2)
+    second, _ = _pem("EC PRIVATE KEY", lines=2)
+    public, _ = _pem("PUBLIC KEY", lines=2)
+    spans = Redactor().private_key_spans(f"{first}\n{public}\n{second}\n")
+    assert len(spans) == 2
+
+
+def test_a_key_cut_off_before_its_end_has_a_span_as_far_as_it_looks_like_one():
+    block, _ = _pem(lines=3)
+    cut = "\n".join(block.split("\n")[:-1])
+    text = f"{cut}\nnot part of it"
+    ((start, end),) = Redactor().private_key_spans(text)
+    assert text[start:end] == cut
+
+
+def test_there_are_no_spans_when_redaction_is_off_or_there_is_no_key():
+    block, _ = _pem()
+    assert Redactor(enabled=False).private_key_spans(block) == ()
+    assert Redactor().private_key_spans("just text\nmore text") == ()
+    assert Redactor().private_key_spans("") == ()
+
+
+def test_the_begin_and_end_patterns_name_what_the_recogniser_starts_and_ends_on():
+    from nanoclaude.permissions.redact import PRIVATE_KEY_BEGIN, PRIVATE_KEY_END, PRIVATE_KEY_MARKER
+
+    for kind in ("RSA PRIVATE KEY", "PRIVATE KEY", "OPENSSH PRIVATE KEY", "PGP PRIVATE KEY BLOCK"):
+        assert PRIVATE_KEY_BEGIN.search(f"x -----BEGIN {kind}----- y")
+        assert PRIVATE_KEY_END.search(f"x -----END {kind}----- y")
+    assert not PRIVATE_KEY_BEGIN.search("-----BEGIN PUBLIC KEY-----")
+    assert not PRIVATE_KEY_END.search("-----END CERTIFICATE-----")
+    assert Redactor().scrub(_pem()[0])[0] == PRIVATE_KEY_MARKER

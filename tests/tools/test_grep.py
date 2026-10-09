@@ -1,3 +1,4 @@
+import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
@@ -5,6 +6,7 @@ from typing import Never
 
 import pytest
 
+from nanoclaude.permissions.redact import Redactor
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.tools.base import ToolArgumentError, ToolContext
 from nanoclaude.tools.grep import GrepTool
@@ -564,6 +566,7 @@ async def test_a_match_ripgrep_reports_with_its_path_as_bytes_is_judged_like_any
     ctx, tmp_repo, monkeypatch
 ):
     root = str(tmp_repo).encode()
+    (tmp_repo / "open.txt").write_text("needle: fine\n")
     _ripgrep_reports(
         monkeypatch,
         _hit(_bytes_of(root + b"/.env"), {"text": "needle: not for the model\n"}),
@@ -618,6 +621,131 @@ async def test_a_line_that_is_not_utf8_is_shown_by_both_backends(ctx, tmp_repo, 
         _maybe_force_python_fallback(monkeypatch, force)
         outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle"})
         assert "latin.txt:1:caf\ufffd needle" in outcome.content, (force, outcome.content)
+
+
+# ---- Grep never shows a line of a private key block, a match or the context around one
+
+
+def _key_file(root: Path, name: str = "deploy.txt", *, before: int = 3, body: int = 6) -> list[str]:
+    from tests.keys import pem
+
+    block, rows = pem(lines=body)
+    head = [f"head {i}" for i in range(1, before + 1)]
+    (root / name).write_text("\n".join([*head, *block, "tail 1", "tail 2"]) + "\n")
+    return rows
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_search_for_a_piece_of_the_key_does_not_show_the_line_it_is_in(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    rows = _key_file(tmp_repo)
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": re.escape(rows[2][8:30])})
+    assert not outcome.is_error and "1 match(es)" in outcome.content, outcome.content
+    assert rows[2][8:30] not in outcome.content, outcome.content
+    assert "deploy.txt:7:[redacted:private-key]" in outcome.content, outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+@pytest.mark.parametrize("flag", ["-A", "-B", "-C"])
+async def test_context_lines_from_inside_a_key_are_masked_too(
+    ctx, tmp_repo, monkeypatch, force_python_fallback, flag
+):
+    """A match just outside the block, with context reaching into it."""
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    rows = _key_file(tmp_repo)
+    pattern = "head 3" if flag in ("-A", "-C") else "tail 1"
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": pattern, flag: 4})
+    assert not any(row in outcome.content for row in rows), outcome.content
+    assert "BEGIN" not in outcome.content and "END RSA" not in outcome.content, outcome.content
+    assert "[redacted:private-key]" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_match_on_the_begin_line_is_masked_and_one_after_the_end_is_not(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    _key_file(tmp_repo)
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "BEGIN RSA|tail"})
+    assert "BEGIN" not in outcome.content, outcome.content
+    assert "deploy.txt:4:[redacted:private-key]" in outcome.content
+    assert "deploy.txt:12:tail 1" in outcome.content and "deploy.txt:13:tail 2" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_file_with_no_key_in_it_is_searched_as_before(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "plain.txt").write_text("alpha\nbeta\ngamma\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "beta", "-C": 1})
+    assert "plain.txt-1-alpha" in outcome.content and "plain.txt:2:beta" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_key_after_a_line_break_ripgrep_does_not_count_is_masked_on_both_backends(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    """The fallback numbers lines by ``str.splitlines`` and ripgrep by ``\\n``: a form feed
+    before the key shifts one by a line, and neither may be left showing a line of it."""
+    from tests.keys import pem
+
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    block, rows = pem(lines=4)
+    (tmp_repo / "odd.txt").write_text("a\x0cb\n" + "\n".join(block) + "\nz\n", newline="")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": re.escape(rows[1][5:25]), "-C": 1})
+    assert not any(row in outcome.content for row in rows), outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_with_redaction_switched_off_grep_shows_the_line(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    rows = _key_file(tmp_repo)
+    plain = replace(ctx, redactor=Redactor(enabled=False))
+    outcome = await GrepTool().run(plain, "t1", {"pattern": re.escape(rows[2][8:30])})
+    assert rows[2][8:30] in outcome.content
+
+
+async def test_the_other_modes_do_not_read_the_files_for_keys(ctx, tmp_repo, monkeypatch):
+    """They show no lines, so there is nothing to mask and nothing to read."""
+
+    def must_not_run(*_args: object, **_kwargs: object) -> frozenset[int]:
+        raise AssertionError("a file was read for a mask in a mode that shows no lines")
+
+    monkeypatch.setattr("nanoclaude.tools.grep.masked_line_numbers", must_not_run)
+    rows = _key_file(tmp_repo)
+    for mode in ("files", "count"):
+        outcome = await GrepTool().run(
+            ctx, "t1", {"pattern": re.escape(rows[2][8:30]), "output_mode": mode}
+        )
+        assert not outcome.is_error and "deploy.txt" in outcome.content
+
+
+async def test_the_other_modes_show_no_lines_and_are_untouched(ctx, tmp_repo):
+    rows = _key_file(tmp_repo)
+    for mode in ("files", "count"):
+        outcome = await GrepTool().run(
+            ctx, "t1", {"pattern": re.escape(rows[2][8:30]), "output_mode": mode}
+        )
+        assert "deploy.txt" in outcome.content and rows[2][8:30] not in outcome.content
+
+
+async def test_a_file_that_cannot_be_read_for_the_mask_has_its_lines_masked_not_shown(
+    ctx, tmp_repo, monkeypatch
+):
+    """Fail closed: a file that was searched a moment ago and cannot be opened now."""
+    (tmp_repo / "gone.txt").write_text("needle one\n")
+    monkeypatch.setattr(
+        "nanoclaude.tools.grep.search",
+        lambda *_a, **_k: [Match(str(tmp_repo / "vanished.txt"), 1, "needle visible")],
+    )
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle"})
+    assert "needle visible" not in outcome.content
+    assert "vanished.txt:1:[redacted:private-key]" in outcome.content
 
 
 async def test_a_deny_rule_for_another_tool_does_not_hide_files_from_grep(ctx, tmp_repo):
