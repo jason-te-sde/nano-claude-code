@@ -46,12 +46,12 @@ def git_state(root: str) -> str:
     return f"git branch: {branch}"
 
 
-def environment_block(root: str, *, depth: int = 3) -> str:
+def environment_block(root: str, *, policy: Policy, depth: int = 3) -> str:
     parts = [f"Working directory: {root}"]
     state = git_state(root)
     if state:
         parts.append(state)
-    parts.append("Project structure:\n" + project_map(root, depth=depth))
+    parts.append("Project structure:\n" + project_map(root, policy=policy, depth=depth))
     return "\n\n".join(parts)
 
 
@@ -70,5 +70,5 @@ def assemble(
     instructions = load_instructions(root, cwd=cwd, home=home, policy=policy, redactor=redactor)
     return AssembledContext(
         system=build_system_prompt(root, instructions=instructions, tool_protocol=tool_protocol),
-        environment=environment_block(root, depth=depth),
+        environment=environment_block(root, policy=policy, depth=depth),
     )

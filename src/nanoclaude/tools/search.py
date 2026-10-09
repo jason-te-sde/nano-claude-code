@@ -16,13 +16,14 @@ lines returned.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
 import shutil
 import stat
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +50,21 @@ class Match:
     #: match. Defaulted so every existing positional Match(path, line_no, line)
     #: call site is unaffected.
     is_context: bool = False
+
+
+def _decoded(field: Mapping[str, str], *, as_path: bool) -> str:
+    """The text of a path or a line in ripgrep's JSON: ``{"text": ...}``, or ``{"bytes": ...}``.
+
+    ripgrep reports the second for a name or a line that is not valid UTF-8, as base64 of the
+    bytes. A path is decoded the way the operating system decodes a name (undecodable bytes
+    become lone surrogates, which ``os.fsencode`` turns back into the same bytes), so that
+    it is judged and opened as what it is; a line is decoded with replacement characters,
+    since it is only shown.
+    """
+    if "text" in field:
+        return field["text"]
+    raw = base64.b64decode(field["bytes"])
+    return os.fsdecode(raw) if as_path else raw.decode("utf-8", errors="replace")
 
 
 def ripgrep_available() -> bool:
@@ -224,7 +240,7 @@ def ripgrep_search(
         if event_type not in ("match", "context"):
             continue
         data = event["data"]
-        path = data["path"]["text"]
+        path = _decoded(data["path"], as_path=True)
         # A path the caller does not want is dropped here, before the limit is applied
         # and not after: a refused file's matches must not use up a limit that the files
         # that are shown would have filled.
@@ -234,7 +250,7 @@ def ripgrep_search(
             Match(
                 path,
                 data["line_number"],
-                data["lines"]["text"].rstrip("\n"),
+                _decoded(data["lines"], as_path=False).rstrip("\n"),
                 is_context=event_type == "context",
             )
         )

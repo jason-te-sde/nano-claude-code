@@ -472,3 +472,81 @@ def test_ripgrep_context_of_a_path_that_is_not_kept_is_dropped_too(monkeypatch):
 def test_with_no_keep_every_match_is_reported():
     """The default is what it always was: asking about every path is the caller's choice."""
     assert python_search("needle", root="/does/not/exist", glob=None) == []
+
+
+# ---- ripgrep reports a path or a line it cannot give as text as base64 of its bytes
+
+
+def _as_bytes(raw: bytes) -> dict[str, str]:
+    import base64
+
+    return {"bytes": base64.b64encode(raw).decode()}
+
+
+def _event(path: object, number: int, lines: object, kind: str = "match") -> dict[str, object]:
+    return {"type": kind, "data": {"path": path, "lines": lines, "line_number": number}}
+
+
+def test_a_path_ripgrep_reports_as_bytes_is_read_as_the_path_it_is(monkeypatch):
+    _canned_ripgrep(monkeypatch, _event(_as_bytes(b"/p/src/a.py"), 3, {"text": "needle\n"}))
+    (found,) = ripgrep_search("needle", root="/p", glob=None)
+    assert (found.path, found.line_no, found.line) == ("/p/src/a.py", 3, "needle")
+
+
+def test_a_path_that_is_not_utf8_comes_back_as_the_system_decodes_a_name(monkeypatch):
+    raw = b"/p/sub/caf\xe9.txt"
+    _canned_ripgrep(monkeypatch, _event(_as_bytes(raw), 1, {"text": "needle\n"}))
+    (found,) = ripgrep_search("needle", root="/p", glob=None)
+    assert found.path == os.fsdecode(raw)
+    assert os.fsencode(found.path) == raw  # the same bytes: it names the file it was
+
+
+def test_a_line_ripgrep_reports_as_bytes_is_decoded_with_replacement_characters(monkeypatch):
+    _canned_ripgrep(monkeypatch, _event({"text": "/p/a.txt"}, 1, _as_bytes(b"caf\xe9 needle\n")))
+    (found,) = ripgrep_search("needle", root="/p", glob=None)
+    assert found.line == "caf\ufffd needle"
+
+
+def test_a_context_line_reported_as_bytes_is_decoded_the_same_way(monkeypatch):
+    _canned_ripgrep(
+        monkeypatch,
+        _event(_as_bytes(b"/p/a.txt"), 1, _as_bytes(b"\xff\xfe before\n"), "context"),
+        _event(_as_bytes(b"/p/a.txt"), 2, {"text": "needle\n"}),
+    )
+    before, match = ripgrep_search("needle", root="/p", glob=None, before=1)
+    assert (before.is_context, before.line) == (True, "\ufffd\ufffd before")
+    assert (match.is_context, match.line) == (False, "needle")
+
+
+def test_a_bytes_path_is_asked_of_keep_as_the_path_it_is(monkeypatch):
+    raw = b"/p/secrets/caf\xe9.txt"
+    _canned_ripgrep(
+        monkeypatch,
+        _event(_as_bytes(raw), 1, {"text": "needle\n"}),
+        _event(_as_bytes(b"/p/open.txt"), 1, {"text": "needle\n"}),
+    )
+    asked: list[str] = []
+
+    def keep(path: str) -> bool:
+        asked.append(path)
+        return "/secrets/" not in path
+
+    found = ripgrep_search("needle", root="/p", glob=None, keep=keep)
+    assert [m.path for m in found] == ["/p/open.txt"]
+    assert os.fsdecode(raw) in asked
+
+
+@pytest.mark.skipif(not ripgrep_available(), reason="ripgrep not on PATH")
+def test_ripgrep_itself_reports_a_line_that_is_not_utf8_and_it_is_decoded(tmp_path):
+    (tmp_path / "latin.txt").write_bytes(b"caf\xe9 needle\n")
+    (tmp_path / "plain.txt").write_text("needle\n")
+    found = {
+        Path(m.path).name: m.line for m in ripgrep_search("needle", root=str(tmp_path), glob=None)
+    }
+    assert found == {"latin.txt": "caf\ufffd needle", "plain.txt": "needle"}
+
+
+def test_the_fallback_decodes_a_line_that_is_not_utf8_the_same_way(tmp_path):
+    (tmp_path / "latin.txt").write_bytes(b"caf\xe9 needle\n")
+    (found,) = python_search("needle", root=str(tmp_path), glob=None)
+    assert found.line == "caf\ufffd needle"

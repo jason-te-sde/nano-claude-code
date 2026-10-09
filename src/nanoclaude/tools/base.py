@@ -41,6 +41,11 @@ _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
+#: A character that stands for a byte the system could not decode (a name with bytes that are
+#: not UTF-8 is decoded with these), which no encoder will take.
+_LONE_SURROGATE = re.compile(r"[\ud800-\udfff]")
+
+
 def sanitize(text: str) -> str:
     """Remove terminal control sequences from anything a tool returns."""
     return _CONTROL.sub("", _ANSI.sub("", text))
@@ -77,8 +82,15 @@ class ToolContext:
         return self.sandbox.resolve(raw, base=self.root)
 
     def display(self, resolved: str) -> str:
+        """``resolved`` as the model is shown it: relative to the root when it is inside it.
+
+        A name with bytes that are not UTF-8 reaches here with a lone surrogate for each (as
+        the system decodes it), and a string with one cannot be encoded as UTF-8, so it is
+        shown with U+FFFD in their place.
+        """
         path, root = PurePosixPath(resolved), PurePosixPath(self.root)
-        return str(path.relative_to(root)) if root in path.parents else resolved
+        shown = str(path.relative_to(root)) if root in path.parents else resolved
+        return _LONE_SURROGATE.sub("\ufffd", shown)
 
 
 @runtime_checkable

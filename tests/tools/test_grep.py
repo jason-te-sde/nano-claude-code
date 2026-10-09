@@ -536,6 +536,90 @@ async def test_the_limit_counts_matches_and_not_context_lines_after_refused_ones
     assert "needle three" not in outcome.content and "refused" not in outcome.content
 
 
+def _ripgrep_reports(monkeypatch: pytest.MonkeyPatch, *events: dict[str, object]) -> None:
+    import json
+    import subprocess
+    from types import SimpleNamespace
+
+    stdout = "\n".join(json.dumps(event) for event in events) + "\n"
+    monkeypatch.setattr("nanoclaude.tools.search.ripgrep_available", lambda: True)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
+    )
+
+
+def _bytes_of(raw: bytes) -> dict[str, str]:
+    import base64
+
+    return {"bytes": base64.b64encode(raw).decode()}
+
+
+def _hit(path: dict[str, str], line: object, number: int = 1) -> dict[str, object]:
+    return {"type": "match", "data": {"path": path, "lines": line, "line_number": number}}
+
+
+async def test_a_match_ripgrep_reports_with_its_path_as_bytes_is_judged_like_any_other(
+    ctx, tmp_repo, monkeypatch
+):
+    root = str(tmp_repo).encode()
+    _ripgrep_reports(
+        monkeypatch,
+        _hit(_bytes_of(root + b"/.env"), {"text": "needle: not for the model\n"}),
+        _hit(_bytes_of(root + b"/secrets/notes.txt"), {"text": "needle: launch code\n"}),
+        _hit(_bytes_of(root + b"/open.txt"), {"text": "needle: fine\n"}),
+    )
+    denying = _deny_reading(ctx, "Read(secrets/**)")
+    outcome = await GrepTool().run(denying, "t1", {"pattern": "needle"})
+    assert "needle: fine" in outcome.content and "1 match(es)" in outcome.content
+    assert "not for the model" not in outcome.content and "launch code" not in outcome.content
+    assert ".env" not in outcome.content and "secrets" not in outcome.content
+
+
+async def test_a_refused_bytes_path_does_not_use_up_the_limit(ctx, tmp_repo, monkeypatch):
+    root = str(tmp_repo).encode()
+    _ripgrep_reports(
+        monkeypatch,
+        *[_hit(_bytes_of(root + b"/.env"), {"text": f"needle {n}\n"}, n) for n in range(1, 20)],
+        *[_hit(_bytes_of(root + b"/open.txt"), {"text": f"needle {n}\n"}, n) for n in (1, 2, 3)],
+    )
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "head_limit": 3})
+    assert "3 match(es)" in outcome.content and outcome.content.count("open.txt:") == 3
+
+
+async def test_a_name_that_is_not_utf8_is_shown_in_a_form_that_can_be_sent(
+    ctx, tmp_repo, monkeypatch
+):
+    raw = str(tmp_repo).encode() + b"/caf\xe9.txt"
+    _ripgrep_reports(monkeypatch, _hit(_bytes_of(raw), {"text": "needle here\n"}))
+    for mode in ("content", "files", "count"):
+        outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "output_mode": mode})
+        assert not outcome.is_error, outcome.content
+        assert "caf" in outcome.content and "\ufffd" in outcome.content, outcome.content
+        outcome.content.encode("utf-8")  # a lone surrogate would raise here
+
+
+async def test_a_name_that_is_not_utf8_is_judged_by_the_rule_that_names_its_directory(
+    ctx, tmp_repo, monkeypatch
+):
+    raw = str(tmp_repo).encode() + b"/secrets/caf\xe9.txt"
+    _ripgrep_reports(monkeypatch, _hit(_bytes_of(raw), {"text": "needle launch code\n"}))
+    outcome = await GrepTool().run(
+        _deny_reading(ctx, "Read(secrets/**)"), "t1", {"pattern": "needle"}
+    )
+    assert "launch code" not in outcome.content and "No matches" in outcome.content
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not on PATH")
+async def test_a_line_that_is_not_utf8_is_shown_by_both_backends(ctx, tmp_repo, monkeypatch):
+    (tmp_repo / "latin.txt").write_bytes(b"caf\xe9 needle\n")
+    for force in (False, True):
+        _maybe_force_python_fallback(monkeypatch, force)
+        outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle"})
+        assert "latin.txt:1:caf\ufffd needle" in outcome.content, (force, outcome.content)
+
+
 async def test_a_deny_rule_for_another_tool_does_not_hide_files_from_grep(ctx, tmp_repo):
     (tmp_repo / "secrets").mkdir()
     (tmp_repo / "secrets" / "notes.txt").write_text("needle\n")

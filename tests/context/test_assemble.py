@@ -8,7 +8,7 @@ import pytest
 
 from nanoclaude.context.assemble import environment_block, git_state
 from nanoclaude.context.git import EMPTY_TREE, run_git
-from tests.context.helpers import assemble_in
+from tests.context.helpers import assemble_in, policy_for
 
 
 def test_the_system_prompt_is_identical_across_two_assemblies(tmp_repo):
@@ -30,7 +30,7 @@ def test_instructions_reach_the_system_prompt(tmp_repo):
 
 
 def test_a_directory_that_is_not_a_git_repository_still_works(tmp_path):
-    assert isinstance(environment_block(str(tmp_path)), str)
+    assert isinstance(environment_block(str(tmp_path), policy=policy_for(tmp_path)), str)
 
 
 def _init_real_repo(path: Path) -> None:
@@ -85,7 +85,7 @@ def test_a_missing_git_executable_produces_no_traceback(tmp_repo, monkeypatch, t
     """
     empty_bin = tmp_path_factory.mktemp("emptybin")
     monkeypatch.setenv("PATH", str(empty_bin))
-    block = environment_block(str(tmp_repo))
+    block = environment_block(str(tmp_repo), policy=policy_for(tmp_repo))
     assert "git branch" not in block
 
 

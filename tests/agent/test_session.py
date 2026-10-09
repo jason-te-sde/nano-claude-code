@@ -2393,6 +2393,20 @@ async def test_a_read_deny_rule_keeps_an_instruction_file_out_of_the_request(tmp
     assert "orange" not in session.model.requests[0].system
 
 
+async def test_the_project_map_in_the_request_leaves_out_what_the_policy_would_not_show(tmp_repo):
+    (tmp_repo / ".env").write_text("x")
+    (tmp_repo / "app.py").write_text("")
+    (tmp_repo / "vault").mkdir()
+    (tmp_repo / "vault" / "keys.txt").write_text("x")
+    session = build_session(tmp_repo, [says("ok")])
+    session.policy = replace(session.policy, rules=RuleSet.build(deny=["Read(vault)"]))
+    await session.run("hello")
+    system = session.model.requests[0].system
+    shown = {line.strip() for line in system.split("Project structure:", 1)[1].splitlines()}
+    assert "app.py" in shown
+    assert shown.isdisjoint({".env", "vault/", "keys.txt"}), shown
+
+
 async def test_the_todo_list_the_model_writes_is_the_one_the_session_holds(tmp_repo):
     todos = [{"content": "write the test", "status": "in_progress"}]
     session = build_session(
