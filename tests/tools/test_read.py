@@ -12,6 +12,17 @@ async def test_output_is_line_numbered_with_a_single_tab(ctx, tmp_repo):
     assert "2\ty = 2" in outcome.content
 
 
+async def test_a_line_that_assigns_the_result_of_a_call_to_a_secret_name_is_shown_as_it_is(
+    ctx, tmp_repo
+):
+    """Edit matches on content: a line the model read with its call redacted is a line it
+    can no longer edit."""
+    line = "password = get_password_from_env()"
+    (tmp_repo / "settings.py").write_text(f"{line}\n")
+    outcome = await ReadTool().run(ctx, "t1", {"path": "settings.py"})
+    assert f"1\t{line}" in outcome.content
+
+
 async def test_a_window_reports_which_lines_it_showed(ctx, tmp_repo):
     (tmp_repo / "a.py").write_text("\n".join(f"line {i}" for i in range(1, 101)) + "\n")
     outcome = await ReadTool().run(ctx, "t1", {"path": "a.py", "offset": 50, "limit": 2})

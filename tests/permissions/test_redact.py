@@ -217,6 +217,107 @@ def test_a_name_that_only_contains_a_secret_word_is_not_a_secret(text):
     assert Redactor().scrub(text) == (text, 0)
 
 
+# ---- an assignment whose value is code is shown as it is
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "password = get_password_from_env()",
+        "token = self.token",
+        "api_key = config.api_key",
+        'secret = os.environ["APP_SECRET"]',
+        "password = None",
+        "token = null",
+        "secret = True",
+        # the same shapes with a value long enough to have been taken for a secret
+        "api_key = vault_client_secret_provider.api_key",
+        "client_secret = settings_loader_instance[0]",
+        "token = ProductionSecretsManager.token",
+        "access_token = fetch_access_token_from_vault('main')",
+        "PASSWORD = get_database_password_from_env()  # rotated by ops",
+        "password = app_configuration_registry.database.password",
+        "password: self_service_portal_config['db']",
+    ],
+)
+def test_an_assignment_whose_value_is_code_is_shown_unchanged(line):
+    assert Redactor().scrub(line) == (line, 0)
+
+
+def test_a_quoted_value_is_redacted_even_when_it_has_a_dot_or_a_bracket_in_it():
+    """What follows a value only says it is code when the value is not in quotes: a
+    password in quotes that has a full stop after its first sixteen characters is one."""
+    value = fake_secret("quoted-dot")
+    for text in (f'password = "{value}.tail"', f"api_key = '{value}[1]'", f'token = "{value}(x)"'):
+        cleaned, count = Redactor().scrub(text)
+        assert value not in cleaned and count == 1, cleaned
+
+
+def test_an_unquoted_value_is_redacted_when_what_follows_is_not_a_call_or_an_access():
+    value = fake_secret("unquoted-end")
+    for tail in ("", ".", " ", ", next", ";", ") # end", ". The next sentence", ".\n"):
+        text = f"password: {value}{tail}"
+        cleaned, count = Redactor().scrub(text)
+        assert value not in cleaned and count == 1, text
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "PASSWORD={v}",
+        "password = {v}",
+        "[database]\npassword = {v}\n",
+        'password = "{v}"',
+        "db_password: {v}",
+    ],
+)
+def test_a_bare_word_or_a_quoted_value_is_still_redacted(template):
+    """An unquoted value that is a bare word cannot be told from an identifier, so what
+    looks random enough is taken for the secret it most likely is."""
+    value = "hunter2abc" + fake_secret(template, 14)
+    text = template.format(v=value)
+    cleaned, count = Redactor().scrub(text)
+    assert value not in cleaned and count == 1, cleaned
+
+
+def test_a_bare_identifier_that_looks_random_is_redacted_and_that_is_known():
+    """The known over-redaction: ``password = <identifier>`` where the identifier is long
+    and mixed enough, with nothing after it to say it is code."""
+    cleaned, count = Redactor().scrub("api_key = xK9mQ2vL7nR4tY1wZ3pB8s")
+    assert count == 1 and "xK9mQ" not in cleaned
+
+
+@pytest.mark.parametrize(
+    ("value", "after", "is_code"),
+    [
+        ("get_password_from_env", "()", True),
+        ("get_password_from_env", "(arg)", True),
+        ("application_settings", ".api_key", True),
+        ("application_settings", "._private", True),
+        ("credential_store_entries", '["main"]', True),
+        ("None", "", True),
+        ("null", "", True),
+        ("nil", "", True),
+        ("undefined", "", True),
+        ("True", "", True),
+        ("False", "", True),
+        ("true", "", True),
+        ("false", "", True),
+        ("get_password_from_env", "", False),
+        ("get_password_from_env", ".", False),
+        ("get_password_from_env", ". Next", False),
+        ("get_password_from_env", ".5", False),
+        ("get_password_from_env", " (note)", False),
+        ("Nonexistent", "", False),
+        ("TrueColour", "", False),
+    ],
+)
+def test_what_counts_as_code_after_an_assignment(value, after, is_code):
+    from nanoclaude.permissions.redact import _is_code_expression
+
+    assert _is_code_expression(value, after) is is_code
+
+
 def test_a_value_that_is_too_short_or_too_regular_is_still_left_alone():
     for text in ("password = 'hunter2'", "api_key = '" + "ab" * 10 + "'"):
         assert Redactor().scrub(text) == (text, 0)

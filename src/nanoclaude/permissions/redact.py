@@ -26,6 +26,12 @@ What this does *not* cover, so that nobody relies on it for more:
   it, or in any other case and has the keyword as a word of its own (``api_key``,
   ``clientSecret``, ``Password``). ``dbpassword`` in lower case, with no break to find the
   word by, is not read as one.
+* A name that says secret, followed by a bare word, is redacted when the word is random
+  enough, because an identifier cannot be told from a password typed without quotes
+  (``password = a_long_function_name`` looks like ``password = Xy7Kp2mQ9vL4nR8t``). That is
+  known over-redaction. A call (``name(``), a subscript (``name[``), an attribute chain
+  (``name.other``) and the words ``None``, ``null``, ``nil``, ``undefined``, ``True``,
+  ``False``, ``true`` and ``false`` are code, and are left alone.
 * A private key block that is cut off is masked as far as what is left looks like a key
   (its base64 lines and its two headers); a key whose lines were rewrapped, indented or
   interleaved with other text is not.
@@ -126,6 +132,28 @@ _ASSIGNED = re.compile(
     re.IGNORECASE,
 )
 
+#: Words that are a value in code, not a secret: what a language writes for nothing, for yes
+#: and for no. With the length a value needs to be taken for a secret at all these cannot be
+#: one, and are listed so that the rule does not depend on that number staying where it is.
+_CODE_WORDS = frozenset({"None", "null", "nil", "undefined", "True", "False", "true", "false"})
+#: What follows a value that is an identifier and not a secret: a call (``name(``), a subscript
+#: (``name[``) or an attribute (``name.other``). A full stop that ends a sentence is not one.
+_CODE_AFTER = re.compile(r"\(|\[|\.[A-Za-z_]")
+
+
+def _is_code_expression(value: str, after: str) -> bool:
+    """Whether an unquoted ``value`` is code (a call, a subscript, an attribute chain, or one
+    of the words for nothing and for yes and no) and not something somebody typed as a secret.
+
+    ``after`` is what follows the value in the text, as far as the first two characters. The
+    value pattern stops at the first character a secret would not have, which is exactly where
+    ``get_password_from_env()`` has its parenthesis, so the pattern alone redacts the name of
+    the function and leaves the brackets, and an Edit can no longer match the line the model
+    read.
+    """
+    return value in _CODE_WORDS or _CODE_AFTER.match(after) is not None
+
+
 _NAME_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 _SECRET_WORDS = frozenset({"secret", "token", "password", "passwd", "apikey"})
 _SECRET_WORD_PAIRS = frozenset({("api", "key"), ("private", "key")})
@@ -176,6 +204,13 @@ class Redactor:
             if not _names_a_secret(match["name"]):
                 return match.group(0)
             if shannon_entropy(match["value"]) < ENTROPY_FLOOR:
+                return match.group(0)
+            # A value in quotes is a string, whatever follows it; one without is code when
+            # it is a call or an access, and is taken for a secret when it is a bare word.
+            quoted = match["sep"].endswith(("'", '"'))
+            if not quoted and _is_code_expression(
+                match["value"], match.string[match.end() : match.end() + 2]
+            ):
                 return match.group(0)
             replacements += 1
             # Only the value goes: the name, the quotes and the separator are how a reader
