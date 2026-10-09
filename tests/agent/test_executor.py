@@ -212,6 +212,73 @@ async def test_an_edit_of_the_repositorys_own_config_is_refused_whatever_the_mod
     assert not (tmp_repo / ".nanoclaude").exists()
 
 
+PROTECTED_TARGETS = [
+    ".git/config",
+    ".GIT/config",
+    "sub/.git/hooks/pre-commit",
+    ".nanoclaude/config.toml",
+    "innocent.txt",  # a link inside the root whose target is inside .git/
+]
+
+
+def _arrange_protected_targets(root: Path) -> dict[str, str | None]:
+    """Make the files the targets above stand for, and say what each held (None: nothing)."""
+    (root / ".git").mkdir(exist_ok=True)
+    (root / ".git" / "config").write_text("[core]\n\tbare = false\n")
+    (root / "sub" / ".git" / "hooks").mkdir(parents=True, exist_ok=True)
+    (root / "sub" / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
+    (root / "innocent.txt").symlink_to(root / ".git" / "config")
+    return {
+        ".git/config": "[core]\n\tbare = false\n",
+        "sub/.git/hooks/pre-commit": "#!/bin/sh\n",
+        ".nanoclaude/config.toml": None,
+    }
+
+
+@pytest.mark.parametrize("target", PROTECTED_TARGETS)
+@pytest.mark.parametrize("tool", ["Write", "Edit"])
+@pytest.mark.parametrize("mode", [Mode.DEFAULT, Mode.ACCEPT_EDITS, Mode.BYPASS], ids=str)
+async def test_the_real_write_and_edit_tools_are_refused_at_every_protected_path(
+    policy, tmp_repo, mode, tool, target
+):
+    """Through the executor, with the tools that would do the write: refused as
+    sandbox.protected-path in every mode, and nothing on disk changes."""
+    before = _arrange_protected_targets(tmp_repo)
+    arguments = (
+        {"path": target, "content": "x = 1\n"}
+        if tool == "Write"
+        else {"path": target, "old_string": "bare", "new_string": "fsmonitor"}
+    )
+    (outcome,) = await executor(replace(policy, mode=mode)).run_batch(
+        (ToolUseBlock("t1", tool, arguments),), start("hi")
+    )
+    assert outcome.is_error and "sandbox.protected-path" in outcome.content, outcome.content
+    for name, content in before.items():
+        path = tmp_repo / name
+        assert (path.read_text() if path.exists() else None) == content, name
+    assert (tmp_repo / "innocent.txt").is_symlink()
+
+
+@pytest.mark.parametrize("above", [".git", ".nanoclaude", ".GIT"])
+async def test_a_project_whose_root_is_under_a_protected_name_can_be_written_to(
+    policy, tmp_path, above
+):
+    """The names are looked for inside the root, not above it; the root's own ``.git`` is
+    still refused."""
+    from nanoclaude.permissions.sandbox import Sandbox
+
+    root = tmp_path / above / "app"
+    (root / ".git").mkdir(parents=True)
+    inside = replace(policy, sandbox=Sandbox((str(root),)), mode=Mode.ACCEPT_EDITS)
+    allowed = ToolUseBlock("t1", "Write", {"path": "src/a.py", "content": "x = 1\n"})
+    refused = ToolUseBlock("t2", "Write", {"path": ".git/config", "content": "x = 1\n"})
+    ok_outcome, refused_outcome = await executor(inside).run_batch((allowed, refused), start("hi"))
+    assert not ok_outcome.is_error, ok_outcome.content
+    assert (root / "src" / "a.py").read_text() == "x = 1\n"
+    assert refused_outcome.is_error and "sandbox.protected-path" in refused_outcome.content
+    assert not (root / ".git" / "config").exists()
+
+
 async def test_always_upgrades_the_rest_of_the_session(policy, tmp_repo):
     class AlwaysAllow(SilentUI):
         async def confirm(

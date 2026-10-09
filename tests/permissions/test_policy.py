@@ -901,3 +901,82 @@ def test_every_path_of_a_request_is_checked_not_only_the_first():
     assert evaluate(both, policy(mode=PermissionMode.BYPASS), Grants()).rule == (
         "sandbox.protected-path"
     )
+
+
+# ---- sandbox.protected-path is about the project's own .git and .nanoclaude
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "/x/.git/work",
+        "/srv/u/.nanoclaude/app",
+        "/x/.GIT/work",
+        "/x/.git/.nanoclaude/p",
+        "/.nanoclaude",
+    ],
+)
+@pytest.mark.parametrize("mode", [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS])
+def test_a_root_under_a_directory_with_a_protected_name_can_still_be_written_to(root, mode):
+    """The names are looked for in the path *inside* the root. A project that lives under a
+    directory called ``.git`` or ``.nanoclaude`` is not thereby a place nothing may be
+    written."""
+    p = policy(sandbox=Sandbox((root,)), mode=mode)
+    result = evaluate(write_req("Write", f"{root}/src/a.py"), p, Grants())
+    assert result.rule != "sandbox.protected-path", (root, result)
+    assert result.decision is not Decision.DENY, (root, result)
+
+
+@pytest.mark.parametrize("root", ["/x/.git/work", "/srv/u/.nanoclaude/app", "/p"])
+@pytest.mark.parametrize(
+    "inside", [".git/config", ".git/hooks/pre-commit", ".nanoclaude/config.toml", "sub/.git/x"]
+)
+def test_the_roots_own_git_and_nanoclaude_are_protected_wherever_the_root_is(root, inside):
+    for mode in (PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.BYPASS):
+        p = policy(sandbox=Sandbox((root,)), mode=mode)
+        result = evaluate(write_req("Write", f"{root}/{inside}"), p, Grants())
+        assert (result.decision, result.rule) == (Decision.DENY, "sandbox.protected-path")
+        assert inside in result.reason
+
+
+def test_the_root_itself_is_never_a_protected_path():
+    p = policy(sandbox=Sandbox(("/x/.git/work",)))
+    result = evaluate(write_req("Write", "/x/.git/work"), p, Grants())
+    assert result.rule != "sandbox.protected-path"
+
+
+def test_a_path_in_any_root_is_judged_against_that_root_and_against_every_root_holding_it():
+    two = policy(sandbox=Sandbox(("/p", "/q/.git/work")))
+    assert evaluate(write_req("Write", "/p/.git/x"), two, Grants()).rule == "sandbox.protected-path"
+    assert evaluate(write_req("Write", "/q/.git/work/a.py"), two, Grants()).decision is not (
+        Decision.DENY
+    )
+    assert (
+        evaluate(write_req("Write", "/q/.git/work/.git/x"), two, Grants()).rule
+        == "sandbox.protected-path"
+    )
+    # one root inside another: the outer one sees .git in the path, and that is enough
+    nested = policy(sandbox=Sandbox(("/p", "/p/.git/vendor")))
+    result = evaluate(write_req("Write", "/p/.git/vendor/x.txt"), nested, Grants())
+    assert result.rule == "sandbox.protected-path"
+
+
+def test_a_sibling_that_only_shares_a_roots_prefix_is_not_inside_it():
+    """``/p-evil/.git/x`` is outside ``/p``; the sandbox rows answer that, not this one."""
+    result = evaluate(write_req("Write", "/p-evil/.git/x"), policy(), Grants())
+    assert result.rule == "sandbox.outside-root"
+
+
+def test_the_protected_path_row_sits_after_the_credentials_row():
+    """A write both rows refuse is reported by the one that comes first in the order."""
+    both = write_req("Write", "/p/.git/.env")
+    assert evaluate(both, policy(), Grants()).rule == "secret.path"
+    assert evaluate(both, policy(mode=PermissionMode.BYPASS), Grants()).rule == "secret.path"
+    # With the credentials row off, the next row answers.
+    opted_in = policy(allow_secrets=True)
+    assert evaluate(both, opted_in, Grants()).rule == "sandbox.protected-path"
+
+
+def test_the_protected_path_row_sits_after_a_deny_rule():
+    p = policy(rules=RuleSet.build(deny=["Write(**/.env)"]))
+    assert evaluate(write_req("Write", "/p/.git/.env"), p, Grants()).rule == "rule.deny"
