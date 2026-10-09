@@ -162,3 +162,25 @@ def test_an_outcome_still_fills_in_the_row_it_belongs_to(tmp_path):
         r["tool_use_id"]: r["outcome"] for r in log.store.db.execute("SELECT * FROM tool_calls")
     }
     assert rows == {"t1": None, "t2": "cancelled"}
+
+
+def test_a_second_outcome_for_a_call_leaves_the_first(tmp_path):
+    """A call that ran and succeeded is not later said to have failed because something
+    reported twice: the second report changes nothing, and is not an error."""
+    log = audit(tmp_path)
+    _decision(log, "t1")
+    log.record_outcome("s1", "t1", outcome="ok", duration_ms=12, bytes_out=40, error=None)
+    log.record_outcome("s1", "t1", outcome="error", duration_ms=0, bytes_out=0, error="later")
+    row = log.store.db.execute("SELECT * FROM tool_calls").fetchone()
+    assert (row["outcome"], row["duration_ms"], row["bytes_out"], row["error"]) == (
+        "ok",
+        12,
+        40,
+        None,
+    )
+
+
+def test_an_outcome_for_a_call_nobody_decided_is_not_a_row(tmp_path):
+    log = audit(tmp_path)
+    log.record_outcome("s1", "nothing", outcome="ok", duration_ms=1, bytes_out=1, error=None)
+    assert log.store.db.execute("SELECT COUNT(*) AS n FROM tool_calls").fetchone()["n"] == 0

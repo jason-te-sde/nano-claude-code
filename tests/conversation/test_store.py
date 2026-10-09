@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 from collections.abc import Hashable
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -839,3 +840,195 @@ def test_a_store_that_is_already_there_keeps_the_mode_it_has(tmp_path):
     again = Store(home / "sessions.db")
     again.open()
     assert (mode_of(home), mode_of(again.path)) == (0o755, 0o644)
+
+
+# ---- the audit table is append-only in the database itself
+
+
+def _audited_store(tmp_path: Path, *, outcome: str | None = None) -> Store:
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    _audit(store, "s1", "t1", 0)
+    if outcome is not None:
+        store.db.execute(
+            "UPDATE tool_calls SET outcome = ?, duration_ms = 5, bytes_out = 7 "
+            "WHERE tool_use_id = 't1'",
+            (outcome,),
+        )
+        store.db.commit()
+    return store
+
+
+def _row(store: Store) -> sqlite3.Row:
+    row: sqlite3.Row = store.db.execute(
+        "SELECT * FROM tool_calls WHERE tool_use_id = 't1'"
+    ).fetchone()
+    return row
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DELETE FROM tool_calls",
+        "DELETE FROM tool_calls WHERE tool_use_id = 't1'",
+        "DELETE FROM tool_calls WHERE session_id = 's1' AND outcome IS NULL",
+    ],
+)
+def test_a_row_of_the_audit_cannot_be_deleted(tmp_path, statement):
+    store = _audited_store(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store.db.execute(statement)
+    assert _row(store) is not None
+
+
+def test_a_deleted_row_is_not_got_back_by_a_rollback_either(tmp_path):
+    store = _audited_store(tmp_path, outcome="ok")
+    with pytest.raises(sqlite3.IntegrityError):
+        store.db.execute("DELETE FROM tool_calls")
+    store.db.rollback()
+    assert _row(store)["outcome"] == "ok"
+
+
+def test_the_outcome_can_be_set_once_on_a_row_that_has_none(tmp_path):
+    store = _audited_store(tmp_path)
+    store.db.execute(
+        "UPDATE tool_calls SET outcome = 'ok', duration_ms = 12, bytes_out = 40, error = 'e' "
+        "WHERE tool_use_id = 't1' AND outcome IS NULL"
+    )
+    row = _row(store)
+    assert (row["outcome"], row["duration_ms"], row["bytes_out"], row["error"]) == (
+        "ok",
+        12,
+        40,
+        "e",
+    )
+
+
+@pytest.mark.parametrize("second", ["ok", "error", "cancelled", "refused"])
+def test_a_second_outcome_is_refused_whatever_it_is(tmp_path, second):
+    store = _audited_store(tmp_path, outcome="ok")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store.db.execute("UPDATE tool_calls SET outcome = ? WHERE tool_use_id = 't1'", (second,))
+    row = _row(store)
+    assert (row["outcome"], row["duration_ms"], row["bytes_out"]) == ("ok", 5, 7)
+
+
+def test_an_outcome_is_not_given_back_to_null(tmp_path):
+    store = _audited_store(tmp_path, outcome="ok")
+    with pytest.raises(sqlite3.IntegrityError):
+        store.db.execute("UPDATE tool_calls SET outcome = NULL WHERE tool_use_id = 't1'")
+    assert _row(store)["outcome"] == "ok"
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "decision = 'deny'",
+        "rule = 'rule.deny'",
+        'args_json = \'{"path": "/etc/passwd"}\'',
+        "tool = 'Write'",
+        "turn = 9",
+        "ts = 1",
+        "tool_use_id = 't9'",
+        "session_id = 's9'",
+    ],
+)
+@pytest.mark.parametrize("with_outcome", [False, True], ids=["alone", "with-the-outcome"])
+def test_what_was_decided_cannot_be_rewritten_even_while_the_outcome_is_still_open(
+    tmp_path, assignment, with_outcome
+):
+    store = _audited_store(tmp_path)
+    changing = f"{assignment}, outcome = 'ok'" if with_outcome else assignment
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store.db.execute(f"UPDATE tool_calls SET {changing} WHERE tool_use_id = 't1'")  # noqa: S608
+    row = _row(store)
+    assert (row["decision"], row["rule"], row["tool"], row["outcome"]) == (
+        "allow",
+        "rule.allow",
+        "Read",
+        None,
+    )
+
+
+def test_a_row_that_has_no_outcome_yet_cannot_have_only_its_error_or_size_changed(tmp_path):
+    """Only an outcome opens the row to the other three columns."""
+    store = _audited_store(tmp_path)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.db.execute("UPDATE tool_calls SET error = 'late' WHERE tool_use_id = 't1'")
+    assert _row(store)["error"] is None
+
+
+_VALUES = "(session_id, turn, tool_use_id, ts, tool, args_json, decision, rule) "
+_SECOND = "VALUES ('s1', 0, 't1', 0, 'Write', '{}', 'deny', 'rule.deny')"
+
+
+@pytest.mark.parametrize(
+    "verb",
+    ["INSERT OR REPLACE INTO", "REPLACE INTO", "INSERT OR IGNORE INTO", "INSERT INTO"],
+    ids=["or-replace", "replace", "or-ignore", "plain"],
+)
+def test_a_row_is_not_replaced_by_an_insert_with_the_same_key_either(tmp_path, verb):
+    """REPLACE deletes the row it replaces without running a delete trigger, so it is
+    refused where it is inserted."""
+    store = _audited_store(tmp_path, outcome="ok")
+    with pytest.raises(sqlite3.IntegrityError):
+        store.db.execute(f"{verb} tool_calls {_VALUES}{_SECOND}")
+    row = _row(store)
+    assert (row["tool"], row["decision"], row["outcome"]) == ("Read", "allow", "ok")
+
+
+def test_a_new_row_for_a_new_call_is_still_inserted(tmp_path):
+    store = _audited_store(tmp_path, outcome="ok")
+    _audit(store, "s1", "t2", 1)
+    store.create_session("s2", cwd="/p", roles={})
+    _audit(store, "s2", "t1", 0)  # the same id in another session is another call
+    count = store.db.execute("SELECT COUNT(*) AS n FROM tool_calls").fetchone()["n"]
+    assert count == 3
+
+
+def test_the_triggers_are_there_in_a_database_an_earlier_version_made(tmp_path):
+    """A database made before the triggers existed gets them when it is opened."""
+    store = _audited_store(tmp_path, outcome="ok")
+    names = [
+        row["name"]
+        for row in store.db.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+    ]
+    assert len(names) == 3, names
+    for name in names:
+        store.db.execute(f"DROP TRIGGER {name}")
+    store.db.commit()
+    store.db.execute("DELETE FROM tool_calls")  # nothing stops it now: an earlier version's file
+    store.db.commit()
+    _audit(store, "s1", "t1", 0)
+    store.close()
+
+    reopened = Store(tmp_path / "s.db")
+    reopened.open()
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        reopened.db.execute("DELETE FROM tool_calls")
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        reopened.db.execute("UPDATE tool_calls SET decision = 'deny'")
+
+
+def test_opening_the_same_database_again_leaves_the_triggers_as_they_were(tmp_path):
+    store = _audited_store(tmp_path, outcome="ok")
+    store.close()
+    for _ in range(2):
+        again = Store(tmp_path / "s.db")
+        again.open()
+        names = sorted(
+            row["name"]
+            for row in again.db.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        )
+        assert len(names) == 3, names
+        again.close()
+
+
+def test_the_other_tables_are_not_append_only(tmp_path):
+    """Compaction and /clear replace a transcript, and a session ends: the triggers are the
+    audit table's and nobody else's."""
+    store = _audited_store(tmp_path)
+    store.db.execute("UPDATE sessions SET ended_at = 1 WHERE id = 's1'")
+    store.db.execute("DELETE FROM messages WHERE session_id = 's1'")
+    store.db.commit()
