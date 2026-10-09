@@ -9,16 +9,28 @@ directory by ``mkdir`` with mode 0700, and the chmod that follows each is only f
 that took bits away from its owner (0277 would make a file read-only to the person it
 belongs to), which it can only put back, never widen past.
 
-What was already there is left as it is: a directory or a file that exists keeps its mode,
-because it is the person's, and a person who shared it on purpose has not asked for it to
-be taken back. A file that is *replaced* is a new file, and is private.
+What an earlier version left open is narrowed when ncc opens it: the home directory, the
+session store and the files SQLite keeps beside it, the prompt history and the capability
+cache are ncc's own, were made with the default mode by versions that did not know better,
+and are made 0700 (directories) and 0600 (files) by :func:`narrow_directory` and
+:func:`narrow_file` the next time ncc opens them. What ncc does not own is not narrowed: the
+person's ``config.toml`` keeps the mode they gave it, a link is not followed to change what
+it leads to, and a file that belongs to another user is not touched (a ``chmod`` that is
+refused, which is what that is, does not stop ncc). A file that is *replaced* is a new file,
+and is private.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import secrets
+import stat
+from collections.abc import Callable
 from pathlib import Path
+
+#: How many names :func:`write_private` tries for its temporary file before it gives up.
+_TEMPORARY_ATTEMPTS = 8
 
 
 class TargetExistsError(Exception):
@@ -56,7 +68,8 @@ def write_private(path: Path, text: str, *, replace: bool) -> None:
     It is then moved into place: a file that was already there is replaced by one that is
     private, whatever its own mode was, and one that was interrupted leaves no half of a
     file. ``O_EXCL`` refuses a temporary name that is already there, a link included, so
-    that nothing is written through one.
+    that nothing is written through one, and the name is random, so that one left behind by
+    an earlier process is not in the way.
 
     ``replace`` says whether replacing a file is agreed to. When it is not, the file is
     put in place by a hard link, which fails if anything is there, a dangling link included,
@@ -64,8 +77,19 @@ def write_private(path: Path, text: str, *, replace: bool) -> None:
     after the last look is somebody's work.
     """
     make_private_directories(path.parent)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    # A name nothing can already be using: random, and made with O_EXCL, so that a leftover
+    # from a process that died (or a link planted at the name) is never written through and
+    # never makes this write fail. A process id was not enough: ids are recycled, and a
+    # stale file with a recycled one was in the way for good.
+    for _ in range(_TEMPORARY_ATTEMPTS):
+        temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(f"no free name for the temporary file of {path} in {path.parent}")
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             os.fchmod(handle.fileno(), 0o600)
@@ -102,3 +126,34 @@ def create_private_file(path: Path) -> None:
         os.fchmod(descriptor, 0o600)
     finally:
         os.close(descriptor)
+
+
+def _narrow(path: Path, wanted: int, kind: Callable[[int], bool]) -> None:
+    """Set ``path`` to ``wanted`` if it is ncc's to set: there, of the right kind (not a link),
+    the running user's, and not already that mode. Best effort: a ``chmod`` that is refused
+    is not an error."""
+    try:
+        status = os.lstat(path)
+    except OSError:
+        return
+    if not kind(status.st_mode) or status.st_uid != os.geteuid():
+        return
+    if stat.S_IMODE(status.st_mode) == wanted:
+        return
+    with contextlib.suppress(OSError):
+        path.chmod(wanted)
+
+
+def narrow_file(path: Path) -> None:
+    """Make a file ncc keeps private (0600) if an earlier version left it open to others.
+
+    A path that is not there, is a link or is not a regular file is left alone, and so is a
+    file that belongs to another user; a ``chmod`` that fails does not raise.
+    """
+    _narrow(path, 0o600, stat.S_ISREG)
+
+
+def narrow_directory(path: Path) -> None:
+    """Make a directory ncc keeps its files in private (0700) if an earlier version left it
+    open to others. Otherwise as :func:`narrow_file`."""
+    _narrow(path, 0o700, stat.S_ISDIR)

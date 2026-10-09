@@ -746,21 +746,26 @@ def test_a_config_that_was_agreed_to_is_replaced_without_a_second_question(tmp_p
     assert [m for m, _ in ran.ask.asked].count("overwrite?") == 1
 
 
-def test_a_file_planted_at_the_temporary_name_is_refused_and_nothing_goes_through_it(tmp_path, key):
+def test_a_file_planted_at_the_old_temporary_name_is_not_in_the_way_and_nothing_goes_through_it(
+    tmp_path, key
+):
+    """The temporary name used to be the config's and the process id, so a link planted there
+    made init fail. It is random now: the planted link is never met, and is not written through."""
     victim = tmp_path / "victim"
     victim.write_text("precious")
     (tmp_path / ".nanoclaude").mkdir()
-    (tmp_path / ".nanoclaude" / f".config.toml.{os.getpid()}.tmp").symlink_to(victim)
-    with pytest.raises(ConfigError, match=r"cannot write .*config\.toml"):
-        run_init(
-            plain_console()[0],
-            home=tmp_path,
-            ask=Answers("1", key, None),
-            env={},
-            verify=Verifier(),
-        )
+    planted = tmp_path / ".nanoclaude" / f".config.toml.{os.getpid()}.tmp"
+    planted.symlink_to(victim)
+    run_init(
+        plain_console()[0],
+        home=tmp_path,
+        ask=Answers("1", key, None),
+        env={},
+        verify=Verifier(),
+    )
     assert victim.read_text() == "precious"
-    assert not config_path(tmp_path).exists()
+    assert planted.is_symlink()
+    assert config_path(tmp_path).exists()
 
 
 @pytest.mark.parametrize("agreed", [False, True])

@@ -57,6 +57,7 @@ from nanoclaude.permissions.policy import PermissionMode, Policy
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.permissions.sandbox import Sandbox, is_within
+from nanoclaude.private import narrow_file
 from nanoclaude.providers.base import CredentialsError, ModelError
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CapabilityCache
 from nanoclaude.tools.base import sanitize
@@ -628,6 +629,10 @@ def _build_session(
     store = Store(state_dir / "sessions.db")
     try:
         _open(store)
+        # The store has narrowed the directory and its own files. The capability cache is
+        # ncc's too, and a session may never read it (a model the table knows is not looked up
+        # in it), so a cache an earlier version left open to others is narrowed here.
+        narrow_file(state_dir / CACHE_FILENAME)
         session_id, resume = _which_session(args, store, settings.root)
         router = Router(config, CapabilityCache(state_dir / CACHE_FILENAME))
         todo = TodoState()

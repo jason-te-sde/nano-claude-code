@@ -47,7 +47,12 @@ from nanoclaude.conversation.transcript import (
     ToolUseBlock,
     Transcript,
 )
-from nanoclaude.private import create_private_file, make_private_directories
+from nanoclaude.private import (
+    create_private_file,
+    make_private_directories,
+    narrow_directory,
+    narrow_file,
+)
 from nanoclaude.providers.base import Usage
 
 SCHEMA = """
@@ -268,11 +273,17 @@ class Store:
         # whole conversation, tool output included.
         make_private_directories(self.path.parent)
         create_private_file(self.path)
+        # What an earlier version made with the default mode is narrowed now: the directory,
+        # the database, and the log and index that SQLite opened with whatever mode they had.
+        narrow_directory(self.path.parent)
+        narrow_file(self.path)
         self._db = sqlite3.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
         self._db.commit()
+        for sidecar in ("-wal", "-shm"):
+            narrow_file(self.path.with_name(self.path.name + sidecar))
 
     def close(self) -> None:
         if self._db is not None:

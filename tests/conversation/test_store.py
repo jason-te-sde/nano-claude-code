@@ -827,19 +827,46 @@ def test_a_new_store_is_private_and_works_under_a_restrictive_umask(tmp_path):
     assert store.session_row("s1") is not None
 
 
-def test_a_store_that_is_already_there_keeps_the_mode_it_has(tmp_path):
+def test_a_store_an_earlier_version_made_open_to_others_is_narrowed_when_it_is_opened(tmp_path):
+    """The directory, the database and the write-ahead log and index SQLite keeps beside it."""
     from tests.conftest import mode_of
 
     home = tmp_path / ".nanoclaude"
-    home.mkdir(mode=0o755)
-    home.chmod(0o755)
+    first = Store(home / "sessions.db")
+    first.open()
+    first.create_session("s1", cwd="/p", roles={})  # still open: the -wal and -shm exist
+    sidecars = [home / "sessions.db-wal", home / "sessions.db-shm"]
+    assert all(p.exists() for p in sidecars)
+    for path in (home, home / "sessions.db", *sidecars):
+        path.chmod(0o755 if path.is_dir() else 0o644)
+
+    again = Store(home / "sessions.db")
+    again.open()
+
+    assert mode_of(home) == 0o700
+    assert [mode_of(p) for p in (home / "sessions.db", *sidecars)] == [0o600] * 3
+    assert again.session_row("s1") is not None  # and it still opens, and works
+    again.create_session("s2", cwd="/p", roles={})
+    again.close()
+    first.close()
+
+
+def test_a_store_that_cannot_be_narrowed_still_opens(tmp_path, monkeypatch):
+    home = tmp_path / ".nanoclaude"
+    home.mkdir()
     first = Store(home / "sessions.db")
     first.open()
     first.close()
-    first.path.chmod(0o644)
+    (home / "sessions.db").chmod(0o644)
+
+    def refused(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "chmod", refused)
     again = Store(home / "sessions.db")
     again.open()
-    assert (mode_of(home), mode_of(again.path)) == (0o755, 0o644)
+    again.create_session("s1", cwd="/p", roles={})
+    assert again.session_row("s1") is not None
 
 
 # ---- the audit table is append-only in the database itself
