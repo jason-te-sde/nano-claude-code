@@ -1,12 +1,13 @@
 import ast
 import os
-import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from nanoclaude.context.assemble import assemble, environment_block, git_state
+from nanoclaude.context.git import EMPTY_TREE, run_git
 
 
 def test_the_system_prompt_is_identical_across_two_assemblies(tmp_repo):
@@ -51,7 +52,7 @@ def _init_real_repo(path: Path) -> None:
     subprocess.run(commit, cwd=path, check=True)  # noqa: S603
 
 
-def test_git_state_reports_the_branch_and_the_dirty_count(tmp_repo):
+def test_git_state_reports_the_branch_and_nothing_about_the_working_tree(tmp_repo):
     """tmp_repo's own ".git" (conftest.py) is an empty placeholder directory,
     which git refuses to recognise as a repository at all (confirmed by hand:
     "fatal: not a git repository"). So nothing above actually runs
@@ -59,8 +60,8 @@ def test_git_state_reports_the_branch_and_the_dirty_count(tmp_repo):
     that it does.
     """
     _init_real_repo(tmp_repo)
-    state = git_state(str(tmp_repo))
-    assert state == "git branch: main (1 file(s) with uncommitted changes)"
+    (tmp_repo / "untracked.txt").write_text("not committed\n")
+    assert git_state(str(tmp_repo)) == "git branch: main"
 
 
 def test_real_git_state_stays_out_of_the_system_prompt_and_in_the_environment(tmp_repo):
@@ -101,13 +102,6 @@ def _script(path: Path, marker: Path, *, then: str = "") -> Path:
     path.write_text(f"#!/bin/sh\necho ran >> '{marker}'\n{then}\n")
     path.chmod(0o755)
     return path
-
-
-def _git_at_least(major: int, minor: int) -> bool:
-    out = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True).stdout  # noqa: S607
-    found = re.search(r"(\d+)\.(\d+)", out)
-    assert found, out
-    return (int(found[1]), int(found[2])) >= (major, minor)
 
 
 def _make_stale(path: Path) -> None:
@@ -164,41 +158,149 @@ def test_assembling_context_does_not_run_a_hook_the_index_refresh_would_fire(rep
     _assert_runs_it_plain_and_not_when_assembling(repo, marker, stale=repo / "a.txt")
 
 
-@pytest.mark.skipif(
-    not _git_at_least(2, 40),
-    reason="git before 2.40 has no GIT_ATTR_SOURCE to switch attributes off",
-)
-def test_assembling_context_does_not_run_a_clean_filter_a_repository_names(repo, tmp_path):
-    """``status`` compares a file whose stat data changed by running its clean filter, and
-    a filter is a program named by the repository's config and chosen by its attributes."""
+def _filter_marker(repo: Path, tmp_path: Path) -> tuple[Path, Path]:
+    """A clean filter named ``evil`` in the repository's config, and the marker it leaves."""
     marker = tmp_path / "marker"
     cleaner = _script(tmp_path / "clean.sh", marker, then="cat")
+    _git(repo, "config", "filter.evil.clean", str(cleaner))
+    return marker, cleaner
+
+
+def test_assembling_context_does_not_run_a_clean_filter_a_gitattributes_file_selects(
+    repo, tmp_path
+):
+    """``status`` compares a file whose stat data changed by running its clean filter, and
+    a filter is a program named by the repository's config and chosen by its attributes."""
+    marker, _ = _filter_marker(repo, tmp_path)
     (repo / ".gitattributes").write_text("a.txt filter=evil\n")
     _git(repo, "add", ".gitattributes")
     _git(repo, "commit", "-q", "-m", "attributes")
-    _git(repo, "config", "filter.evil.clean", str(cleaner))
     _assert_runs_it_plain_and_not_when_assembling(repo, marker, stale=repo / "a.txt")
 
 
-def test_the_dirty_count_is_still_right_with_the_overrides_in_force(repo):
-    (repo / "a.txt").write_text("changed\n")
-    (repo / "new.txt").write_text("new\n")
-    assert git_state(str(repo)) == "git branch: main (2 file(s) with uncommitted changes)"
+def test_assembling_context_does_not_run_a_clean_filter_info_attributes_selects(repo, tmp_path):
+    """The same filter chosen from ``.git/info/attributes``, which no attribute source
+    override reaches and which git before 2.40 would not have overridden anyway."""
+    marker, _ = _filter_marker(repo, tmp_path)
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "attributes").write_text("a.txt filter=evil\n")
+    _assert_runs_it_plain_and_not_when_assembling(repo, marker, stale=repo / "a.txt")
 
 
-def test_git_state_is_empty_rather_than_wrong_when_status_fails(repo, monkeypatch):
-    """No count is better than a count of zero that only means the question failed."""
-    import nanoclaude.context.git as gitmod
+def test_assembling_context_does_not_run_a_clean_filter_core_attributesfile_selects(repo, tmp_path):
+    marker, _ = _filter_marker(repo, tmp_path)
+    attributes = tmp_path / "attributes"
+    attributes.write_text("a.txt filter=evil\n")
+    _git(repo, "config", "core.attributesFile", str(attributes))
+    _assert_runs_it_plain_and_not_when_assembling(repo, marker, stale=repo / "a.txt")
 
-    real = gitmod.run_git
 
-    def failing_status(root: str, *args: str) -> subprocess.CompletedProcess[str]:
-        if args and args[0] == "status":
-            return subprocess.CompletedProcess(args, 128, stdout="", stderr="fatal: boom")
-        return real(root, *args)
+def test_git_state_is_empty_rather_than_wrong_when_git_fails(repo, monkeypatch):
+    """A branch name printed by a git that then exited non-zero (an unborn branch prints
+    ``HEAD`` and exits 128) is not a statement of fact the model should believe."""
 
-    monkeypatch.setattr("nanoclaude.context.assemble.run_git", failing_status)
+    def failing(root: str, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 128, stdout="HEAD\n", stderr="fatal: boom")
+
+    monkeypatch.setattr("nanoclaude.context.assemble.run_git", failing)
     assert git_state(str(repo)) == ""
+
+
+def test_git_state_is_empty_when_git_prints_no_branch(repo, monkeypatch):
+    def silent(root: str, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(args, 0, stdout="\n", stderr="")
+
+    monkeypatch.setattr("nanoclaude.context.assemble.run_git", silent)
+    assert git_state(str(repo)) == ""
+
+
+def test_git_state_is_empty_when_git_cannot_be_run_or_takes_too_long(repo, monkeypatch):
+    def missing(root: str, *args: str) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError("git")
+
+    def slow(root: str, *args: str) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(args, 5.0)
+
+    for failure in (missing, slow):
+        monkeypatch.setattr("nanoclaude.context.assemble.run_git", failure)
+        assert git_state(str(repo)) == ""
+
+
+def test_an_unborn_branch_gets_no_git_line_not_a_wrong_one(tmp_path):
+    path = tmp_path / "fresh"
+    path.mkdir()
+    _git(path, "init", "-q", "-b", "main")
+    assert git_state(str(path)) == ""
+
+
+def test_the_only_git_commands_assembling_context_runs_are_rev_parse_forms(repo, monkeypatch):
+    """Anything that reads the working tree (``status``, ``diff``, ``ls-files``) can run a
+    program the repository configures, by a route nobody has listed yet."""
+    real = subprocess.run
+    seen: list[list[str]] = []
+
+    def recording(argv: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.append(list(argv))
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording)
+    assemble(str(repo), cwd=str(repo), home=None)
+    git_calls = [argv for argv in seen if argv and argv[0] == "git"]
+    assert git_calls, "assembling the context asked git nothing; the test proves nothing"
+    assert {argv[3] for argv in git_calls} == {"rev-parse"}, git_calls
+
+
+# ---- run_git itself refuses anything but rev-parse
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("status", "--porcelain"),
+        ("diff",),
+        ("log", "-1"),
+        ("ls-files",),
+        ("show", "HEAD"),
+        ("fetch",),
+        ("-c", "core.pager=x", "rev-parse", "HEAD"),  # an option in front of the subcommand
+        ("--git-dir=.git", "rev-parse"),
+        ("Rev-Parse", "HEAD"),
+        ("rev-parser",),
+        ("",),
+        (),
+    ],
+    ids=repr,
+)
+def test_run_git_refuses_everything_but_rev_parse(repo, monkeypatch, args):
+    def must_not_run(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise AssertionError("a refused git command was started")
+
+    monkeypatch.setattr(subprocess, "run", must_not_run)
+    with pytest.raises(ValueError, match="rev-parse"):
+        run_git(str(repo), *args)
+
+
+def test_run_git_keeps_the_settings_that_were_there_before_the_rule(repo, monkeypatch):
+    """With only rev-parse run, no route reaches these three, so no behaviour test can tell
+    that they are there; they are kept as a second line, and pinned here as they are."""
+    real = subprocess.run
+    seen: dict[str, Any] = {}
+
+    def recording(argv: list[str], *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        seen.update(argv=list(argv), env=kwargs["env"])
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording)
+    run_git(str(repo), "rev-parse", "HEAD")
+    assert seen["argv"][:3] == ["git", "-c", "core.fsmonitor=false"]
+    assert seen["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+    assert seen["env"]["GIT_ATTR_SOURCE"] == EMPTY_TREE
+
+
+def test_run_git_runs_a_rev_parse_form(repo):
+    done = run_git(str(repo), "rev-parse", "--abbrev-ref", "HEAD")
+    assert (done.returncode, done.stdout.strip()) == (0, "main")
+    assert run_git(str(repo), "rev-parse", "--show-toplevel").returncode == 0
 
 
 def test_git_is_run_from_one_place():
