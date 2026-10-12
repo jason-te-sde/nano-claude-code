@@ -69,7 +69,7 @@ What a tool returns is stripped of terminal control sequences before it goes any
 
 `read_refusal(policy, *paths)` asks the policy whether a `Read` of a file would be refused, and is the one question that `Grep`'s matches, an `@` mention, the project map and the instruction files ask, so that a rule or a credentials path that holds for `Read` holds for all of them and cannot drift from it. It can leave out the sandbox's row, for a file that is outside the sandbox by design (the instruction files of the directories above the project root), whose place has been settled by a boundary of its own.
 
-The rule id of the decision is what a refusal quotes (`refused (sandbox.outside-root): ...`), what `/status` shows and what the audit table stores, so the ids are a contract. These eighteen exist:
+The rule id of the decision is what a refusal quotes (`refused (sandbox.outside-root): ...`), what the `-p` declined line names and what the audit table stores, so the ids are a contract. These eighteen exist:
 
 | Rule id | Decision | Meaning |
 | --- | --- | --- |
@@ -147,7 +147,7 @@ A retry is shown as it happens and is not stored: the audit table is keyed by to
 
 ## Configuration
 
-Two files, merged key by key, validated on load, with the trust rules of [configuration.md](configuration.md). Each file is checked on its own, before the merge, so that a message can name the file that holds the mistake. Nothing in a file is silently ignored: a key or section that nothing reads is an error.
+Two files, merged key by key, validated on load, with the trust rules of [configuration.md](configuration.md). Each file is checked on its own, before the merge, so that a message can name the file that holds the mistake. Nothing in a file is silently ignored: a key or section that the schema does not have is an error. A few that it does have are read by nothing yet, the shell limits and the `[ui]` section, and the reference says which.
 
 ## Where v0.1 differs from the plan
 

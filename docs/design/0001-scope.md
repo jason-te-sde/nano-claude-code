@@ -34,7 +34,7 @@ A release is judged by whether a stranger can install it, use it, and not lose a
 
 What waits does so for one of three reasons. It needs something that is not built yet (background commands need the shell tool). It opens a trust boundary that has to be designed whole (hooks, MCP, plugins, WebFetch). Or it is a product of its own (agent teams, a marketplace). The last group is not scheduled at all: those items were weighed and left out, and the list says so in the same words, so that nobody reads an omission as an oversight.
 
-Two things are decided by absence rather than by a flag. A configuration file that names a section this version does not read is refused (`hooks`, `mcp`, `verify` and `tools` are all refused today), because a guard that is silently ignored is worse than one that is not there. And a slash command for a subsystem that does not exist is not stubbed: `/rewind` and `/mcp` are not commands at all.
+Two things are decided by absence rather than by a flag. A configuration file that names a section this version does not have is refused (`hooks`, `mcp`, `verify` and `tools` are all refused today), because a guard that is silently ignored is worse than one that is not there. And a slash command for a subsystem that does not exist is not stubbed: `/rewind` and `/mcp` are not commands at all.
 
 ## Costs
 
