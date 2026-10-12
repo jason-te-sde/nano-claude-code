@@ -9,11 +9,12 @@ just runs its calls one at a time.
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
+
+from nanoclaude.private import write_private
 
 #: The cache's file, inside the directory ncc keeps its state in. Named once, so that the
 #: command that reads the cache and the one that clears it cannot disagree about where it is.
@@ -43,7 +44,8 @@ CONSERVATIVE_DEFAULT = Capabilities(
     max_output=2_048,
 )
 
-# Checked 2026-10-02 against each model's page on platform.claude.com: the
+# Checked 2026-10-02 against each model's page on platform.claude.com, and again on
+# 2026-10-07 for Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 on the models overview: the
 # context window and the synchronous Messages API's max output.
 _CURRENT_CLAUDE = Capabilities(True, True, "explicit", 1_000_000, 128_000, "thinking", True)
 _HAIKU_4_5 = Capabilities(True, True, "explicit", 200_000, 64_000, "thinking", True)
@@ -54,7 +56,9 @@ _KNOWN: dict[tuple[str, str], Capabilities] = {
     ("anthropic", "claude-opus-5"): _CURRENT_CLAUDE,
     ("anthropic", "claude-sonnet-5-5"): _CURRENT_CLAUDE,
     ("anthropic", "claude-sonnet-5"): _CURRENT_CLAUDE,
-    # The alias and the dated id it points to.
+    # 1M window, 128K max output, adaptive thinking (models overview, 2026-10-07).
+    ("anthropic", "claude-haiku-5-5"): _CURRENT_CLAUDE,
+    # Legacy since 2026-10-07 but still served. The alias and the dated id it points to.
     ("anthropic", "claude-haiku-4-5"): _HAIKU_4_5,
     ("anthropic", "claude-haiku-4-5-20251001"): _HAIKU_4_5,
     # The model ncc init offers for OpenRouter. Checked 2026-10-07 against OpenRouter's public
@@ -156,17 +160,14 @@ class CapabilityCache:
             "reasoning": caps.reasoning,
             "vision": caps.vision,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Written atomically: a sibling temp file is fully flushed first, then
-        # swapped into place with a single rename. A reader can only ever see
-        # the old complete file or the new complete file, never a half-written
-        # one from a process that died mid-write. The pid qualifies the temp
-        # name so two `ncc` processes racing on the same cache file write
-        # their own temp file rather than clobbering each other's partial
-        # write before either gets to replace().
-        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-        tmp.replace(self.path)
+        # Written atomically and privately, by the one routine ncc keeps files under its
+        # home with: a sibling temp file, made private as it is made and fully flushed
+        # first, is swapped into place with a single rename. A reader can only ever see
+        # the old complete file or the new complete file, never a half-written one from a
+        # process that died mid-write. The pid qualifies the temp name so two `ncc`
+        # processes racing on the same cache file write their own temp file rather than
+        # clobbering each other's partial write before either gets to replace().
+        write_private(self.path, json.dumps(data, indent=2, sort_keys=True), replace=True)
 
 
 async def resolve_capabilities(

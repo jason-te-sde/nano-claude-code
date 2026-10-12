@@ -6,7 +6,7 @@ Python 3.11 or newer. macOS or Linux — Windows is not supported (see the READM
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev,shell,openai]"
+pip install -e ".[dev]"
 ```
 
 ## Before you push

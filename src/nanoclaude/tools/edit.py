@@ -29,6 +29,7 @@ from nanoclaude.permissions.policy import PermissionRequest
 from nanoclaude.providers.base import ToolSpec
 from nanoclaude.tools.base import ToolArgumentError, ToolContext, ToolOutcome, failed, ok
 from nanoclaude.tools.fs import FileSystemError, read_text, write_atomic
+from nanoclaude.tools.keyblocks import mask_text
 
 _CURLY = str.maketrans(
     {"\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"'}
@@ -255,9 +256,17 @@ class EditTool:
             return failed(call_id, f"{shown}: the edit produced no change")
 
         stamp = write_atomic(resolved, updated)
-        diff = unified_diff(snapshot.content, updated, shown)
-        # The diff carries the lines around the edit as context, and those reach the
-        # model and the transcript like any tool output, so they are scrubbed alike.
+        # The diff carries the lines around the edit as context, and those reach the model and
+        # the transcript like any tool output. A line inside a private key block is masked in
+        # the old content and in the new before the two are compared: the extent of a block is
+        # a fact about the whole content, and three lines of context cannot see it.
+        diff = unified_diff(
+            mask_text(ctx.redactor, snapshot.content), mask_text(ctx.redactor, updated), shown
+        )
+        if not diff:
+            # What changed is all inside a block, and is not shown: said, not left looking
+            # as if nothing had.
+            diff = "(the change is inside a private key block, which is not shown)\n"
         scrubbed, _ = ctx.redactor.scrub(diff)
         return ok(call_id, f"Edited {shown}\n{scrubbed}", ((resolved, stamp),))
 

@@ -19,21 +19,25 @@ a delay of a millisecond, and cancellation is driven with events.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import json
 import re
+import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
 from nanoclaude.agent.loop import StopReason
+from nanoclaude.agent.router import Router
 from nanoclaude.agent.session import Session, new_session_id
 from nanoclaude.agent.ui import Approval, AutoApprove, AutoDecline
-from nanoclaude.config.schema import LimitsConfig, ModelConfig, RolesConfig
+from nanoclaude.config.schema import Config, LimitsConfig, ModelConfig, RolesConfig
+from nanoclaude.context.git import run_git
 from nanoclaude.conversation.budget import (
     Budget,
     ContextTooSmallError,
@@ -53,8 +57,18 @@ from nanoclaude.conversation.transcript import (
     user_text,
     validate,
 )
+from nanoclaude.permissions.policy import PermissionRequest
+from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.prompts import SYSTEM_PROMPT
-from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, StopKind, Usage
+from nanoclaude.providers.base import (
+    CredentialsError,
+    ModelError,
+    ModelReply,
+    ModelRequest,
+    StopKind,
+    ToolSpec,
+    Usage,
+)
 from nanoclaude.providers.capabilities import (
     CONSERVATIVE_DEFAULT,
     Capabilities,
@@ -65,6 +79,7 @@ from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, calls_many, cut_off, says
 from nanoclaude.testing.session import ScriptedClient, ScriptedSession, build_session
 from nanoclaude.tools.base import ToolContext, ToolOutcome
+from nanoclaude.tools.registry import ToolRegistry, default_registry
 
 #: A model id neither the capability table nor the price book has heard of. Its
 #: cost is unknown, and it gets the conservative capabilities unless a test gives
@@ -104,8 +119,17 @@ def _no_git(monkeypatch: pytest.MonkeyPatch) -> None:
     Which branch the repository is on has no bearing on anything tested here, and
     a temp directory that happened to sit inside another repository would change
     the system prompt from machine to machine. assemble() has its own tests.
+
+    The same goes for the question of which repository the project is in, which decides
+    whose instructions are read (spec 7.1): here it is none, and the tests that want one
+    ask for the ``repository`` fixture.
     """
     monkeypatch.setattr("nanoclaude.context.assemble.git_state", lambda _root: "")
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", _git_is_not_asked)
+
+
+def _git_is_not_asked(*_args: object, **_kwargs: object) -> NoReturn:
+    raise OSError("git is not run by these tests")
 
 
 class Watcher(AutoApprove):
@@ -703,6 +727,30 @@ async def test_a_bug_in_one_tool_does_not_end_the_session(tmp_repo, monkeypatch)
     assert (row["outcome"], row["session_id"]) == ("error", session.session_id)
 
 
+async def test_a_cancelled_confirmation_leaves_the_audit_row_with_the_outcome_cancelled(tmp_repo):
+    """What Ctrl+C at a confirmation does, end to end: the REPL catches the cancellation and
+    carries on, so the row of the call it cancelled must say so, and the next prompt, which
+    mends the transcript, finds nothing in the audit left open."""
+
+    class Cancelling(AutoApprove):
+        async def confirm(self, *_args: object) -> Approval:
+            raise asyncio.CancelledError
+
+    session = build_session(
+        tmp_repo,
+        [calls("Write", {"path": "a.txt", "content": "A"}, call_id="t1")],
+        ui=Cancelling(),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await session.run("write it")
+    assert session.store is not None
+    row = session.store.db.execute(
+        "SELECT outcome, decision FROM tool_calls WHERE tool_use_id = 't1'"
+    ).fetchone()
+    assert (row["outcome"], row["decision"]) == ("cancelled", "ask")
+    assert not (tmp_repo / "a.txt").exists()
+
+
 # --------------------------------------------------------------------------
 # Carried note: the retry policy and ui.on_retry
 # --------------------------------------------------------------------------
@@ -934,7 +982,7 @@ async def test_the_context_is_assembled_once_for_each_request_and_shared_with_th
 
 async def test_a_window_smaller_than_the_fixed_prompt_cannot_be_compacted_and_says_so(tmp_repo):
     session = build_session(tmp_repo, [says("never asked")], context_window=2_000)
-    with pytest.raises(ContextTooSmallError, match="Compacting cannot help"):
+    with pytest.raises(ContextTooSmallError, match="compacting cannot help"):
         await session.run("hello")
     assert session.model.requests == []  # refused before anything was sent
 
@@ -2311,6 +2359,17 @@ async def test_a_mention_of_a_secrets_file_is_expanded_only_when_the_policy_allo
     assert "GREETING=hello" in allowing.model.requests[0].transcript.messages[0].text()
 
 
+async def test_a_mention_of_a_file_a_read_deny_rule_covers_is_not_inlined(tmp_repo):
+    (tmp_repo / "secrets").mkdir()
+    (tmp_repo / "secrets" / "notes.txt").write_text("launch code 1234\n")
+    session = build_session(tmp_repo, [says("ok")])
+    session.policy = replace(session.policy, rules=RuleSet.build(deny=["Read(secrets/**)"]))
+    await session.run("what is in @secrets/notes.txt")
+    first = session.model.requests[0].transcript.messages[0].text()
+    assert "launch code" not in first
+    assert "was not inlined" in first and "rule.deny" in first
+
+
 async def test_global_instructions_come_from_the_sessions_home(tmp_repo):
     home = tmp_repo / "elsewhere"
     (home / ".nanoclaude").mkdir(parents=True)
@@ -2318,6 +2377,56 @@ async def test_global_instructions_come_from_the_sessions_home(tmp_repo):
     session = build_session(tmp_repo, [says("ok")], home=home)
     await session.run("hello")
     assert "Always answer in haiku." in session.model.requests[0].system
+
+
+async def test_an_instruction_file_that_leads_out_of_the_root_is_not_in_the_request(tmp_repo):
+    outside = tmp_repo.parent / f"{tmp_repo.name}-outside"
+    outside.mkdir()
+    (outside / "private.txt").write_text("outside secret: orange\n")
+    (tmp_repo / "NANO.md").symlink_to(outside / "private.txt")
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    assert "orange" not in session.model.requests[0].system
+
+
+async def test_the_instructions_in_the_request_are_scrubbed_by_the_sessions_redactor(tmp_repo):
+    token = "ghp_" + hashlib.sha256(b"session").hexdigest()[:36]
+    (tmp_repo / "NANO.md").write_text(f"Deploy with {token}.\n")
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert token not in system and "Deploy with" in system
+
+
+async def test_the_instructions_are_scrubbed_by_the_redactor_the_session_holds(tmp_repo):
+    token = "ghp_" + hashlib.sha256(b"session-own").hexdigest()[:36]
+    (tmp_repo / "NANO.md").write_text(f"Deploy with {token}.\n")
+    session = build_session(tmp_repo, [says("ok")])
+    session.redactor = replace(session.redactor, enabled=False)
+    await session.run("hello")
+    assert token in session.model.requests[0].system
+
+
+async def test_a_read_deny_rule_keeps_an_instruction_file_out_of_the_request(tmp_repo):
+    (tmp_repo / "NANO.md").write_text("Never mention the orange.\n")
+    session = build_session(tmp_repo, [says("ok")])
+    session.policy = replace(session.policy, rules=RuleSet.build(deny=["Read(NANO.md)"]))
+    await session.run("hello")
+    assert "orange" not in session.model.requests[0].system
+
+
+async def test_the_project_map_in_the_request_leaves_out_what_the_policy_would_not_show(tmp_repo):
+    (tmp_repo / ".env").write_text("x")
+    (tmp_repo / "app.py").write_text("")
+    (tmp_repo / "vault").mkdir()
+    (tmp_repo / "vault" / "keys.txt").write_text("x")
+    session = build_session(tmp_repo, [says("ok")])
+    session.policy = replace(session.policy, rules=RuleSet.build(deny=["Read(vault)"]))
+    await session.run("hello")
+    system = session.model.requests[0].system
+    shown = {line.strip() for line in system.split("Project structure:", 1)[1].splitlines()}
+    assert "app.py" in shown
+    assert shown.isdisjoint({".env", "vault/", "keys.txt"}), shown
 
 
 async def test_the_todo_list_the_model_writes_is_the_one_the_session_holds(tmp_repo):
@@ -3576,3 +3685,116 @@ async def test_a_client_that_cannot_be_made_leaves_no_request_open(tmp_repo, mon
         await session.run("hello")
     assert stage.events == []
     assert stage.open == 0
+
+
+# --------------------------------------------------------------------------
+# What the prompt says about running commands follows the tools the session has
+# --------------------------------------------------------------------------
+
+
+class _Shell:
+    """A tool named Bash, for a registry that has one. It runs nothing."""
+
+    name = "Bash"
+    read_only = False
+
+    def spec(self) -> ToolSpec:
+        return ToolSpec("Bash", "Run a command.", {"type": "object", "properties": {}})
+
+    def permission_request(
+        self,
+        ctx: ToolContext,  # noqa: ARG002 - the protocol's signature
+        arguments: Mapping[str, Any],  # noqa: ARG002 - the protocol's signature
+    ) -> PermissionRequest:
+        return PermissionRequest("Bash", "true")
+
+    async def run(
+        self,
+        ctx: ToolContext,  # noqa: ARG002 - the protocol's signature
+        call_id: str,
+        arguments: Mapping[str, Any],  # noqa: ARG002 - the protocol's signature
+    ) -> ToolOutcome:
+        return ToolOutcome(call_id, "")
+
+
+async def test_a_session_without_a_tool_that_runs_commands_is_not_told_to_run_tests(tmp_repo):
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert "After changing code, run the project's tests" not in system
+    assert "cannot run commands" in system
+
+
+async def test_a_session_whose_registry_has_bash_is_told_to_run_tests(tmp_repo):
+    session = build_session(tmp_repo, [says("ok")])
+    session.registry = ToolRegistry([*default_registry(), _Shell()])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert "After changing code, run the project's tests" in system
+    assert "cannot run commands" not in system
+
+
+# --------------------------------------------------------------------------
+# A role whose model has no key stops the session at the start
+# --------------------------------------------------------------------------
+
+
+def test_a_session_whose_compact_model_has_no_key_is_refused_before_anything_is_stored(tmp_repo):
+    built = build_session(tmp_repo, [says("never asked")])
+    models = {
+        "m": ModelConfig("anthropic", "claude-sonnet-5"),
+        "cheap": ModelConfig("anthropic", "claude-haiku-4-5", api_key_env="CHEAP_KEY"),
+    }
+    config = Config(
+        models=models,
+        roles=RolesConfig("m", "m", "m", "m", "cheap", "m"),
+        env={"ANTHROPIC_API_KEY": "k"},
+    )
+    router = Router(config, built.router.cache)
+    store = Store(tmp_repo / "sessions.db")
+    store.open()
+    with pytest.raises(CredentialsError) as caught:
+        Session(
+            root=str(tmp_repo),
+            config=config,
+            router=router,
+            registry=built.registry,
+            policy=built.policy,
+            store=store,
+            session_id="abc123",
+        )
+    assert str(caught.value) == (
+        "role 'compact' uses model 'cheap', which needs CHEAP_KEY — set it, or run: ncc init"
+    )
+    # Refused first: a session that never started leaves no row behind to resume.
+    assert store.session_row("abc123") is None
+
+
+# --------------------------------------------------------------------------
+# The instructions a session sends are the repository's, from its top level down to the root
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A real git repository, and git asked about it for real again.
+
+    The placeholder ``.git`` of ``tmp_repo`` is not one, and the autouse fixture above has
+    stopped the session asking.
+    """
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", run_git)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S607
+    return tmp_path
+
+
+async def test_a_session_whose_root_is_inside_a_repository_sends_the_repositorys_instructions(
+    repository,
+):
+    (repository / "NANO.md").write_text("Rule from the top of the repository.\n")
+    app = repository / "app"
+    app.mkdir()
+    (app / "NANO.md").write_text("Rule from the project.\n")
+    session = build_session(app, [says("ok")])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert system.index("Rule from the top") < system.index("Rule from the project")

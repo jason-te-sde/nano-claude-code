@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
@@ -21,8 +21,16 @@ def _no_git(monkeypatch: pytest.MonkeyPatch) -> None:
     Which branch the repository is on has no bearing on anything tested here, and a
     temp directory that happened to sit inside another repository would change the
     system prompt from machine to machine. assemble() has its own tests.
+
+    The same goes for the question of which repository the project is in, which decides
+    whose instructions are read (spec 7.1): here it is none.
     """
     monkeypatch.setattr("nanoclaude.context.assemble.git_state", lambda _root: "")
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", _git_is_not_asked)
+
+
+def _git_is_not_asked(*_args: object, **_kwargs: object) -> NoReturn:
+    raise OSError("git is not run by these tests")
 
 
 @pytest.fixture(autouse=True)

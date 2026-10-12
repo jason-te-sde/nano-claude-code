@@ -12,7 +12,18 @@ Streams are a contract too. stdout carries the answer and nothing else, written 
 the model wrote it: not through Rich, which would read ``[...]`` in code as markup and wrap
 a long line at 80 columns when the output is a file. Everything that went wrong is one line
 on stderr in the form of spec 17.9, and a run that fails with nothing to show leaves stdout
-empty.
+empty. So is each call a headless run had to decline, because nobody was there to ask: one
+``ncc: declined ...`` line each (see :mod:`nanoclaude.cli.headless`).
+
+With ``--output-format json`` stdout is one JSON object, however the run ended. A failure's
+object has the keys a finished run's has, with ``is_error`` true, ``stop_reason`` ``"error"``,
+what was spent so far (nothing, before there was a session), ``error`` as the stderr line
+without its prefix and ``exit_code`` as the process's. The format is read from the parsed
+arguments; a mistake that stops them being parsed is answered in JSON when the arguments typed
+say ``--output-format json`` (the last such flag winning, as in the parser) and as a line on
+stderr alone otherwise, because a format that was not given, or was not one there is, is not
+one to answer in. ``--help`` and ``--version`` are text, and a reader that has closed stdout
+is not written to (exit 141).
 """
 
 from __future__ import annotations
@@ -44,9 +55,10 @@ from nanoclaude.agent.session import (
     UnknownSessionError,
     new_session_id,
 )
-from nanoclaude.agent.ui import UI, AutoDecline
+from nanoclaude.agent.ui import UI
+from nanoclaude.cli.headless import ReportingDecline
 from nanoclaude.cli.init import run_init
-from nanoclaude.cli.render import ConsoleUI, show_error
+from nanoclaude.cli.render import ConsoleUI, error_text, show_error
 from nanoclaude.cli.repl import run_repl
 from nanoclaude.config.load import CONFIG_DIRNAME, ConfigError, expand_root, load_config
 from nanoclaude.config.schema import ROLES
@@ -56,8 +68,9 @@ from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import PermissionMode, Policy
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
 from nanoclaude.permissions.rules import RuleSet
-from nanoclaude.permissions.sandbox import Sandbox
-from nanoclaude.providers.base import CredentialsError, ModelError
+from nanoclaude.permissions.sandbox import Sandbox, is_within
+from nanoclaude.private import narrow_file
+from nanoclaude.providers.base import CredentialsError, ModelError, Usage
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CapabilityCache
 from nanoclaude.tools.base import sanitize
 from nanoclaude.tools.registry import default_registry
@@ -125,8 +138,9 @@ def _turns(text: str) -> int:
     return value
 
 
-#: What ``--mode`` may be set to by itself. Bypass is also a mode, but only with the flag
-#: whose name says so, and what is offered to someone who typed a mode wrongly is not that.
+#: What ``--mode`` may be set to. Bypass is also a mode, but it is turned on only by the flag
+#: whose name says so (spec 6.2), so it is not one of these, and what is offered to someone
+#: who typed a mode wrongly is not that.
 _MODES = tuple(mode.value for mode in PermissionMode if mode is not PermissionMode.BYPASS)
 _OUTPUT_FORMATS = ("text", "json")
 
@@ -149,13 +163,29 @@ def _long(flag: str) -> str:
     return flag.rpartition("/")[2]
 
 
-def _flag_error(message: str) -> str:
+def _typed_the_flag(typed: Sequence[str], flag: str) -> bool:
+    """Whether the arguments, as typed, hold ``flag``: the exact word, before any bare ``--``.
+
+    For an error worded from the one argument argparse stopped at, when what to do about it
+    depends on what else was typed. Nothing after a bare ``--`` is a flag, and only the exact
+    spelling counts: no other turns anything on.
+    """
+    for word in typed:
+        if word == "--":
+            return False
+        if word == flag:
+            return True
+    return False
+
+
+def _flag_error(message: str, typed: Sequence[str] = ()) -> str:
     """What argparse found wrong, as spec 17.9 words an error: what happened, a dash, what to do.
 
     argparse words these for itself and puts what was typed into them as it was. The line is
     printed through ``show_error``, which makes it one line without anything in it for a
     terminal to act on; this gives it the form. What is not one of the cases it knows is
-    still said, with where to look.
+    still said, with where to look. ``typed`` is what was typed, for the one case whose advice
+    depends on it.
     """
     if match := _EXPECTED_ONE.fullmatch(message):
         flag = _long(match["flag"])
@@ -174,6 +204,18 @@ def _flag_error(message: str) -> str:
                 f"{value} is not a command \u2014 the only command is {', '.join(_COMMANDS)}; "
                 "to give ncc a task, pass it with -p"
             )
+        if flag == "--mode" and value == PermissionMode.BYPASS:
+            # The flag is passed already when it is beside the mode, and what is left is to
+            # leave the mode out; advice to pass it would send the person round in a circle.
+            advice = (
+                "leave --mode bypass out"
+                if _typed_the_flag(typed, "--dangerously-skip-permissions")
+                else "pass that flag"
+            )
+            return (
+                f"{PermissionMode.BYPASS} is turned on by --dangerously-skip-permissions, "
+                f"not by --mode \u2014 {advice}"
+            )
         what, choices = ("mode", _MODES) if flag == "--mode" else ("format", _OUTPUT_FORMATS)
         return f"{flag} {value} is not a {what} — choose one of {', '.join(choices)}"
     if match := _NOT_ALLOWED.fullmatch(message):
@@ -190,12 +232,17 @@ class _Parser(argparse.ArgumentParser):
     stdout and exit 0.
     """
 
+    #: What was typed, for a mistake whose advice depends on what else was: argparse words it
+    #: from the one argument it stopped at, and stops at the first.
+    _typed: Sequence[str] = ()
+
     def error(self, message: str) -> NoReturn:
-        raise UsageError(_flag_error(message))
+        raise UsageError(_flag_error(message, self._typed))
 
     def parse_args(  # type: ignore[override]
         self, args: Sequence[str] | None = None, namespace: argparse.Namespace | None = None
     ) -> argparse.Namespace:
+        self._typed = sys.argv[1:] if args is None else args
         parsed, extra = self.parse_known_args(args, namespace)
         if extra:
             plural = "s" if len(extra) > 1 else ""
@@ -218,24 +265,84 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         choices=_COMMANDS,
         metavar=_COMMAND,
-        help="init: pick a provider, give a key, and write the config; run it once, first",
+        help="init: pick a provider, enter a key, write the config",
     )
-    parser.add_argument("-p", "--print", dest="prompt", metavar="PROMPT", help="run once and exit")
+    parser.add_argument(
+        "-p",
+        "--print",
+        dest="prompt",
+        metavar="PROMPT",
+        help="run PROMPT once, print the answer, and exit",
+    )
     # No default: whether it was given at all is what says it has no use without a prompt.
-    parser.add_argument("--output-format", choices=_OUTPUT_FORMATS)
-    parser.add_argument("--root", default=".", help="working directory (default: cwd)")
-    parser.add_argument("--model", metavar="ALIAS", help="model to use for the main role")
-    parser.add_argument("--role", action="append", default=[], metavar="ROLE=ALIAS")
-    parser.add_argument("--mode", choices=[mode.value for mode in PermissionMode])
-    parser.add_argument("--add-dir", action="append", default=[], metavar="PATH")
-    parser.add_argument("--max-turns", type=_turns, metavar="N")
+    parser.add_argument(
+        "--output-format",
+        choices=_OUTPUT_FORMATS,
+        help="how -p prints its answer (default: text)",
+    )
+    # No default: whether it was given at all is what says it was meant. Left out it is the
+    # working directory, and a working directory that would put a whole home directory in
+    # the sandbox is refused (see _refuse_a_root_that_is_too_wide).
+    parser.add_argument(
+        "--root",
+        default=None,
+        help="project directory (default: here; ~ and / need --root)",
+    )
+    parser.add_argument(
+        "--model", metavar="ALIAS", help="model for the main role, for this run only"
+    )
+    parser.add_argument(
+        "--role",
+        action="append",
+        default=[],
+        metavar="ROLE=ALIAS",
+        help="route one role to a model; may be repeated",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=_MODES,
+        help="permission mode (bypass is a separate flag)",
+    )
+    parser.add_argument(
+        "--add-dir",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="also let the agent work in PATH; may be repeated",
+    )
+    parser.add_argument(
+        "--max-turns", type=_turns, metavar="N", help="most turns one prompt may take (default: 40)"
+    )
     again = parser.add_mutually_exclusive_group()
-    again.add_argument("-c", "--continue", dest="continue_last", action="store_true")
-    again.add_argument("-r", "--resume", metavar="SESSION_ID")
-    parser.add_argument("--allow-secrets", action="store_true")
-    parser.add_argument("--dangerously-skip-permissions", action="store_true")
-    parser.add_argument("--no-color", action="store_true")
-    parser.add_argument("--version", action="version", version=f"nano-claude-code {__version__}")
+    again.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_last",
+        action="store_true",
+        help="go on with the latest session in this directory",
+    )
+    again.add_argument(
+        "-r", "--resume", metavar="SESSION_ID", help="go on with the session with this id"
+    )
+    parser.add_argument(
+        "--allow-secrets",
+        action="store_true",
+        help="let credentials files be read, unredacted",
+    )
+    parser.add_argument(
+        "--dangerously-skip-permissions",
+        action="store_true",
+        help="do not ask before tool calls (the sandbox stays on)",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true", help="no colour in output (NO_COLOR works too)"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"nano-claude-code {__version__}",
+        help="show the version and exit",
+    )
     return parser
 
 
@@ -264,7 +371,34 @@ class _Outcome:
     code: int
 
 
+@dataclass(slots=True)
+class _Run:
+    """What a failed run can still say about itself: the session, once there was one."""
+
+    session: Session | None = None
+
+
+def _asked_for_json(typed: Sequence[str]) -> bool:
+    """Whether the arguments, as typed, ask for ``--output-format json``.
+
+    For a mistake that stopped them being parsed, when the parsed format is not there to ask.
+    The last ``--output-format`` wins, as it does in the parser, and nothing after a bare
+    ``--`` is a flag. Only the exact word counts: a format that is not one there is, is not
+    one to answer in.
+    """
+    wanted = None
+    for index, word in enumerate(typed):
+        if word == "--":
+            break
+        if word == "--output-format" and index + 1 < len(typed):
+            wanted = typed[index + 1]
+        elif word.startswith("--output-format="):
+            wanted = word.partition("=")[2]
+    return wanted == "json"
+
+
 def main(argv: list[str] | None = None) -> int:
+    typed = sys.argv[1:] if argv is None else argv
     try:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
@@ -272,11 +406,14 @@ def main(argv: list[str] | None = None) -> int:
         # process: the console script does, with what it returns.
         return exc.code if isinstance(exc.code, int) else 1
     except UsageError as exc:
-        # Nothing was parsed, so whether colour was asked off is read from what was typed.
-        flagged = "--no-color" in (sys.argv[1:] if argv is None else argv)
-        show_error(_stderr_console(flagged), str(exc))
-        return EXIT_CODES["usage"]
+        # Nothing was parsed, so whether colour was asked off, and whether the answer is to
+        # be JSON, are read from what was typed.
+        return _end_with(
+            exc, _stderr_console("--no-color" in typed), as_json=_asked_for_json(typed)
+        )
     err = _stderr_console(args.no_color)
+    as_json = args.output_format == "json"
+    run = _Run()
     try:
         home = nanoclaude_home()
         if args.command == "init":
@@ -292,45 +429,68 @@ def main(argv: list[str] | None = None) -> int:
             raise UsageError(
                 "no prompt and no terminal — pass a prompt with -p, or run ncc in a terminal"
             )
-        settings = _settings(args)
+        settings = _settings(args, home)
         _warn_about_switches(args, err)
         if args.prompt is None:
             return asyncio.run(
                 _run_interactive(args, settings, home, _stdout_console(args.no_color))
             )
-        outcome = asyncio.run(_run_headless(args, settings, home))
-        _report(outcome, as_json=args.output_format == "json", err=err)
+        outcome = asyncio.run(_run_headless(args, settings, home, err, run))
+        _report(outcome, as_json=as_json, err=err)
         return outcome.code
-    except (UsageError, UnknownSessionError) as exc:
-        show_error(err, str(exc))
-        return EXIT_CODES["usage"]
-    except (ConfigError, ContextTooSmallError, CredentialsError) as exc:
-        # A key that is missing or refused is mended in the configuration, as the rest are.
-        show_error(err, str(exc))
-        return EXIT_CODES["config"]
-    except SessionChangedError as exc:
-        show_error(err, str(exc))
-        return EXIT_CODES["stopped"]
-    except ModelError as exc:
-        show_error(err, _with_advice(str(exc), _PROVIDER_ADVICE))
-        return EXIT_CODES["provider"]
-    except StoreOpenError as exc:
-        show_error(err, str(exc))
-        return EXIT_CODES["stopped"]
     except BrokenPipeError:
         _abandon_stdout()
         return EXIT_CODES["output_closed"]
-    except KeyboardInterrupt as exc:
+    except (Exception, KeyboardInterrupt) as exc:
+        return _end_with(exc, err, as_json=as_json, session=run.session)
+
+
+def _failure(exc: BaseException) -> tuple[str, int]:
+    """The line for a person, and the exit code, for an exception that ended the run.
+
+    The order is the order of the cases: a key that is missing or refused is mended in the
+    configuration, as the rest are, and is a :class:`ModelError` that must not be taken for a
+    failure of the provider. Last is anything nobody planned for: a script reads the exit
+    code and the first line of stderr, and a traceback is neither.
+    """
+    if isinstance(exc, (UsageError, UnknownSessionError)):
+        return str(exc), EXIT_CODES["usage"]
+    if isinstance(exc, (ConfigError, ContextTooSmallError, CredentialsError)):
+        return str(exc), EXIT_CODES["config"]
+    if isinstance(exc, SessionChangedError | StoreOpenError):
+        return str(exc), EXIT_CODES["stopped"]
+    if isinstance(exc, ModelError):
+        return _with_advice(str(exc), _PROVIDER_ADVICE), EXIT_CODES["provider"]
+    if isinstance(exc, KeyboardInterrupt):
         # Ctrl+C has no words of its own; one that came with a message (ncc init, interrupted
         # after it wrote the config) has, and a person who is told nothing more was done when
         # a file was written is told something false.
-        show_error(err, str(exc) or "interrupted \u2014 nothing more was done; run again to retry")
-        return EXIT_CODES["interrupted"]
-    except Exception as exc:
-        # Last, after every exception that has a line and a code of its own. A script reads
-        # the exit code and the first line of stderr, and a traceback is neither.
-        show_error(err, _unexpected(exc))
-        return EXIT_CODES["stopped"]
+        words = str(exc) or "interrupted \u2014 nothing more was done; run again to retry"
+        return words, EXIT_CODES["interrupted"]
+    return _unexpected(exc), EXIT_CODES["stopped"]
+
+
+def _end_with(
+    exc: BaseException, err: Console, *, as_json: bool, session: Session | None = None
+) -> int:
+    """End a run that failed: the line on stderr, and for JSON the one object on stdout.
+
+    ``session`` is the run's own, if it got as far as one: what it had spent is reported
+    even though the run did not finish. The object is written first, as for a run that ends
+    with a stop line, so that a script reading stdout has it by the time stderr is read.
+    """
+    message, code = _failure(exc)
+    if as_json:
+        turns = session.state.turn if session is not None else 0
+        payload = _payload(session, "", "error", turns, error=message, code=code)
+        try:
+            print(json.dumps(payload, indent=2))
+            sys.stdout.flush()
+        except BrokenPipeError:
+            _abandon_stdout()
+            return EXIT_CODES["output_closed"]
+    show_error(err, message)
+    return code
 
 
 def _init(args: argparse.Namespace, home: Path, err: Console, typed: Sequence[str]) -> int:
@@ -361,7 +521,7 @@ def _init(args: argparse.Namespace, home: Path, err: Console, typed: Sequence[st
         return EXIT_CODES["stopped"]
 
 
-def _settings(args: argparse.Namespace) -> _Settings:
+def _settings(args: argparse.Namespace, home: Path) -> _Settings:
     mode = _permission_mode(args)
     roles = _role_overrides(args.role)
     # Given and empty is not left out: "$UNSET" in a script says something went wrong, and a
@@ -376,7 +536,9 @@ def _settings(args: argparse.Namespace) -> _Settings:
                 f"--model {args.model} and --role main={alias} say different things about the "
                 "main role — pass only one of them"
             )
-    root = _directory("--root", args.root)
+    root = _directory("--root", "." if args.root is None else args.root)
+    if args.root is None:
+        _refuse_a_root_that_is_too_wide(root, home)
     return _Settings(
         root=root,
         roots=(root, *(_directory("--add-dir", raw) for raw in args.add_dir)),
@@ -385,25 +547,52 @@ def _settings(args: argparse.Namespace) -> _Settings:
     )
 
 
+def _refuse_a_root_that_is_too_wide(root: str, home: Path) -> None:
+    """Stop, as a usage error, when the directory ncc was run in would put too much in reach.
+
+    The sandbox is whatever the root holds, and a root that holds a home directory holds the
+    session store (the whole conversation, tool output included), the shell's startup files
+    and every other project there is. That is never what running ``ncc`` somewhere means, so
+    it is refused unless ``--root`` names it, which says it was meant. Three cases, from the
+    widest: the filesystem root; a home directory, the person's own and the one ncc keeps its
+    files in, which are the same unless ``NANOCLAUDE_HOME`` says otherwise; and a directory
+    that holds one of them.
+    """
+    if root == "/":
+        raise UsageError(
+            "the current directory is the filesystem root — every file on this machine would "
+            "be in reach; run ncc from a project directory, or pass --root / if you mean it"
+        )
+    homes = [os.path.realpath(home)]
+    with contextlib.suppress(RuntimeError):  # no home can be found for this user at all
+        homes.append(os.path.realpath(Path.home()))
+    if root in homes:
+        raise UsageError(
+            "the current directory is your home directory — every file in it would be in "
+            "reach; run ncc from a project directory, or pass --root ~ if you mean it"
+        )
+    if any(is_within(root, held) for held in homes):
+        raise UsageError(
+            "the current directory contains your home directory — every file in it would be "
+            f"in reach; run ncc from a project directory, or pass --root {shlex.quote(root)} "
+            "if you mean it"
+        )
+
+
 def _permission_mode(args: argparse.Namespace) -> PermissionMode:
     """The mode the flags ask for. Bypass takes the flag with the long name, and nothing else.
 
     Spec 6.2 makes turning the permission checks off a decision made at start, with a flag
-    whose spelling is the point. ``--mode bypass`` is the same decision spelled the short
-    way, so it is refused alone; and the flag beside a mode that asks for protection is two
-    answers to one question, so it is refused too and not settled quietly in the flag's favour.
+    whose spelling is the point, so ``--mode`` does not take ``bypass`` at all (the parser
+    refuses it, and says which flag does). The flag beside a ``--mode`` that asks for
+    protection is two answers to one question, so it is refused and not settled quietly in
+    the flag's favour.
     """
-    skipping = args.dangerously_skip_permissions
-    if args.mode == PermissionMode.BYPASS and not skipping:
-        raise UsageError(
-            "--mode bypass needs --dangerously-skip-permissions "
-            "— pass that flag as well, or choose another mode"
-        )
-    if skipping:
-        if args.mode not in (None, PermissionMode.BYPASS):
+    if args.dangerously_skip_permissions:
+        if args.mode is not None:
             raise UsageError(
                 f"--mode {args.mode} contradicts --dangerously-skip-permissions "
-                "— pass only one of them"
+                "\u2014 pass only one of them"
             )
         return PermissionMode.BYPASS
     return PermissionMode(args.mode) if args.mode else PermissionMode.DEFAULT
@@ -505,7 +694,7 @@ def _is_busy(exc: BaseException) -> bool:
     )
 
 
-def _unexpected(exc: Exception) -> str:
+def _unexpected(exc: BaseException) -> str:
     """What a person is told of an exception nobody planned for, as spec 17.9 words it."""
     if _is_busy(exc):
         return "the session store is busy — another ncc may be using it; try again"
@@ -562,7 +751,11 @@ def _abandon_stdout() -> None:
 
 
 def _build_session(
-    args: argparse.Namespace, settings: _Settings, home: Path, console: Console | None
+    args: argparse.Namespace,
+    settings: _Settings,
+    home: Path,
+    console: Console | None,
+    err: Console,
 ) -> Session:
     config = load_config(home=str(home), project=settings.root, env=dict(os.environ))
     if args.model is not None:
@@ -587,6 +780,10 @@ def _build_session(
     store = Store(state_dir / "sessions.db")
     try:
         _open(store)
+        # The store has narrowed the directory and its own files. The capability cache is
+        # ncc's too, and a session may never read it (a model the table knows is not looked up
+        # in it), so a cache an earlier version left open to others is narrowed here.
+        narrow_file(state_dir / CACHE_FILENAME)
         session_id, resume = _which_session(args, store, settings.root)
         router = Router(config, CapabilityCache(state_dir / CACHE_FILENAME))
         todo = TodoState()
@@ -599,7 +796,7 @@ def _build_session(
             router=router,
             registry=default_registry(todo),
             policy=policy,
-            ui=_ui(console, settings.root, router),
+            ui=_ui(console, err, settings, router),
             store=store,
             audit=AuditLog(store, redactor),
             session_id=session_id,
@@ -627,16 +824,17 @@ def _open(store: Store) -> None:
         raise StoreOpenError(store.path, exc) from exc
 
 
-def _ui(console: Console | None, root: str, router: Router) -> UI:
+def _ui(console: Console | None, err: Console, settings: _Settings, router: Router) -> UI:
     """The front end for the session: none that asks, for headless, and ConsoleUI for the REPL.
 
-    ConsoleUI is told where the project is, so that it shows ``src/a.py`` and not an absolute
-    path, and how to find the model behind a role, so that its waiting indicator names the
-    model and not the role.
+    Headless declines what would have been asked and says so on ``err``, naming the mode so
+    that its advice is not to turn on what is on. ConsoleUI is told where the project is, so
+    that it shows ``src/a.py`` and not an absolute path, and how to find the model behind a
+    role, so that its waiting indicator names the model and not the role.
     """
     if console is None:
-        return AutoDecline()
-    return ConsoleUI(console, root=root, model_of=_model_of(router))
+        return ReportingDecline(err, root=settings.root, mode=settings.mode)
+    return ConsoleUI(console, root=settings.root, model_of=_model_of(router))
 
 
 def _model_of(router: Router) -> Callable[[str], str]:
@@ -679,15 +877,19 @@ def _which_session(args: argparse.Namespace, store: Store, root: str) -> tuple[s
 async def _run_interactive(
     args: argparse.Namespace, settings: _Settings, home: Path, console: Console
 ) -> int:
-    session = _build_session(args, settings, home, console)
+    session = _build_session(args, settings, home, console, _stderr_console(args.no_color))
     try:
         return await run_repl(session, console, str(home / CONFIG_DIRNAME / "history"))
     finally:
         await session.aclose()
 
 
-async def _run_headless(args: argparse.Namespace, settings: _Settings, home: Path) -> _Outcome:
-    session = _build_session(args, settings, home, None)
+async def _run_headless(
+    args: argparse.Namespace, settings: _Settings, home: Path, err: Console, run: _Run
+) -> _Outcome:
+    session = _build_session(args, settings, home, None, err)
+    # Kept where main can see it: a run that fails still has what it spent to report.
+    run.session = session
     try:
         try:
             done = await session.follow_up(args.prompt)
@@ -702,11 +904,14 @@ async def _run_headless(args: argparse.Namespace, settings: _Settings, home: Pat
             if kept is None:
                 raise ModelError(line) from exc
             # That text is the result there is, and the run still failed.
+            code = EXIT_CODES["provider"]
             return _Outcome(
-                payload=_payload(session, kept, "cut_off", session.state.turn, is_error=True),
+                payload=_payload(
+                    session, kept, "cut_off", session.state.turn, error=line, code=code
+                ),
                 text=kept,
                 error=line,
-                code=EXIT_CODES["provider"],
+                code=code,
             )
         return _finished(session, done)
     finally:
@@ -732,11 +937,13 @@ def _finished(session: Session, done: Done) -> _Outcome:
     # message are the program's own, and belong on stderr.
     models_words = reason in (StopReason.COMPLETED, StopReason.REFUSAL, StopReason.MAX_TOKENS)
     result = _as_written(done) if models_words else done.text
+    error = _stop_line(session, done)
+    code = EXIT_CODES["completed" if completed else "stopped"]
     return _Outcome(
-        payload=_payload(session, result, reason.value, done.state.turn, is_error=not completed),
+        payload=_payload(session, result, reason.value, done.state.turn, error=error, code=code),
         text=result if models_words else "",
-        error=_stop_line(session, done),
-        code=EXIT_CODES["completed" if completed else "stopped"],
+        error=error,
+        code=code,
     )
 
 
@@ -776,11 +983,24 @@ def _stop_line(session: Session, done: Done) -> str | None:
 
 
 def _payload(
-    session: Session, result: str, stop_reason: str, turns: int, *, is_error: bool
+    session: Session | None,
+    result: str,
+    stop_reason: str,
+    turns: int,
+    *,
+    error: str | None,
+    code: int,
 ) -> dict[str, Any]:
-    usage = session.router.total_usage()
+    """The one object ``--output-format json`` prints.
+
+    Every run has the same keys, so that a script reads them without asking which kind of
+    run it was: ``error`` is the stderr line without its prefix (None for a run that
+    finished) and ``exit_code`` the process's. ``session`` is None for a run that failed
+    before there was one, which spent nothing.
+    """
+    usage = session.router.total_usage() if session is not None else Usage()
     return {
-        "session_id": session.session_id,
+        "session_id": session.session_id if session is not None else None,
         "result": result,
         "stop_reason": stop_reason,
         "turns": turns,
@@ -789,8 +1009,10 @@ def _payload(
             "output_tokens": usage.output_tokens,
             "cache_read_tokens": usage.cache_read_tokens,
         },
-        "cost_usd": session.router.total_cost(),
-        "is_error": is_error,
+        "cost_usd": session.router.total_cost() if session is not None else 0.0,
+        "is_error": error is not None,
+        "error": None if error is None else error_text(error),
+        "exit_code": code,
     }
 
 

@@ -13,7 +13,6 @@ dotfiles repository. The pasted key goes to one place only: the verification req
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import os
 import re
 from collections.abc import Callable, Coroutine, Mapping, Sequence
@@ -32,6 +31,7 @@ from nanoclaude.cli.render import show_error
 from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, ConfigError, load_config
 from nanoclaude.config.schema import ROLES, Config, LimitsConfig, PermissionsConfig
 from nanoclaude.conversation.transcript import Transcript, user_text
+from nanoclaude.private import TargetExistsError, write_private
 from nanoclaude.providers.base import EmptyReplyError, ModelError, ModelRequest
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CapabilityCache
 from nanoclaude.tools.base import sanitize
@@ -135,9 +135,10 @@ def render_config(preset: Preset, alias: str, model: str) -> str:
 adapter     = {_toml_string(preset.adapter)}
 model       = {_toml_string(model)}
 {base_url}{key_env}
-# Roles let one session use different models for different jobs. Exploring a
-# codebase is most of the tokens and none of the difficulty, so pointing
-# `explore` at a cheap or local model is the easiest saving available.
+# Roles name the model for each job. In this version only `main` (the conversation) and
+# `compact` (the summary that replaces a long conversation) are routed to a model of their
+# own. `explore`, `plan`, `verify` and `title` are accepted so this file keeps working, but
+# nothing uses them until sub-agents arrive in v0.3.
 # Add another [models.<alias>] block and name it here.
 [roles]
 {roles}
@@ -145,11 +146,12 @@ model       = {_toml_string(model)}
 # What ncc may do without asking, what it asks about, and what it never does.
 [permissions]
 allow = {_list(permissions.allow)}
+# `Bash` and `Git` are reserved for tools this version does not have.
 ask   = {_list(permissions.ask)}
 deny  = ["Read(**/.env*)"]
 
-# Guard rails on one run: how many model turns it may take, and how long a shell command
-# may run, in seconds.
+# Guard rails on one run: how many model turns it may take. `bash_timeout_s` is reserved
+# for a shell tool, which this version does not have, so changing it changes nothing.
 [limits]
 max_turns      = {limits.max_turns}
 bash_timeout_s = {limits.bash_timeout_s:g}
@@ -328,70 +330,6 @@ def _flawed_key_line(whose: str, flaw: str, variable: str) -> str:
     )
 
 
-class _TargetExists(Exception):
-    """The config is there, and the write was not told that replacing it was agreed to."""
-
-
-def _make_private_directories(directory: Path) -> None:
-    """Make ``directory`` and every part of it that is missing, each with mode 0700.
-
-    Only what is made here is touched: a directory that was already there keeps its mode.
-    ``mkdir`` filters its mode by the umask, so that with a umask of 0177 or tighter (any bit
-    of 0300) a new directory would lose its owner's write or search bit and nothing could be
-    made in it; the mode is set again after, and the directory that holds a private config
-    is private too.
-    """
-    missing = []
-    for candidate in (directory, *directory.parents):
-        if candidate.exists():
-            break
-        missing.append(candidate)
-    for candidate in reversed(missing):
-        try:
-            candidate.mkdir(mode=0o700)
-        except FileExistsError:
-            continue
-        candidate.chmod(0o700)
-
-
-def _write_private(path: Path, text: str, *, replace: bool) -> None:
-    """Write ``text`` to ``path``, which exists with mode 0600 from the moment it does.
-
-    The file is made by ``os.open`` with the mode in its arguments, so that no other user
-    can read it between its being made and its being made private; that mode is filtered by
-    the umask (0277 makes it 0400, 0777 makes it 0000), so it is set on the descriptor too.
-    It is then moved into place: a file that was already there is replaced by one that is
-    private, whatever its own mode was, and one that was interrupted leaves no half of a
-    config. ``O_EXCL`` refuses a temporary name that is already there, a link included, so
-    that nothing is written through one.
-
-    ``replace`` says whether replacing a config is agreed to. When it is not, the file is
-    put in place by a hard link, which fails if anything is there, a dangling link included,
-    and :class:`_TargetExists` is raised and nothing is replaced: a config that appeared
-    after the last look is somebody's work.
-    """
-    _make_private_directories(path.parent)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(text)
-        if replace:
-            temporary.replace(path)
-        else:
-            try:
-                os.link(temporary, path)
-            except FileExistsError as exc:
-                raise _TargetExists from exc
-            with contextlib.suppress(OSError):
-                temporary.unlink()
-    except BaseException:
-        with contextlib.suppress(OSError):
-            temporary.unlink()
-        raise
-
-
 def _what_is_there(target: Path) -> str:
     """What the config that is there is, for the question about replacing it.
 
@@ -427,11 +365,11 @@ def _publish(console: Console, ask: Ask, target: Path, text: str, agreed: bool) 
     """
     try:
         try:
-            _write_private(target, text, replace=agreed)
-        except _TargetExists:
+            write_private(target, text, replace=agreed)
+        except TargetExistsError:
             if not _may_replace(console, ask, target):
                 return False
-            _write_private(target, text, replace=True)
+            write_private(target, text, replace=True)
     except OSError as exc:
         reason = exc.strerror or type(exc).__name__
         raise ConfigError(

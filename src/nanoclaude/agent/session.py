@@ -200,6 +200,9 @@ class Session:
         # Empty rather than a placeholder prompt: follow_up() is a valid first
         # call (the REPL makes it after /clear), and it must find the configured
         # turn limit and a transcript it can start.
+        # First, before a row is written for a session that cannot start: every role's model
+        # must have its key (spec 17.9's missing-key line, naming the role and the variable).
+        self.router.check_credentials()
         self.state = LoopState(Transcript(), turn=0, max_turns=self.config.limits.max_turns)
         if self.resume:
             self._take_up_stored_session()
@@ -285,7 +288,7 @@ class Session:
             prompt,
             root=self.root,
             redactor=self.redactor,
-            allow_secrets=self.policy.allow_secrets,
+            policy=self.policy,
         )
         return text
 
@@ -364,7 +367,10 @@ class Session:
             self.root,
             cwd=self.root,
             home=self.home,
+            policy=self.policy,
+            redactor=self.redactor,
             tool_protocol=None if native else render_tools(specs),
+            tools=[tool.name for tool in self.registry],
         )
         return f"{context.system}\n\n{context.environment}", specs if native else ()
 

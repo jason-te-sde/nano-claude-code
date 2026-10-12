@@ -1,10 +1,12 @@
 """Which model plays which role, and what each of them cost.
 
 The reason this exists: exploring a codebase is most of the tokens in a coding
-session and almost none of the difficulty. Sending that to a cheap or local
-model while the main conversation stays on an expensive one is the single
-largest saving available, and it is only possible because the provider
-boundary is neutral.
+session and almost none of the difficulty, so it can be sent to a cheap or local
+model while the main conversation stays on an expensive one. That is only
+possible because the provider boundary is neutral. It is not yet a saving anyone
+can have: in v0.1 only the ``main`` and ``compact`` roles are routed, and
+``explore``, ``plan``, ``verify`` and ``title`` are accepted and checked but
+asked for by nothing until sub-agents arrive in v0.3 (spec 13).
 
 Cost is reported per role, and the total is ``None`` if any model in the
 session has no price. A partial total presented as a total is worse than no
@@ -107,30 +109,60 @@ class Router:
             self.config = previous
             raise
 
+    def check_credentials(self) -> None:
+        """Refuse, before any request is made, a role whose model needs a key that is not set.
+
+        Each of the six roles is looked at, in role order, and the first whose model needs a
+        variable that holds nothing is reported by role, model and variable. Nothing is built
+        and nothing is sent: it is the environment that is read. A model that already has a
+        client (one a front end or a test handed over) needs no key to be found for it.
+
+        Without this the compact role's missing key is found at the first compaction, which
+        may be an hour into a conversation, and a role nothing uses yet is found when
+        sub-agents begin to.
+
+        Raises :class:`~nanoclaude.providers.base.CredentialsError`.
+        """
+        for role in ROLES:
+            alias = self.config.roles.alias_for(role)
+            if alias not in self._clients:
+                self._require_key(role, alias)
+
+    def _require_key(self, role: str, alias: str) -> str:
+        """The key for ``alias``, or the error that says whose it is and where to put it.
+
+        An empty string for a model that needs none. The message names the role as well as
+        the variable, which the adapters' own messages cannot: they do not know the role, and
+        the first one names ANTHROPIC_API_KEY whatever the config says.
+        """
+        variable = self.config.api_key_env_for(alias)
+        key = self.config.api_key_for(alias)
+        if variable and not key:
+            raise CredentialsError(
+                f"role {role!r} uses model {alias!r}, which needs {variable} "
+                "\u2014 set it, or run: ncc init"
+            )
+        return key
+
     def _build(self, role: str, alias: str, entry: ModelConfig) -> ModelClient:
         # Also catches a ModelConfig made by hand, which the loader never saw: an
         # adapter nobody knows must be an error here and not whichever branch
         # below happens to come last.
         check_model(alias, entry.adapter, entry.model, entry.base_url)
-        variable = self.config.api_key_env_for(alias)
-        key = self.config.api_key_for(alias)
+        key = self._require_key(role, alias)
         if entry.adapter == "anthropic":
-            # The adapter's own message names ANTHROPIC_API_KEY whatever the config
-            # says, and cannot name the role. This one names both.
-            if not key:
-                raise CredentialsError(
-                    f"role {role!r} uses model {alias!r}, which needs {variable} "
-                    "— set it, or run: ncc init"
-                )
             return AnthropicClient(
                 key, model=entry.model, base_url=entry.base_url or ANTHROPIC_BASE_URL
             )
         if entry.adapter == "openai_compat":
             # One adapter serves OpenRouter, Groq, DeepSeek and the rest, each with
-            # its own variable, so the adapter is told which one to name when the
-            # key is missing.
+            # its own variable, so the adapter is told which one to name should it ever
+            # be asked for a key that is not there.
             return OpenAICompatClient(
-                key, model=entry.model, base_url=entry.base_url or "", api_key_env=variable
+                key,
+                model=entry.model,
+                base_url=entry.base_url or "",
+                api_key_env=self.config.api_key_env_for(alias),
             )
         return OllamaClient(model=entry.model, base_url=entry.base_url or OLLAMA_BASE_URL)
 

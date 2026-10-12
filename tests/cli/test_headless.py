@@ -28,7 +28,7 @@ from nanoclaude.providers.retry import classify_status
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, cut_off, says
 from nanoclaude.testing.session import ScriptedClient
-from tests.cli.helpers import INTERRUPTED, run_ncc
+from tests.cli.helpers import INTERRUPTED, assert_failed_run_stdout, run_ncc
 
 BAD_CALL = '<tool name="Read">{"path": </tool>'
 
@@ -150,6 +150,8 @@ def test_json_output_has_a_stable_shape(ncc_home, project, serve, capsys):
         "usage",
         "cost_usd",
         "is_error",
+        "error",
+        "exit_code",
     }
     assert re.fullmatch(r"[0-9a-f]{12}", payload["session_id"])
     assert payload["result"] == "done"
@@ -193,7 +195,7 @@ def unsuitable() -> list[ModelReply]:
 def test_a_model_without_working_tool_calls_is_a_stop_and_not_a_completion(
     ncc_home, project, serve, capsys
 ):
-    serve(textual=unsuitable())
+    serve(m=[], textual=unsuitable())  # m plays the roles --model leaves alone
     code, out, err = run_ncc(
         capsys, "--root", str(project), "--model", "textual", "-p", "read a.py"
     )
@@ -211,7 +213,7 @@ def test_a_model_without_working_tool_calls_is_a_stop_and_not_a_completion(
 def test_a_model_without_working_tool_calls_is_an_error_in_the_json(
     ncc_home, project, serve, capsys
 ):
-    serve(textual=unsuitable())
+    serve(m=[], textual=unsuitable())  # m plays the roles --model leaves alone
     code, out, err = run_ncc(
         capsys,
         "--root",
@@ -307,11 +309,15 @@ def test_a_reply_cut_off_before_any_text_has_nothing_to_write(ncc_home, project,
     assert err.startswith("error: the reply was cut off") and "what arrived is kept" not in err
 
 
-def test_a_reply_cut_off_before_any_text_has_no_json_either(ncc_home, project, serve, capsys):
+def test_a_reply_cut_off_before_any_text_is_a_json_error_without_a_result(
+    ncc_home, project, serve, capsys
+):
     serve(m=[cut_off("")])
-    code, out, _ = run_ncc(capsys, "--root", str(project), "-p", "q", "--output-format", "json")
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "q", "--output-format", "json")
     assert code == EXIT_CODES["provider"]
-    assert out == ""
+    # Nothing arrived, so there is no result to carry, and still one object that says why.
+    assert_failed_run_stdout(["json"], out, err, code)
+    assert json.loads(out)["result"] == ""
 
 
 # --------------------------------------------------------------------------
@@ -393,11 +399,33 @@ def test_a_missing_key_is_a_configuration_error_that_names_the_variable(
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
     assert code == EXIT_CODES["config"]
-    assert out == ""
+    assert_failed_run_stdout(fmt, out, err, code)
     assert err == (
         "error: role 'main' uses model 'm', which needs ANTHROPIC_API_KEY "
         "\u2014 set it, or run: ncc init\n"
     )
+
+
+def test_a_role_whose_model_has_no_key_is_reported_when_the_run_starts(
+    ncc_home, project, serve, capsys, monkeypatch
+):
+    # The compact role is first used at the first compaction, which may be an hour in. The
+    # model the person is talking to is fine, and is not asked anything.
+    monkeypatch.delenv("CHEAP_API_KEY", raising=False)
+    config = ncc_home / ".nanoclaude" / "config.toml"
+    config.write_text(
+        config.read_text()
+        + '\n[models.cheap]\nadapter = "anthropic"\nmodel = "claude-haiku-4-5"\n'
+        + 'api_key_env = "CHEAP_API_KEY"\n\n[roles]\nmain = "m"\ncompact = "cheap"\n'
+    )
+    clients = serve(m=[says("hello")])
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hi")
+    assert (code, out) == (EXIT_CODES["config"], "")
+    assert err == (
+        "error: role 'compact' uses model 'cheap', which needs CHEAP_API_KEY "
+        "\u2014 set it, or run: ncc init\n"
+    )
+    assert clients["m"].requests == []
 
 
 @pytest.mark.parametrize("fmt", FORMATS, ids=["text", "json"])
@@ -408,7 +436,7 @@ def test_a_key_the_provider_rejects_is_a_configuration_error_too(
     serve(m=[classify_status(status, '{"error":{"message":"invalid x-api-key"}}')])
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
     assert code == EXIT_CODES["config"]
-    assert out == ""
+    assert_failed_run_stdout(fmt, out, err, code)
     assert err == (
         f"error: the provider rejected your credentials (HTTP {status}): invalid x-api-key "
         "\u2014 check the key, or run: ncc init\n"
@@ -423,12 +451,14 @@ def test_any_other_provider_failure_is_still_a_provider_error(
     serve(m=[classify_status(status, '{"error":{"message":"nope"}}')])
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
     assert code == EXIT_CODES["provider"]
-    assert out == "" and err.startswith("error: ")
+    assert_failed_run_stdout(fmt, out, err, code)
+    assert err.startswith("error: ")
 
 
 def test_a_model_window_too_small_for_the_prompt_is_a_configuration_error(
-    ncc_home, project, capsys
+    ncc_home, project, serve, capsys
 ):
+    serve(m=[])  # a key is not what is wrong here
     config = ncc_home / ".nanoclaude" / "config.toml"
     config.write_text(
         '[models.m]\nadapter = "anthropic"\nmodel = "claude-sonnet-5"\ncontext_window = 1000\n'
@@ -571,7 +601,8 @@ def test_a_usage_error_is_one_line_with_nothing_in_it_for_a_terminal_to_act_on(
     assert err == "error: --add-dir no where is not a directory \u2014 pass one that exists\n"
 
 
-def test_an_unknown_session_is_one_line_too(ncc_home, project, capsys):
+def test_an_unknown_session_is_one_line_too(ncc_home, project, serve, capsys):
+    serve(m=[])
     code, out, err = run_ncc(capsys, "--root", str(project), "--resume", "a\nb", "-p", "hi")
     assert code == EXIT_CODES["usage"] and out == ""
     assert err.startswith('error: no stored session "a b" \u2014 ') and err.count("\n") == 1

@@ -9,6 +9,7 @@ show the difference (the roles a flag routed).
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ import pytest
 from nanoclaude.agent.session import Session
 from nanoclaude.cli.main import EXIT_CODES, build_parser
 from nanoclaude.config.schema import ROLES
+from nanoclaude.context.git import run_git
 from nanoclaude.conversation.store import Store
 from nanoclaude.permissions.policy import PermissionMode
 from nanoclaude.providers.base import ModelReply
@@ -261,19 +263,11 @@ def test_plan_mode_refuses_writes_by_rule(ncc_home, project, serve, capsys):
     assert "mode.plan-read-only" in result.content
 
 
-@pytest.mark.parametrize(
-    "flags",
-    [
-        ["--dangerously-skip-permissions"],
-        ["--mode", "bypass", "--dangerously-skip-permissions"],
-        ["--mode=bypass", "--dangerously-skip-permissions"],
-    ],
-    ids=["the flag alone", "mode and flag", "mode spelled with ="],
-)
 def test_the_flag_with_the_long_name_turns_permission_prompts_off(
-    ncc_home, project, serve, capsys, sessions, flags
+    ncc_home, project, serve, capsys, sessions
 ):
     serve(m=[WRITE, says("done")])
+    flags = ["--dangerously-skip-permissions"]
     code, out, _ = run_ncc(capsys, "--root", str(project), *flags, "-p", "write it")
     assert (code, out) == (EXIT_CODES["completed"], "done\n")
     assert written(project)
@@ -282,10 +276,18 @@ def test_the_flag_with_the_long_name_turns_permission_prompts_off(
 
 @pytest.mark.parametrize(
     "flags",
-    [["--mode", "bypass"], ["--mode=bypass"], ["--mode", "bypass", "--mode", "bypass"]],
-    ids=["mode bypass", "mode=bypass", "twice"],
+    [
+        ["--mode", "bypass"],
+        ["--mode=bypass"],
+        ["--mode", "bypass", "--mode", "bypass"],
+        # Past a bare -- nothing is a flag, so this is not the flag beside it either.
+        ["--mode", "bypass", "--", "--dangerously-skip-permissions"],
+        # Only the exact spelling is the flag, and no other turns anything off.
+        ["--mode", "bypass", "--dangerously-skip"],
+    ],
+    ids=["mode bypass", "mode=bypass", "twice", "flag after --", "abbreviated flag"],
 )
-def test_mode_bypass_alone_is_refused_and_nothing_runs(
+def test_mode_bypass_is_refused_with_the_flag_that_does_it_and_nothing_runs(
     ncc_home, project, serve, capsys, stores, flags
 ):
     clients = serve(m=[WRITE, says("done")])
@@ -293,8 +295,36 @@ def test_mode_bypass_alone_is_refused_and_nothing_runs(
     assert code == EXIT_CODES["usage"]
     assert out == ""
     assert err == (
-        "error: --mode bypass needs --dangerously-skip-permissions — pass that flag "
-        "as well, or choose another mode\n"
+        "error: bypass is turned on by --dangerously-skip-permissions, not by --mode "
+        "— pass that flag\n"
+    )
+    assert not written(project)
+    assert clients["m"].requests == []
+    assert stores == []  # refused before anything was opened
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        # The flag beside it does not make it a mode: the one way is the flag, by itself. The
+        # person has passed the flag already, so what is left to do is to leave the mode out.
+        ["--mode", "bypass", "--dangerously-skip-permissions"],
+        ["--mode=bypass", "--dangerously-skip-permissions"],
+        ["--dangerously-skip-permissions", "--mode", "bypass"],
+        ["--dangerously-skip-permissions", "--mode=bypass"],
+    ],
+    ids=["mode and flag", "mode= and flag", "flag and mode", "flag and mode="],
+)
+def test_mode_bypass_beside_the_flag_is_told_to_leave_the_mode_out_and_nothing_runs(
+    ncc_home, project, serve, capsys, stores, flags
+):
+    clients = serve(m=[WRITE, says("done")])
+    code, out, err = run_ncc(capsys, "--root", str(project), *flags, "-p", "write it")
+    assert code == EXIT_CODES["usage"]
+    assert out == ""
+    assert err == (
+        "error: bypass is turned on by --dangerously-skip-permissions, not by --mode "
+        "— leave --mode bypass out\n"
     )
     assert not written(project)
     assert clients["m"].requests == []
@@ -479,6 +509,23 @@ def test_instructions_in_the_home_that_ncc_was_given_reach_the_model(
     clients = serve(m=[says("ok")])
     run_ncc(capsys, "--root", str(project), "-p", "hi")
     assert "Always answer in rhyme." in clients["m"].requests[0].system
+
+
+def test_a_project_inside_a_repository_gets_the_instructions_of_the_whole_repository(
+    ncc_home, tmp_path, serve, capsys, monkeypatch
+):
+    # Git is asked for real here: the suite's other tests are told the project is in none.
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", run_git)
+    repository = tmp_path / "repository"
+    app = repository / "services" / "app"
+    app.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)  # noqa: S607
+    (repository / "NANO.md").write_text("Rule for the whole repository.\n")
+    (app / "NANO.md").write_text("Rule for this service.\n")
+    clients = serve(m=[says("ok")])
+    run_ncc(capsys, "--root", str(app), "-p", "hi")
+    system = clients["m"].requests[0].system
+    assert system.index("Rule for the whole repository.") < system.index("Rule for this service.")
 
 
 def audited_arguments(home, session_id):

@@ -172,3 +172,15 @@ def test_a_link_to_a_regular_file_is_read_as_the_file_is(tmp_path):
     link.symlink_to(target)
     assert read_text(str(link)).content == "hello\n"
     assert stamp_of(str(link)) is not None
+
+
+def test_the_advice_for_a_file_too_large_to_read_names_only_tools_that_exist(tmp_path):
+    # There is no Bash tool yet, and Read refuses the whole file whatever offset and limit it
+    # is given, so neither may be offered as the way to a part of it. Grep searches it.
+    target = tmp_path / "big.txt"
+    target.write_bytes(b"x" * 1_000_001)
+    with pytest.raises(FileTooLargeError) as refused:
+        read_text(str(target))
+    said = str(refused.value)
+    assert "Grep" in said
+    assert "Bash" not in said and "offset" not in said and "slice" not in said

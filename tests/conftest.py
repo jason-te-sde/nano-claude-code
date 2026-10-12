@@ -1,5 +1,6 @@
 """Fixtures shared by the whole suite."""
 
+import os
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -63,3 +64,26 @@ def ctx(tmp_repo: Path, policy: Policy) -> ToolContext:
         read_state={},
         root=str(tmp_repo),
     )
+
+
+@pytest.fixture
+def private_from_the_start(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """A process in which a file or directory can only come out private if it was made so.
+
+    The umask lets everything through and no chmod of any kind does anything, so a mode that
+    is private afterwards is the mode the call that *created* it asked for, not one that
+    was set on it later, which would leave it open in between.
+    """
+    previous = os.umask(0)
+    monkeypatch.setattr(os, "chmod", lambda *_a, **_k: None)
+    monkeypatch.setattr(os, "fchmod", lambda *_a, **_k: None)
+    monkeypatch.setattr(Path, "chmod", lambda *_a, **_k: None)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def mode_of(path: Path) -> int:
+    """The permission bits of ``path``, as the octal number a person reads."""
+    return path.stat().st_mode & 0o777
