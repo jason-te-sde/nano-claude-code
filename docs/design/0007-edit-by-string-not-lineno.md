@@ -14,7 +14,7 @@ An `old_string` must match exactly once, unless `replace_all` is set. A second m
 
 The batch is atomic. A rename that touches four places must not be able to apply three of them, because the result is neither the old code nor the new and does not compile. A later edit that fails discards the whole batch, and the file is byte for byte what it was (`test_a_failing_later_edit_discards_the_whole_batch`, `test_a_failing_edit_in_a_batch_leaves_the_file_byte_identical`). The write itself goes to a temporary file in the same directory, is flushed, and is moved into place, so a crash cannot leave half of a source file.
 
-What a model types and what a file holds disagree in two places, both handled and not reported. Curly quotes in the file match straight quotes from the model and the other way round (`test_curly_quotes_in_the_file_match_straight_quotes_from_the_model`), and a file's line endings are detected and kept, so an edit to a CRLF file does not make a file with both (`test_crlf_line_endings_survive_an_edit`). An edit that would change nothing is refused. A successful edit returns a unified diff.
+What a model types and what a file holds disagree in two places, both handled and not reported. Curly quotes in the file match straight quotes from the model and the other way round (`test_curly_quotes_in_the_file_match_straight_quotes_from_the_model`), and a file's line endings are detected and kept, so an edit to a CRLF file does not make a file with both (`test_crlf_line_endings_survive_an_edit`). An edit that would change nothing is refused. A successful edit returns a unified diff, with the lines of a private-key block masked (0012).
 
 `Read` prefixes each line with its number and a tab. The numbers let the model talk about the file and choose a next window; they are not an addressing scheme, and the tool's description tells the model never to put one in an edit.
 
@@ -24,7 +24,7 @@ The model has to reproduce the text it replaces, exactly, and for a large block 
 
 Matching is lenient in one place and only one: quotes. A match found by folding curly quotes is replaced with the text as the model typed it, so a file that used curly quotes in that spot has straight ones afterwards.
 
-A line that `Read` showed redacted (0012) cannot be matched, since the file holds what the redaction replaced. An edit that has to quote such a line fails with "not found" and the line is changed by hand.
+A line that `Read` showed redacted (0012), a private-key block included, cannot be matched, since the file holds what the redaction replaced. An edit that has to quote such a line fails with "not found" and the line is changed by hand.
 
 Edits in a batch apply one after another, so an earlier edit can change what a later one matches. That is deliberate (a rename followed by a use of the new name) and it is also how a batch can fail in a way that looks odd.
 

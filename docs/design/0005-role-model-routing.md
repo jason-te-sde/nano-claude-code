@@ -1,6 +1,6 @@
 # 0005: Six roles, and why explore is the one that pays
 
-Status: accepted. The slots and their routing are built; only two of them are consulted yet.
+Status: accepted. The six slots are built and checked; only two of them are sent requests yet.
 
 A session does not use one model but a cast of them. A role is a slot a model fills: `main` for the conversation, and `explore`, `plan`, `verify`, `compact` and `title` for the jobs around it. A configuration file maps each role to a model entry in its `[roles]` table, a role it leaves out follows `main`, and `main` is the first model defined when the file does not say. `--model <alias>` replaces `main` for one run, and `--role <role>=<alias>` replaces one role, as many times as it is given.
 
@@ -10,19 +10,19 @@ Reading a codebase to find what to change is much of the tokens in a session and
 
 A role is not a sub-agent. A role is a model slot ("which model does this job"). A sub-agent, when it arrives in v0.3, will be a persona: a system prompt, a set of tools and the role whose model it uses. The compaction summary uses the `compact` role's model although there is no sub-agent called compact.
 
-A typo is caught early. A role that points at a model nobody defined is refused when the configuration is loaded, and a misspelled role name is refused with the list of real ones, because a mistyped `explore` would otherwise leave exploration on the expensive model without a word. `--role` is checked again when the router is built, before the first request.
+A typo is caught early. A role that points at a model nobody defined is refused when the configuration is loaded, and a misspelled role name is refused with the list of real ones, because a mistyped `explore` would otherwise leave exploration on the expensive model without a word. `--role` is checked again when the router is built, before the first request. And when a session starts, the key that every role's model needs is looked for, in role order, and the first role whose variable is empty is named with its model and the variable, before anything is sent or written: the key of `compact` would otherwise be found missing at the first compaction, which may be an hour into a conversation (`test_a_role_whose_model_has_no_key_is_named_with_the_variable_and_nothing_is_built`, `test_every_role_is_checked_and_not_only_the_two_that_are_routed_in_this_version`).
 
 Pinned by `test_each_role_can_be_routed_to_its_own_model`, `test_every_role_defaults_to_main_when_unset`, `test_a_role_pointing_at_an_undefined_model_is_rejected_at_load`, `test_a_misspelled_role_is_refused_with_the_roles_that_exist`, `test_usage_is_attributed_per_role` and `test_a_role_that_changes_model_is_priced_call_by_call`.
 
 ## Costs
 
-In v0.1 two roles are consulted. `main` answers the conversation and `compact` writes the summary when a conversation is compacted. `explore`, `plan`, `verify` and `title` are accepted, checked and routed, and then nothing sends them a request: exploring is done by the main model's own calls to Grep and Glob, and routing the other four is v0.3 scope, with sub-agents. Pointing `explore` at a cheap model today changes nothing. Pointing `compact` at one already saves money, because the summary request carries the whole older history.
+In v0.1 two roles are consulted. `main` answers the conversation and `compact` writes the summary when a conversation is compacted. `explore`, `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request: exploring is done by the main model's own calls to Grep and Glob, and routing the other four is v0.3 scope, with sub-agents. Pointing `explore` at a cheap model today changes nothing. Pointing `compact` at one already saves money, because the summary request carries the whole older history.
 
 That request can also fail for a reason the main model would not hit: a summary asked of a model with a small window may not fit the history. The session reports it as the compact role's error and names the role, and the history is kept intact. Pinned by `test_a_summary_that_fails_stops_the_turn_and_leaves_the_history_alone` and `test_an_overflow_on_the_summary_request_is_the_compact_roles_error_not_a_retry`.
 
 The saving has not been measured. How much of a session's tokens go to reading, and how much a cheaper reader costs in the quality of what it reports back to the main model, are open questions that `ncc bench` is meant to answer.
 
-More roles mean more entries to write and more ways for a configuration to be wrong, which is why `ncc init` writes every role on one model and comments on the rest.
+More roles mean more entries to write and more ways for a configuration to be wrong, which is why `ncc init` writes every role on one model and says in a comment which of them are not used yet. It also means that a model on a role nothing uses yet still needs its key at the start of every session.
 
 ## Rejected alternatives
 
