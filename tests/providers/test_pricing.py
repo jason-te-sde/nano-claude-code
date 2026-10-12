@@ -256,6 +256,51 @@ def test_half_of_a_tiered_row_is_refused_by_name_and_not_priced_at_one_set(tmp_p
         PriceBook.load(table)
 
 
+def table_of(rates: dict[str, str]) -> str:
+    """The lines of one table of prices, from the ones a test wants there."""
+    return "".join(f"{key} = {value}\n" for key, value in rates.items())
+
+
+@pytest.mark.parametrize("missing", ["input", "output"])
+def test_a_row_without_an_input_or_an_output_price_is_refused_naming_the_row(tmp_path, missing):
+    # A KeyError that says only 'input' leaves the person to find which of the hundred rows.
+    rates = {"input": "1.0", "output": "2.0"}
+    del rates[missing]
+    table = write_table(tmp_path, 'last_updated = "2026-10-07"\n[acme."plain"]\n' + table_of(rates))
+    with pytest.raises(ValueError, match="acme/plain") as refused:
+        PriceBook.load(table)
+    assert repr(missing) in str(refused.value) and "above_threshold" not in str(refused.value)
+
+
+@pytest.mark.parametrize("missing", ["input", "output"])
+def test_a_second_set_without_an_input_or_an_output_price_is_refused_naming_it_and_the_row(
+    tmp_path, missing
+):
+    second = {"input": "3.0", "output": "6.0"}
+    del second[missing]
+    table = write_table(
+        tmp_path,
+        'last_updated = "2026-10-07"\n[acme."tiered"]\ninput = 1.0\noutput = 2.0\n'
+        "threshold_tokens = 1000\n"
+        '[acme."tiered".above_threshold]\n' + table_of(second),
+    )
+    with pytest.raises(ValueError, match="acme/tiered") as refused:
+        PriceBook.load(table)
+    assert repr(missing) in str(refused.value) and "above_threshold" in str(refused.value)
+
+
+def test_the_prices_that_are_optional_may_be_left_out_of_either_table(tmp_path):
+    table = write_table(
+        tmp_path,
+        'last_updated = "2026-10-07"\n[acme."tiered"]\ninput = 1.0\noutput = 2.0\n'
+        "threshold_tokens = 1000\n"
+        '[acme."tiered".above_threshold]\ninput = 3.0\noutput = 6.0\n',
+    )
+    assert PriceBook.load(table).price_for("acme", "tiered") == Price(
+        1.0, 2.0, 0.0, 0.0, 1000, Price(3.0, 6.0, 0.0, 0.0)
+    )
+
+
 @pytest.mark.parametrize("threshold", ["0", "-5", "1.5", '"many"'])
 def test_a_threshold_that_is_not_a_positive_whole_number_is_refused(tmp_path, threshold):
     table = write_table(

@@ -56,8 +56,19 @@ class Price:
         return self
 
 
-def _rates(entry: dict[str, Any]) -> Price:
-    """One set of rates from a table: the four prices, the cache ones optional."""
+def _rates(entry: dict[str, Any], where: str) -> Price:
+    """One set of rates from a table: the four prices, the cache ones optional.
+
+    A table that lacks the input or the output price is refused, naming ``where`` (the model,
+    and the table of it that is short): read as it stands it would be a bare ``KeyError``
+    that gives a person the key and not which of the rows has lost it.
+    """
+    for key in ("input", "output"):
+        if key not in entry:
+            raise ValueError(
+                f"{where} has no {key!r} price \u2014 every table of prices needs its input and "
+                "output, in dollars per million tokens"
+            )
     return Price(
         entry["input"],
         entry["output"],
@@ -71,12 +82,13 @@ def _price_from(name: str, entry: dict[str, Any]) -> Price:
 
     A row that names a threshold and gives no second set (or the reverse) is refused,
     naming the row. Read as a single price it would charge the first set for every prompt,
-    however long, and a price table is not a place to guess.
+    however long, and a price table is not a place to guess. So is a row, or its second set,
+    that lacks the input or the output price, naming the model and the table.
     """
     second = entry.get("above_threshold")
     threshold = entry.get("threshold_tokens")
     if second is None and threshold is None:
-        return _rates(entry)
+        return _rates(entry, name)
     if second is None or threshold is None:
         raise ValueError(
             f"{name} has a threshold_tokens or an above_threshold table but not both "
@@ -87,7 +99,11 @@ def _price_from(name: str, entry: dict[str, Any]) -> Price:
             f"{name} has threshold_tokens = {threshold!r} \u2014 it must be a whole number "
             "of tokens, at least 1"
         )
-    return replace(_rates(entry), threshold_tokens=threshold, above_threshold=_rates(second))
+    return replace(
+        _rates(entry, name),
+        threshold_tokens=threshold,
+        above_threshold=_rates(second, f"{name}'s above_threshold table"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
