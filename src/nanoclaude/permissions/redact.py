@@ -34,10 +34,10 @@ What this does *not* cover, so that nobody relies on it for more:
   left as it is.
 * A name that says secret, followed by a bare word, is redacted when the word is random
   enough, because an identifier cannot be told from a password typed without quotes
-  (``password = a_long_function_name`` looks like ``password = Xy7Kp2mQ9vL4nR8t``). That is
-  known over-redaction. A call (``name(``), a subscript (``name[``), an attribute chain
-  (``name.other``) and the words ``None``, ``null``, ``nil``, ``undefined``, ``True``,
-  ``False``, ``true`` and ``false`` are code, and are left alone.
+  (``password = a_long_function_name`` looks like ``password =`` and sixteen random letters
+  and digits). That is known over-redaction. A call (``name(``), a subscript (``name[``), an
+  attribute chain (``name.other``) and the words ``None``, ``null``, ``nil``, ``undefined``,
+  ``True``, ``False``, ``true`` and ``false`` are code, and are left alone.
 * A private key block that is cut off is masked as far as what is left looks like a key
   (its base64 lines and its two headers); a key whose lines were rewrapped, indented or
   interleaved with other text is not.

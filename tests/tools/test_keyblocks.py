@@ -369,6 +369,9 @@ def test_a_complete_block_and_an_open_one_on_one_line_leave_the_second_open(tmp_
 # ---- the stream finds what the whole file would
 
 _BEGIN_RSA = "-----BEGIN RSA PRIVATE KEY-----"
+#: Rows of a key's body, made when the module is imported: written out, they are what a scanner
+#: takes for a key.
+_ROWS = pem(lines=3)[1]
 POOL = [
     "plain text",
     "x = 1",
@@ -385,15 +388,15 @@ POOL = [
     "-----END PUBLIC KEY-----",
     "Proc-Type: 4,ENCRYPTED",
     "DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF",
-    "  MIIEowIBAAKCAQEAu1SU1LfVLPHCozMxH2Mo4lgOEePzNm0tRgeLezV6ffAt0gun",
-    "# VBQ2wj7oZrKcWUhsZw5Fs5yhgUlZ5TUjDp0pFXmUYXFpZLGhWRwYZRP2tTLR8lWq",
-    "ZXJzaW9uIDIgb2YgdGhlIExpY2Vuc2U=",
+    "  " + _ROWS[0],  # a row, indented
+    "# " + _ROWS[1],  # a row after a comment marker
+    _ROWS[2][:31] + "=",  # a short last row, with its padding
     'key = "-----BEGIN RSA PRIVATE KEY-----',
     '-----END RSA PRIVATE KEY-----" # tail',
     "-----BEGIN RSA PRIVATE KEY----- text -----END RSA PRIVATE KEY-----",
     "-----END RSA PRIVATE KEY----- -----BEGIN RSA PRIVATE KEY-----",
     "-----BEGIN RSA PRIVATE KEY----- x -----END RSA PRIVATE KEY----- " + _BEGIN_RSA,
-    "-----BEGIN PRIVATE KEY-----\\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\\n-----END PRIVATE KEY-----",
+    "-----BEGIN PRIVATE KEY-----\\n" + _ROWS[0][:32] + "\\n-----END PRIVATE KEY-----",
 ]
 
 

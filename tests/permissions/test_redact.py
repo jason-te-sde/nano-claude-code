@@ -31,6 +31,9 @@ GOOGLE_KEY = "AIza" + "F" * 35
 PRIVATE_KEY_HEADER = "-----BEGIN RSA PRIVATE KEY-----"
 JWT = "eyJ" + "G" * 12 + "." + "H" * 12 + "." + "I" * 12
 ASSIGNED = "API_SECRET=" + "ABCDEFGHIJKLMNOP" + "0129"
+#: What an image is in base64: the eight bytes every PNG starts with, and more bytes. Built here,
+#: because a row of base64 written out is what a scanner takes for a key.
+BASE64_IMAGE = base64.b64encode(b"\x89PNG\r\n\x1a\n" + bytes(range(60))).decode()
 
 
 # One case per row of _SHAPES (nine rows; the two github-token rows match
@@ -63,7 +66,7 @@ def test_known_secret_shapes_are_replaced(text, label):
         "commit 9f2a1c4d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39",  # a git sha
         "id: 3f2504e0-4f89-11d3-9a0c-0305e82c3301",  # a uuid
         "from very.long.module.path.that.goes.on.forever import x",  # an import
-        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8",  # base64 png
+        BASE64_IMAGE,
         "PATH=/usr/local/bin:/usr/bin:/bin",
         "export DEBUG=true",
     ],
@@ -283,8 +286,9 @@ def test_a_bare_word_or_a_quoted_value_is_still_redacted(template):
 def test_a_bare_identifier_that_looks_random_is_redacted_and_that_is_known():
     """The known over-redaction: ``password = <identifier>`` where the identifier is long
     and mixed enough, with nothing after it to say it is code."""
-    cleaned, count = Redactor().scrub("api_key = xK9mQ2vL7nR4tY1wZ3pB8s")
-    assert count == 1 and "xK9mQ" not in cleaned
+    value = fake_secret("a bare identifier", 22)
+    cleaned, count = Redactor().scrub(f"api_key = {value}")
+    assert count == 1 and value not in cleaned
 
 
 @pytest.mark.parametrize(
@@ -717,7 +721,7 @@ def test_what_surrounds_a_redacted_bearer_token_is_kept():
         "Authorization: Bearer " + "a1" * 16,  # long enough, and nothing like random
         "Authorization: Bearer " + _hex("fifteen", 15),  # one short of what a token needs
         "Authorization: Bearer token",
-        "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+        "Authorization: Basic " + base64.b64encode(b"user:password").decode(),  # another scheme
         "the bearer of this letter is authorized to collect it",
         "Bearer " + "a" * 40,  # no header name: only the header is looked for
         "Authorization: " + "a" * 40,
@@ -910,8 +914,11 @@ def test_a_sendgrid_key_whose_last_character_is_a_hyphen_is_redacted_whole():
 
 
 def test_a_bearer_token_of_sixteen_characters_is_redacted_and_one_of_fifteen_is_not():
-    sixteen = "AbCdEfGhIjKlMnO1"
-    assert len(set(sixteen)) == 16
+    sixteen = fake_secret("sixteen", 16)
+    # Random enough and not one case of letters with no digit, with the last character left
+    # off as well: what keeps the shorter one from being redacted is its length, and nothing else.
+    assert shannon_entropy(sixteen[:15]) >= ENTROPY_FLOOR
+    assert any(c.isdigit() for c in sixteen[:15]) and any(c.isalpha() for c in sixteen[:15])
     assert Redactor().scrub(f"Authorization: Bearer {sixteen}")[1] == 1
     assert Redactor().scrub(f"Authorization: Bearer {sixteen[:15]}")[1] == 0
 
