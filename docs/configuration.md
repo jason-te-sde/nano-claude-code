@@ -14,9 +14,11 @@ Every TOML example in this document is loaded by the real configuration loader i
 | What `ncc` learned about a model | `~/.nanoclaude/capabilities.json` |
 | What you typed at the prompt | `~/.nanoclaude/history` |
 | Your instructions for every project | `~/.nanoclaude/NANO.md` |
-| Instructions for one project | `NANO.md` in its root, and in any directory below it that you work in; `CLAUDE.md` is read in a directory that has no `NANO.md` |
+| Instructions for one project | `NANO.md` in its root and in each directory above it up to the top of its repository; `CLAUDE.md` is read in a directory that has no `NANO.md` (see [Instruction files](#instruction-files)) |
 
 `NANOCLAUDE_HOME` moves the home. Set it to a directory and `ncc` keeps `.nanoclaude` inside that directory instead of inside your home directory: the configuration, the session store, the history, the capability cache and the global `NANO.md` all move together. It may start with `~`.
+
+What `ncc` creates under `.nanoclaude` is readable by you alone from the moment it exists: the directory is mode 0700, and `sessions.db` with its write-ahead files, `history`, `capabilities.json` and the `config.toml` that `ncc init` writes are 0600. When it opens them, `ncc` narrows the same files if an earlier version left them open to others. A `config.toml` you wrote yourself keeps the mode you gave it.
 
 A key is never read from a file. A model entry names the environment variable that holds its key, and an `api_key` in a file is refused with a message saying so.
 
@@ -63,7 +65,7 @@ model   = "claude-opus-5-5"
 
 [models.haiku]
 adapter = "anthropic"
-model   = "claude-haiku-4-5"
+model   = "claude-haiku-5-5"
 
 [models.local]
 adapter = "ollama"
@@ -97,7 +99,7 @@ A request sends no temperature, whatever the model: current Claude models and Op
 
 **What a model can do.** `ncc` decides from, in order: a table of models it knows, what it learned about the model on an earlier run, a probe (Ollama only), and then the conservative default: no native tool calls, an 8,192-token window, 2,048 tokens of output. A model that cannot call tools natively is given the tool definitions in its system prompt and writes its calls as text, and the REPL says so when it starts (`⚠ text-tool mode (model lacks native tool calling)`); that works less well, and a model that fails to write a usable call three times in a row ends the prompt with an error naming it. An OpenAI-compatible model that is not in the table is not probed, so it gets the text protocol until you set `native_tools = true` for it, and its window is believed to be 8,192 tokens until you set `context_window`.
 
-**Prices.** `/cost` shows what each role spent, with a price for the Anthropic models in the price book and a dash for any model without one (a local model is free). A dash is not zero. The table is dated, and `/cost` says so when it is more than 90 days old.
+**Prices.** `/cost` shows what each role spent, with a price for the Anthropic models in the price book and a dash for any model without one (a local model is free). A dash is not zero. Claude Haiku 5.5 is priced by prompt length. A call whose prompt (its input, cache-read and cache-write tokens) is up to 100,000 tokens costs $0.10 per million input tokens and $0.50 per million output tokens, and a longer one costs $0.50 and $2.50, for every token it uses, the output included, and not only for those past the line. Every other model has one set of prices. The table is dated 2026-10-07, and `/cost` says so when it is more than 90 days old. A row that lacks a price is refused when the table is read, and the error names the model.
 
 ## Roles
 
@@ -112,9 +114,9 @@ compact = "haiku"
 title   = "local"
 ```
 
-There are six roles: `main`, `explore`, `plan`, `verify`, `compact` and `title`. Each names a model alias. A role that is not set follows `main`, and `main`, if not set, is the first model defined. A role that names a model nobody defined is refused when the file is loaded.
+There are six roles: `main`, `explore`, `plan`, `verify`, `compact` and `title`. Each names a model alias. A role that is not set follows `main`, and `main`, if not set, is the first model defined. A role that names a model nobody defined is refused when the file is loaded. When a session starts, `ncc` checks that the key of every role's model is set, the roles that nothing is sent to yet included. If one is not, it stops before any request, with exit code 3, and names the first such role in the order above, its model and the variable that is empty.
 
-In this version two roles are used. `main` answers the conversation, and `compact` writes the summary when a conversation is compacted, so that `compact` is where a cheaper model already saves money. `explore`, `plan`, `verify` and `title` are checked and routed and nothing yet sends them a request; routing them is v0.3 scope, with sub-agents. `--model <alias>` replaces `main` for one run, `--role <role>=<alias>` replaces one role and may be given more than once, and `/model <alias>` replaces `main` in a session.
+In this version two roles are sent requests. `main` answers the conversation, and `compact` writes the summary when a conversation is compacted, so that `compact` is where a cheaper model already saves money. `explore`, `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request; routing them is v0.3 scope, with sub-agents. `--model <alias>` replaces `main` for one run, `--role <role>=<alias>` replaces one role and may be given more than once, and `/model <alias>` replaces `main` in a session.
 
 The summary request carries the whole older history to the `compact` model, so a model with a small window can fail to write it. The conversation is then left as it was, and the error names the compact role and says how to route it elsewhere.
 
@@ -128,32 +130,83 @@ ask   = ["Bash", "Write", "Edit"]
 deny  = ["Read(**/.env*)", "Bash(curl:*)", "Edit(migrations/**)"]
 ```
 
-The defaults are `allow = ["Read", "Grep", "Glob"]`, `ask = ["Bash", "Write", "Edit", "Git", "TodoWrite"]` and no `deny`. A list in your own file replaces the default for that key. A rule may name a tool that does not exist yet, which is why `Bash` and `Git` are accepted today.
+The defaults are `allow = ["Read", "Grep", "Glob"]`, `ask = ["Bash", "Write", "Edit", "Git", "TodoWrite"]` and no `deny`. A list in your own file replaces the default for that key. A rule may name one of the tools there are, or `Bash` or `Git`, which are reserved for tools this version does not have so that a rule written for them today does not have to be rewritten. Any other tool name is refused when the file is loaded, and the error lists the names there are. Names are case-sensitive, so `read` is refused: a `deny` rule that named no tool would refuse nothing.
 
-**Rules** have three shapes: `Tool`, which matches every call to that tool; `Tool(subject)`, which matches one subject exactly or, for a path, as a glob; and `Tool(prefix:*)`, which matches a subject that begins with the prefix at a word boundary, so `Bash(npm test:*)` covers `npm test -- --watch` and not `npm testify`. The subject is the resolved path for `Read`, `Edit` and `Write`, the pattern for `Glob` and `Grep`, and, when they are built, the command for `Bash` and the subcommand for `Git`. A glob is matched against both the absolute path and the path relative to the sandbox root, in the syntax of a `.gitignore` file. A rule with an empty subject or unbalanced parentheses is refused when the file is loaded.
+**Rules** have three shapes: `Tool`, which matches every call to that tool; `Tool(subject)`, which matches one subject exactly or, for a path, as a glob; and `Tool(prefix:*)`, which matches a subject that begins with the prefix at a word boundary, so `Bash(npm test:*)` covers `npm test -- --watch` and not `npm testify`. The subject is the resolved path for `Read`, `Edit` and `Write`, the pattern for `Glob` and `Grep`, and, when they are built, the command for `Bash` and the subcommand for `Git`. A glob is matched against both the absolute path and the path relative to the sandbox root, each as it is and without its leading slash, in the syntax of a `.gitignore` file. A rule with an empty subject or unbalanced parentheses is refused when the file is loaded.
+
+A `deny` rule compares a path as written and again after case folding and NFC normalization, of the rule and of the path alike, so that every spelling of a file that the file system treats as one is refused: with `Read(secrets/**)` denied, `Secrets/key.txt` is refused too. Folding only adds refusals. `allow` and `ask` rules compare as written, since a looser match would widen what runs without asking.
+
+**A known issue.** Because a glob is also matched against the absolute path without its leading slash, a rule written for a directory of the project can match a directory at the top of the file system. `Read(private/**)` also refuses a file whose resolved path is under `/private/`, and `Write(tmp/**)` in your own file also allows every `Write` in a project whose resolved path is under `/tmp/`. This is to be fixed. Until it is, write a home `allow` rule with the absolute path of the project directory, such as `Write(/home/you/app/tmp/**)`, which names one place.
 
 **The order of the checks** is fixed, and the first that matches decides. The rule id is what appears in a refusal and in the audit record.
 
 1. `rule.deny` is your own `deny` rule. It refuses in every mode.
-2. `secret.path` refuses a path that is a credentials file by convention (`.env`, `*.pem`, `*.key`, SSH keys, `.aws/**`, `.ssh/**` and the like), unless `--allow-secrets` is given.
+2. `secret.path` refuses a path on [the credentials list](#the-credentials-list), unless `--allow-secrets` is given.
 3. `sandbox.outside-root` and `sandbox.symlink-escape` refuse a path outside the sandbox, and a write through a symlink that leaves it.
-4. `bash.dangerous` and `bash.unparseable` refuse a command the danger classifier blocks or cannot read.
-5. `mode.plan-read-only` refuses any write in `plan` mode.
-6. `mode.bypass` allows everything left, in `bypass` mode.
-7. `mode.accept-edits` allows `Edit` and `Write`, in `accept-edits` mode.
-8. `rule.allow` allows what your `allow` rule names.
-9. `grant.session` allows a tool you answered "always" to, for the rest of the session.
-10. `tool.read-only` allows `Read`, `Grep`, `Glob` and `TodoWrite`.
-11. `rule.ask` asks about what your `ask` rule names.
-12. `default.ask` asks about everything else.
+4. `sandbox.protected-path` refuses a write into a `.git` or a `.nanoclaude` directory inside the sandbox, in every mode. Git runs what `.git/config` and `.git/hooks` name, and `ncc` reads its configuration, capability cache and session store from `.nanoclaude`, so a write there is a way for a call to run something that no confirmation described. A `.git` that is a file, as in a worktree, counts, and so does a spelling that case folding or normalization makes the same; `.github` and `.gitignore` do not. Reads are not refused.
+5. `bash.dangerous` and `bash.unparseable` refuse a command the danger classifier blocks or cannot read.
+6. `mode.plan-read-only` refuses any write in `plan` mode.
+7. `mode.bypass` allows everything left, in `bypass` mode.
+8. `mode.accept-edits` allows `Edit` and `Write`, in `accept-edits` mode.
+9. `rule.allow` allows what your `allow` rule names.
+10. `grant.session` allows a tool you answered "always" to, for the rest of the session.
+11. `tool.read-only` allows `Read`, `Grep`, `Glob` and `TodoWrite`.
+12. `rule.ask` asks about what your `ask` rule names.
+13. `default.ask` asks about everything else.
 
-The first five are the hard denials: no mode, rule or grant gets past them. It follows from the order that an `ask` rule has no effect on a tool that is allowed without asking, and that an `allow` rule cannot open a credentials file. To keep something from being read, use `deny`.
+The first six are the hard denials: no mode, rule or grant gets past them. It follows from the order that an `ask` rule has no effect on a tool that is allowed without asking, and that an `allow` rule cannot open a credentials file. To keep something from being read, use `deny`. A `Read` `deny` rule also keeps a file out of what `Grep` returns, out of an `@` mention, out of the project map and out of the instruction files, since each asks the policy whether a `Read` of the file would be refused. `Glob` asks it nothing, and still lists the names of such files.
 
-**Modes.** `default` asks before changing anything. `plan` refuses every write, so the model can read and reason and not change. `accept-edits` applies `Edit` and `Write` without asking and still asks about anything else. `bypass` asks about nothing, and is reached only with `--dangerously-skip-permissions`; it does not turn off the hard denials, so the sandbox, credentials paths, dangerous commands and your `deny` rules are enforced in it. `--mode` takes `default`, `plan` or `accept-edits`, and `--mode bypass` alone is refused; so is the flag together with another mode, and no configuration file can select it. `/mode` switches among the first three and refuses `bypass`.
+**Modes.** `default` asks before changing anything. `plan` refuses every write, so the model can read and reason and not change. `accept-edits` applies `Edit` and `Write` without asking and still asks about anything else. `bypass` asks about nothing, and is reached only with `--dangerously-skip-permissions`; it does not turn off the hard denials, so the sandbox, protected paths, credentials paths, dangerous commands and your `deny` rules are enforced in it. `--mode` takes `default`, `plan` or `accept-edits`. It does not take `bypass`: `--mode bypass` is refused, with the flag beside it or without, and the error names the flag that turns it on. The flag together with any `--mode` is refused too, and no configuration file can select it. `/mode` switches among the first three and refuses `bypass`.
 
-**Confirmations.** A call that needs confirming is shown (an `Edit` as a diff, a `Write` as a diff or the first lines and the size) and the prompt is `[y]es / [n]o / [a]lways`. "Always" grants the tool, not the command, for the rest of the session, and is kept in memory only. A call declined tells the model not to try another way to do the same thing. Without a terminal, `ncc -p` declines everything that would have asked.
+**Confirmations.** A call that needs confirming is shown (an `Edit` as a diff, a `Write` as a diff or the first lines and the size) and the prompt is `[y]es / [n]o / [a]lways`. "Always" grants the tool, not the command, for the rest of the session, and is kept in memory only. A call declined tells the model not to try another way to do the same thing.
 
-**The sandbox** is the project root and each `--add-dir`. A path is judged by where it resolves to, symlinks followed, and a write also checks that its parent directory resolves inside. A root given with `~` or relative to where `ncc` was run is made absolute first. An empty value is an error, never the current directory.
+Under `-p` nobody can answer, so every call that would have asked is declined, and each is one line on stderr naming the rule that asked, `default.ask` or `rule.ask`: `ncc: declined (default.ask) Write src/x.py — pass --mode accept-edits to let -p edit files`. A path inside the project is shown relative to it, and control characters in a subject are spelled out. What follows the dash is what would let `-p` do it: `--mode accept-edits` for a file edit, or the tool's name in `allow` in your own configuration. The exit code is what it would have been. A call the policy refuses outright is not reported there: nobody was to be asked, and the model receives the refusal, with its rule id, as the tool's result.
+
+**The sandbox** is the project root and each `--add-dir`. A path is judged by where it resolves to, symlinks followed, and a write also checks that its parent directory resolves inside. `Grep`, `Glob`, `@` mentions and the project map do not follow a symlink that leads out of it. A root given with `~` or relative to where `ncc` was run is made absolute first. An empty value is an error, never the current directory. Without `--root` the root is the directory `ncc` was run in, and `ncc` refuses to start, with exit code 2 and before it opens anything, when that is `/`, a home directory (yours, or the one `NANOCLAUDE_HOME` names) or a directory that contains one, since the session store, the shell's startup files and every other project would be in reach. `--root` names such a directory and says it was meant; `--add-dir` does not.
+
+### The credentials list
+
+A path that matches one of these, in any directory, is a credentials file. Each is a glob in the syntax of a `.gitignore` file:
+
+```
+.env
+.env.*
+.env-*
+.env_*
+*.env
+.envrc
+*.pem
+*.key
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+credentials
+credentials.*
+secrets.*
+.aws/**
+.ssh/**
+.gnupg/**
+.docker/config.json
+.kube/config
+.netrc
+.npmrc
+.pypirc
+.git-credentials
+.pgpass
+.htpasswd
+.vault-token
+.my.cnf
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.tfstate
+*.tfstate.backup
+*.tfvars
+```
+
+It is compared as the other refusals are, as written and after case folding, so `.ENV` is refused as `.env` is. Public certificates (`*.crt`) and public keys (`id_*.pub`) are not on it. A credential in a file with another name is read like any other file, and what is in it is scrubbed by shape ([0012](design/0012-redaction-before-transcript.md)).
 
 ## Limits
 
@@ -169,8 +222,8 @@ keep_recent_turns = 3
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `max_turns` | 40 | The most model round trips one prompt may take, a whole number of at least 1. A prompt that needs more stops with a message saying how to go on; the next prompt gets the whole count again. `--max-turns` overrides it. |
-| `bash_timeout_s` | 120 | Seconds a shell command may run, above 0. Read by the shell tool, which is not built yet; today it is checked and has no effect. |
-| `output_cap_bytes` | 100000 | The most output of a command kept, a whole number of at least 1. Not read yet, for the same reason. |
+| `bash_timeout_s` | 120 | Seconds a shell command may run, above 0. Reserved for the shell tool, which this version does not have: it is checked when the file is loaded and nothing reads it, so changing it changes nothing. |
+| `output_cap_bytes` | 100000 | The most output of a command kept, a whole number of at least 1. Reserved in the same way. |
 | `compact_soft` | 0.7 | The share of the room for a conversation at which old tool results are shrunk to one line each. Above 0, at most 1. |
 | `compact_hard` | 0.85 | The share at which everything older than the recent turns is replaced by a summary. |
 | `keep_recent_turns` | 3 | How many recent turns a summary leaves as they were, at least 1. A model whose window is under 32,000 tokens keeps at most 2. |
@@ -201,8 +254,8 @@ The room for a conversation is the model's window, less the longest reply it may
 | Flag | Meaning |
 | --- | --- |
 | `-p`, `--print PROMPT` | Run once and exit. |
-| `--output-format text\|json` | With `-p`: the model's words, or a JSON object. |
-| `--root DIR` | The project directory, in place of the current one. |
+| `--output-format text\|json` | With `-p`: the model's words, or one JSON object. |
+| `--root DIR` | The project directory, in place of the current one. Without it, a current directory that is `/` or a home directory, or holds one, is refused. |
 | `--model ALIAS` | The model for the `main` role, for this run. |
 | `--role ROLE=ALIAS` | The model for one role. May be repeated. |
 | `--mode default\|plan\|accept-edits` | The permission mode. |
@@ -217,9 +270,9 @@ The room for a conversation is the model's window, less the longest reply it may
 
 Flags are spelled out in full; an abbreviation is not accepted. `ncc init` takes no flag but `--no-color`, and needs a terminal. `--continue` and `--resume` together are refused. A session can only be taken up from the directory it was started in, and `ncc` says which directory to run from when it was not. A `--continue` with nothing started here is an error and does not start a new session.
 
-**Streams.** In text mode stdout carries the model's reply exactly as written and nothing else, with a newline added only if it had none. Everything that went wrong is one line on stderr in the form `error: <what happened> — <what to do>`. With no `-p` and no terminal, `ncc` says so and exits with code 2 and does nothing.
+**Streams.** In text mode stdout carries the model's reply exactly as written and nothing else, with a newline added only if it had none. Everything that went wrong is one line on stderr in the form `error: <what happened> — <what to do>`. A call that `-p` declined is a line that starts `ncc: declined`, which is not an error (see Confirmations). With no `-p` and no terminal, `ncc` says so and exits with code 2 and does nothing.
 
-**JSON.** `--output-format json` prints one object with `session_id`, `result`, `stop_reason`, `turns`, `usage` (`input_tokens`, `output_tokens`, `cache_read_tokens`), `cost_usd` and `is_error`. `cost_usd` is `null` when any model used has no price, never `0`. `stop_reason` is one of `completed`, `turn_limit`, `refusal`, `max_tokens`, `model_unsuitable` and `cut_off`.
+**JSON.** `--output-format json` prints exactly one object to stdout on every exit, a failure included. Its keys are `session_id`, `result`, `stop_reason`, `turns`, `usage` (`input_tokens`, `output_tokens`, `cache_read_tokens`), `cost_usd`, `is_error`, `error` and `exit_code`. `cost_usd` is `null` when any model used has no price, never `0`. `stop_reason` is one of `completed`, `turn_limit`, `refusal`, `max_tokens`, `model_unsuitable`, `cut_off` and `error`. For a run that finished its task, `error` is `null` and `is_error` is false. Every other run (one that stopped before the task was done, a reply cut off, a failure) has `is_error` true and, in `error`, the line that went to stderr without its `error: ` prefix. `exit_code` is the exit code of the process, whichever it is. A run that failed before it had a session has a null `session_id` and nothing spent, and one that failed later has what it spent so far. Exit code 130 has its object too. `--help` and `--version` print text whatever the format, and a closed stdout (141) is not written to. A usage error found before the arguments could be read is answered in JSON only when the arguments, as typed, say `--output-format json`; otherwise it is the line on stderr alone.
 
 **Exit codes.**
 
@@ -227,10 +280,10 @@ Flags are spelled out in full; an abbreviation is not accepted. `ncc init` takes
 | --- | --- |
 | `0` | The prompt finished, or the REPL was left normally. |
 | `1` | The prompt stopped before the task was done (the turn limit, a refusal, a reply cut at the model's output limit, a model that could not write a tool call), or something failed that is neither the configuration nor the provider: the session store could not be opened or is busy, another process changed the session, a bug. |
-| `2` | `ncc` was used wrongly: a bad flag, no prompt and no terminal, a session that is not in the store. |
-| `3` | The configuration is missing or wrong, including a missing or rejected API key, or the model's window is too small for the prompt. |
+| `2` | `ncc` was used wrongly: a bad flag, no prompt and no terminal, a session that is not in the store, a current directory that is too wide to be a root. |
+| `3` | The configuration is missing or wrong, including a missing or rejected API key (for any role's model, found when the session starts), or the model's window is too small for the prompt. |
 | `4` | The provider failed: the network, a server error after the retries, a rejected request, or a reply that was cut off midway. What arrived of a cut-off reply is kept and printed. |
-| `130` | Interrupted with Ctrl+C. Nothing is written to stdout. |
+| `130` | Interrupted with Ctrl+C. In text mode nothing is written to stdout; with `--output-format json` stdout holds the one object. |
 | `141` | Whoever was reading the output closed it, as `ncc ... \| head -1` does. Not an error; the shell's own number for it. |
 
 ## Slash commands
@@ -252,13 +305,30 @@ Flags are spelled out in full; an abbreviation is not accepted. `ncc init` takes
 
 ## The prompt
 
-Enter sends a line. A second line is started with Esc then Enter (with emacs keys), or by ending a line with a backslash. Completion offers the slash commands at the start of a line, and after `@` the files in the project; a file named with `@` is inlined into the prompt, up to 100,000 bytes, unless it is outside the project or a credentials file. Ctrl+C cancels what is running and keeps the session; two within a second leave. History is kept between sessions in `~/.nanoclaude/history`.
+Enter sends a line. A second line is started with Esc then Enter (with emacs keys), or by ending a line with a backslash. Completion offers the slash commands at the start of a line, and after `@` the files in the project; a file named with `@` is inlined into the prompt, up to 100,000 bytes and scrubbed first, unless it is outside the project or the policy would refuse a `Read` of it (a credentials file, or a file that a `Read` `deny` rule covers). A refused mention stays in the prompt, with a line after it saying it was not inlined and which rule refused it. Ctrl+C cancels what is running and keeps the session; two within a second leave. History is kept between sessions in `~/.nanoclaude/history`.
+
+## Instruction files
+
+`NANO.md` holds instructions for the model. `CLAUDE.md` is read in a directory that has no `NANO.md`, so a project that has one under that name needs no copy. They go into the system prompt of every request, in this order, so that the file nearest the project root is last:
+
+1. The global file, `NANO.md` in `~/.nanoclaude`.
+2. The project's files, from the top level of the repository down to the project root: the top level first, then each directory below it, then the root itself. A project root that is in no repository, or in one that git cannot be asked about, has only its own file.
+
+The project root is the directory `ncc` runs in, or `--root`. Files are read at every request, so an edit takes effect at the next prompt. Every file has to pass each of these, and one that fails any is skipped without a word:
+
+- **Contained.** Its real path, symlinks followed, is inside its boundary: the top level of the repository for the directories above the project root, the project root for the root itself, `~/.nanoclaude` for the global file. A `NANO.md` that links to `~/.ssh/id_rsa` is skipped.
+- **A regular file.** A named pipe or a device is skipped.
+- **Allowed to be read.** The policy would let `Read` show it: no `Read` `deny` rule covers it, and it is not a credentials file under another name, as a `NANO.md` that links to `.env` is. The global file is yours, and is not asked this unless the sandbox contains it.
+- **Scrubbed.** Its text goes through the scrubber that every tool result goes through, before it is cut, so that a credential which straddles the cut is not left as a fragment.
+- **Capped.** A file is cut at 32,000 bytes, with a marker that says so. The chain is held to 64,000 bytes in all: the global file and the project root's are always loaded, each up to 32,000 bytes, and every other file takes what is left, nearest to the project root first. A file that fits is kept whole, one that does not is cut to what is left, and one that finds nothing left is replaced by a line saying it was not loaded.
+
+A `NANO.md` that is skipped is not replaced by the `CLAUDE.md` beside it: the name that is there decides.
 
 ## ncc init
 
 `ncc init` is the first run. It asks which provider (Anthropic, OpenAI, OpenRouter or Ollama), for the key if one is needed and is not already in the environment, and for the model, and then:
 
-1. It writes `~/.nanoclaude/config.toml`, readable by you alone, with every role on the model you chose and a comment on each choice. A `.nanoclaude` directory that it has to create is one only you can enter. If a configuration is already there it asks first, and the default answer is no.
+1. It writes `~/.nanoclaude/config.toml`, readable by you alone, with every role on the model you chose and a comment on each choice. A `.nanoclaude` directory that it has to create is one only you can enter. The comments in the file say that `explore`, `plan`, `verify` and `title` are not used yet, and that `bash_timeout_s` and the `Bash` and `Git` entries in its lists are reserved for tools this version does not have. If a configuration is already there it asks first, and the default answer is no.
 2. It forgets what `ncc` learned about models, so each is probed again.
 3. It checks the key with one small request, sent with the configuration it just wrote. A check that fails is a warning, not an error: the file stays, and your choices are not lost to a mistyped key.
 
@@ -275,7 +345,7 @@ It does not write a `NANO.md`.
 
 ## Sessions
 
-Every conversation is stored in `~/.nanoclaude/sessions.db`, as it happens. `--continue` and `--resume` load one. Nothing lists them; `sqlite3` does. The tables are `sessions`, `messages` (the conversation the model is shown), `messages_archive` (every message a compaction or `/clear` replaced, with when) and `tool_calls` (the audit record: each call, what was decided and by which rule, and what came of it). A decision is written before the call runs. Arguments are stored with credentials scrubbed.
+Every conversation is stored in `~/.nanoclaude/sessions.db`, as it happens. `--continue` and `--resume` load one. Nothing lists them; `sqlite3` does. The tables are `sessions`, `messages` (the conversation the model is shown), `messages_archive` (every message a compaction or `/clear` replaced, with when) and `tool_calls` (the audit record: each call, what was decided and by which rule, and what came of it). A decision is written before the call runs. Arguments are stored with credentials scrubbed. The audit record only grows: a row is never deleted or replaced, and the one update it takes is an outcome, set once on a row that has none, which the database enforces for whoever asks. The outcome is `ok`, `error`, `refused`, `declined` or `cancelled`, the last for a call whose batch was stopped by Ctrl+C, at its confirmation or while a tool ran.
 
 What resuming does not restore is what the conversation had read: the model reads a file again before it edits it.
 
@@ -287,4 +357,4 @@ What resuming does not restore is what the conversation had read: the model read
 
 ## Model ids in the examples
 
-Each hosted model id in this document and in the README was checked against its provider's live list on the day noted. The Anthropic ids (`claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-4-5`) were checked on 2026-10-02. The OpenRouter id (`deepseek/deepseek-v4-pro`) was checked against OpenRouter's public model list on 2026-10-07. The OpenAI id that `ncc init` offers, `gpt-5`, was not: OpenAI's list needs a key to read. Local model names are whatever your server knows them as.
+Each hosted model id in this document and in the README was checked against its provider's live list on the day noted. The Anthropic ids (`claude-sonnet-5-5`, `claude-opus-5-5`, `claude-haiku-5-5`) were checked against Anthropic's models overview on 2026-10-07, the date that the capability table and the price book record. The OpenRouter id (`deepseek/deepseek-v4-pro`) was checked against OpenRouter's public model list on 2026-10-07. The OpenAI id that `ncc init` offers, `gpt-5`, was not: OpenAI's list needs a key to read. Local model names are whatever your server knows them as.
