@@ -1479,27 +1479,30 @@ def test_the_kinds_the_redaction_note_names_are_the_ones_the_scrubber_writes():
     )
 
 
-#: What a sentence about a trailer says when it is about how a commit gets one, or loses it.
+#: The line a commit carries that credits a tool, by any of its names.
+_A_TRAILER = re.compile(r"\b(?:trailers?|co-author\w*|footers?)\b", re.IGNORECASE)
+
+#: What a sentence says when it is about how such a line comes to be on a commit, or goes.
 _HOW_A_TRAILER_COMES_AND_GOES = re.compile(
-    r"\b(?:strip\w*|delet\w*|remov\w*|rewrit\w*|rewritten|drop\w*|append\w*"
-    r"|add(?:s|ed|ing)?|carr(?:y|ies|ied|ying))\b"
+    r"\b(?:strip\w*|delet\w*|remov\w*|rewrit\w*|rewritten|drop\w*|append\w*|insert\w*"
+    r"|add(?:s|ed|ing)?|put(?:s|ting)?|need\w*|carr(?:y|ies|ied|ying))\b"
 )
 
 
 def test_the_attribution_note_and_the_guide_state_the_rule_and_not_how_commits_are_made():
-    shapes = 0
+    mentions = 0
     for document in _every_document():
         text = " ".join(_text(document).split())
         for phrase in ("tools that write commit messages", "act of deleting"):
             assert phrase not in text.lower(), f"{document.name} says {phrase!r}"
         for sentence in re.split(r"(?<=[.!?])\s+|\s+- ", text):
-            if re.search(r"\btrailers?\b", sentence, re.IGNORECASE):
-                shapes += 1
+            if _A_TRAILER.search(sentence):
+                mentions += 1
                 assert _HOW_A_TRAILER_COMES_AND_GOES.search(sentence.lower()) is None, (
                     f"{document.name} says how a trailer comes to be on a commit, or is taken "
                     f"off it, where it should say only what the rule is: {sentence!r}"
                 )
-    assert shapes >= 2, f"only {shapes} sentences mention a trailer, so the check read too little"
+    assert mentions >= 2, f"only {mentions} sentences mention one, so the check read too little"
 
 
 def test_the_readme_says_what_containment_and_redaction_add():
@@ -1607,6 +1610,9 @@ def test_the_documents_say_a_file_is_refused_for_what_the_schema_does_not_have(t
     config.write_text(EXAMPLE_HOME + "\n[hooks]\nbefore = 1\n")
     with pytest.raises(ConfigError, match="unknown section 'hooks'"):
         load_config(home=str(home), project=None, env={})
+    config.write_text(EXAMPLE_HOME + "\n[limits]\nmax_turn = 5\n")
+    with pytest.raises(ConfigError, match="unknown key 'max_turn'"):
+        load_config(home=str(home), project=None, env={})
     # What the schema has and nothing reads yet is accepted, and the reference says which.
     config.write_text(EXAMPLE_HOME + '\n[limits]\nbash_timeout_s = 5\n[ui]\ntheme = "dark"\n')
     load_config(home=str(home), project=None, env={})
@@ -1628,11 +1634,15 @@ def test_a_project_file_may_set_the_compaction_limits_and_the_reference_says_wha
     for directory in (home, project):
         (directory / CONFIG_DIRNAME).mkdir(parents=True)
     (home / CONFIG_DIRNAME / CONFIG_FILENAME).write_text(EXAMPLE_HOME)
+    # Raised above what the home has, which is what a ceiling would refuse.
     (project / CONFIG_DIRNAME / CONFIG_FILENAME).write_text(
-        "[limits]\ncompact_soft = 0.1\ncompact_hard = 0.2\nkeep_recent_turns = 1\n"
+        "[limits]\ncompact_soft = 0.9\ncompact_hard = 0.95\nkeep_recent_turns = 10\n"
     )
     loaded = load_config(home=str(home), project=str(project), env={})
-    assert (loaded.limits.compact_soft, loaded.limits.keep_recent_turns) == (0.1, 1)
+    assert (loaded.limits.compact_soft, loaded.limits.keep_recent_turns) == (0.9, 10), (
+        "a project file can no longer raise a compaction limit; correct docs/configuration.md, "
+        "which says that it may set them freely"
+    )
     text = _text(CONFIGURATION)
     assert "bound nothing" not in text
     assert text.count("cap nothing a session may do") == 2
