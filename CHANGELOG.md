@@ -77,7 +77,7 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
 - Documentation: a configuration reference, an architecture overview, a testing document with a
   section on what the tests do not cover, and a design note for each decision. `scripts/measure.py` is the
   one source of the figures the README quotes.
-- A hygiene check, run in CI from the first commit, for non-English characters and for
+- A hygiene check, run in CI from the first commit, for Chinese characters and for
   attribution, and a test that fails when a tracked file holds a credential-shaped literal.
 
 ### Removed

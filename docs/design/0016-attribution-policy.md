@@ -36,4 +36,3 @@ Writing about the policy is awkward. Anything that quotes a shape fails the scan
 - Review alone. A rule that depends on being remembered is forgotten, and finding out afterwards means rewriting a commit history.
 - A pre-commit hook alone. It is local and can be skipped, and the rule has to hold for what is pushed. The hook is a fine addition and does not replace CI.
 - A Unicode-aware pattern with `grep -P`. It does not run on the macOS that the author uses.
-- Strip trailers when pushing, in CI. A history that is rewritten on the way in is one whose commits differ from those on the author's machine.
