@@ -171,7 +171,9 @@ your shell profile is as safe as that file.
   narrows them if an earlier version left them open. `ncc init` creates the `config.toml` it
   writes private too. An existing `config.toml`, whoever wrote it, is never changed. It holds
   no key (a model entry names the environment variable that holds its key, and an `api_key` in
-  a file is refused), so one left open to other users shows them your settings and no secret.
+  a file is refused), so one left open to other users shows them your settings and no key. A
+  `base_url` is checked only for starting with `http://` or `https://`, so a credential put
+  in one would be shown as well.
 - **A rule's glob and the leading slash.** A rule's glob is also matched against the absolute
   path without its leading slash, so a rule written for a directory of the project can match
   a directory at the top of the file system: `Read(private/**)` also refuses files under
