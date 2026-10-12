@@ -255,7 +255,7 @@ The room for a conversation is the model's window, less the longest reply it may
 | --- | --- |
 | `-p`, `--print PROMPT` | Run once and exit. |
 | `--output-format text\|json` | With `-p`: the model's words, or one JSON object. |
-| `--root DIR` | The project directory, in place of the current one. Without it, a current directory that is `/` or a home directory, or holds one, is refused. |
+| `--root DIR` | The project directory, in place of the current one. Without it, a current directory that is `/`, a home directory or a directory that holds one is refused. |
 | `--model ALIAS` | The model for the `main` role, for this run. |
 | `--role ROLE=ALIAS` | The model for one role. May be repeated. |
 | `--mode default\|plan\|accept-edits` | The permission mode. |
@@ -354,6 +354,7 @@ What resuming does not restore is what the conversation had read: the model read
 - A retry of a provider request is shown as it happens and is not stored, because the audit table is keyed by tool call and has no row for a request.
 - The summary that compaction asks for is written by the `compact` role's model from the whole older history, so a small compact model can fail with the history kept intact. The error names the role.
 - After Ctrl+C the model is told that calls which had not reported back may or may not have run; the results of calls that had finished are not handed back, and it may repeat them.
+- The limits of the defences that keep credentials out, among them what `Glob` lists and a glob rule that is also matched without its leading slash, are in [SECURITY.md](../SECURITY.md).
 
 ## Model ids in the examples
 

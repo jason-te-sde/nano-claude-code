@@ -68,7 +68,8 @@ accepted for the tools that are not built yet.
   `git status` runs, a filter chosen by `.gitattributes`, a hook when the index is written.
   `ncc` runs git only as `git rev-parse`, which reads refs and the layout of the repository
   and never its working tree, and one function refuses any other subcommand. It also passes
-  `-c core.fsmonitor=false` and sets `GIT_OPTIONAL_LOCKS=0` and an empty `GIT_ATTR_SOURCE`.
+  `-c core.fsmonitor=false`, sets `GIT_OPTIONAL_LOCKS=0` and points `GIT_ATTR_SOURCE` at the
+  empty tree.
 - Links. A symlink inside the project that leads out of it is not followed. Neither of
   `Grep`'s two backends reads through one, `Glob` does not list one, an `@` mention does not
   inline one, the project map lists one and does not enter it, and a write through one is
