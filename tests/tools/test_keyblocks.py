@@ -16,7 +16,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from nanoclaude.permissions.redact import PRIVATE_KEY_MARKER, Redactor
-from nanoclaude.tools.keyblocks import _scan, mask_window, masked_line_numbers
+from nanoclaude.tools.keyblocks import _scan, mask_text, mask_window, masked_line_numbers
 from tests.keys import pem
 
 REDACTOR = Redactor()
@@ -426,3 +426,74 @@ def test_the_stream_finds_the_lines_the_whole_file_would(lines):
 def test_stopping_early_never_loses_a_line_at_or_before_the_last_one_needed(lines, upto):
     found = _scan(iter(lines), REDACTOR, upto)
     assert {n for n in reference(lines) if n <= upto} <= found, lines
+
+
+# ---- mask_text: the whole of a content, with what is in a block masked and every line kept
+
+
+def test_text_with_no_block_is_returned_as_it_was():
+    for text in ("", "a", "a\nb\n\nc\n", "-----BEGIN PUBLIC KEY-----\nx\n-----END PUBLIC KEY-----"):
+        assert mask_text(REDACTOR, text) == text
+
+
+def test_every_line_of_a_block_is_masked_and_the_lines_around_it_are_kept():
+    block, _ = pem(lines=3)
+    text = "\n".join(["before", *block, "after"]) + "\n"
+    marks = [PRIVATE_KEY_MARKER] * len(block)
+    assert mask_text(REDACTOR, text) == "\n".join(["before", *marks, "after"]) + "\n"
+
+
+def test_text_before_a_begin_and_after_an_end_on_their_lines_is_kept():
+    block, _ = pem(lines=2)
+    text = f'key = "{block[0]}\n{block[1]}\n{block[2]}\n{block[3]}" # tail\nnext\n'
+    mark = PRIVATE_KEY_MARKER
+    assert mask_text(REDACTOR, text) == f'key = "{mark}\n{mark}\n{mark}\n{mark}" # tail\nnext\n'
+
+
+def test_a_key_on_one_line_with_its_breaks_written_out_is_one_masked_line():
+    _, rows = pem(lines=2)
+    text = (
+        '{"key": "-----BEGIN PRIVATE KEY-----\\n'
+        + rows[0]
+        + '\\n-----END PRIVATE KEY-----"}\nnext\n'
+    )
+    assert mask_text(REDACTOR, text) == '{"key": "' + PRIVATE_KEY_MARKER + '"}\nnext\n'
+
+
+def test_a_block_with_no_end_is_masked_as_far_as_it_looks_like_a_key():
+    block, _ = pem(lines=3)
+    text = "\n".join([*block[:-1], "text that is not a row"]) + "\n"
+    marks = [PRIVATE_KEY_MARKER] * (len(block) - 1)
+    assert mask_text(REDACTOR, text) == "\n".join([*marks, "text that is not a row"]) + "\n"
+
+
+def test_two_blocks_are_each_masked_and_what_is_between_them_is_kept():
+    first, _ = pem(lines=1)
+    second, _ = pem("PRIVATE KEY", lines=2)
+    text = "\n".join([*first, "between", *second]) + "\n"
+    marks = lambda block: [PRIVATE_KEY_MARKER] * len(block)  # noqa: E731
+    assert mask_text(REDACTOR, text) == "\n".join([*marks(first), "between", *marks(second)]) + "\n"
+
+
+def test_a_file_that_ends_inside_its_block_with_no_newline_keeps_that_too():
+    block, _ = pem(lines=2)
+    text = "head\n" + "\n".join(block)
+    assert mask_text(REDACTOR, text) == "head\n" + "\n".join([PRIVATE_KEY_MARKER] * len(block))
+
+
+def test_mask_text_masks_nothing_when_redaction_is_off():
+    block, _ = pem(lines=3)
+    text = "\n".join(["before", *block, "after"]) + "\n"
+    assert mask_text(Redactor(enabled=False), text) == text
+
+
+@settings(max_examples=400, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+@given(st.lists(st.sampled_from(POOL), max_size=40))
+def test_the_masked_text_has_the_lines_it_had_and_changes_the_ones_the_recognizer_touches(lines):
+    text = "\n".join(lines)
+    original, masked = text.split("\n"), mask_text(REDACTOR, text).split("\n")
+    assert len(masked) == len(original), lines
+    changed = {
+        number for number, (a, b) in enumerate(zip(original, masked, strict=True), 1) if a != b
+    }
+    assert changed == reference(lines), lines

@@ -6,15 +6,19 @@ its ``-----END`` line, by the recogniser in ``permissions/redact.py``, which is 
 there is and which this module only drives. The body of one is base64 and means nothing to
 anything that looks at a line of it alone, so a
 window of a file (what Read shows with an ``offset`` and a ``limit``, what Grep shows of a
-match and the lines around it) that begins or ends inside a block, and is scrubbed on its
-own, shows the key. The extent of a block is therefore worked out on the whole file, and the
-window is cut afterwards: a line that is inside a block is shown masked.
+match and the lines around it, what Edit shows of a change and the three lines on each side
+of it) that begins or ends inside a block, and is scrubbed on its own, shows the key. The
+extent of a block is therefore worked out on the whole file, and the window is cut afterwards:
+a line that is inside a block is shown masked.
 
-Two entry points, for the two ways a file is looked at. :func:`mask_window` is Read's: the
+Three entry points, for the three ways a file is looked at. :func:`mask_window` is Read's: the
 whole text is in hand, and a window of it is shown with the part of the block in it masked.
 :func:`masked_line_numbers` is Grep's: the file is not in hand, only the numbers of the lines
 that are to be shown, so it is read as a stream, one line at a time, and what is kept is the
 lines of a block that is open and the numbers of the lines that were inside one.
+:func:`mask_text` is the diff Edit returns: the old content and the new are both in hand, the
+diff is a window of each, and so every line of a block is masked in each before the two are
+compared.
 """
 
 from __future__ import annotations
@@ -31,7 +35,31 @@ from nanoclaude.permissions.redact import (
     Redactor,
 )
 
-__all__ = ["PRIVATE_KEY_MARKER", "mask_window", "masked_line_numbers"]
+__all__ = ["PRIVATE_KEY_MARKER", "mask_text", "mask_window", "masked_line_numbers"]
+
+
+def mask_text(redactor: Redactor, content: str) -> str:
+    """``content`` with each part of it that is inside a private key block replaced by
+    :data:`PRIVATE_KEY_MARKER`, one mask for each line the block covers.
+
+    Every line break is kept, so the lines that are not in a block keep their numbers and the
+    line counts of a hunk header are the lines that are shown. Text before a ``BEGIN`` and
+    after an ``END`` on its line stays, as it does in :func:`mask_window`. The extent of a
+    block is the one :meth:`Redactor.private_key_spans` finds in ``content`` as a whole, and
+    so is the one :meth:`Redactor.scrub` would mask. Nothing is masked when redaction is off.
+    """
+    spans = redactor.private_key_spans(content)
+    if not spans:
+        return content
+    pieces: list[str] = []
+    position = 0
+    for start, end in spans:
+        pieces.append(content[position:start])
+        lines = content.count("\n", start, end) + 1
+        pieces.append("\n".join([PRIVATE_KEY_MARKER] * lines))
+        position = end
+    pieces.append(content[position:])
+    return "".join(pieces)
 
 
 def mask_window(

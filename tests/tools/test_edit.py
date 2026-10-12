@@ -2,9 +2,11 @@ from dataclasses import replace as dc_replace
 
 import pytest
 
+from nanoclaude.permissions.redact import PRIVATE_KEY_MARKER, Redactor
 from nanoclaude.tools.base import ToolArgumentError
 from nanoclaude.tools.edit import EditError, EditTool, preview_edit, unified_diff
 from nanoclaude.tools.fs import BinaryFileError, stamp_of
+from tests.keys import pem
 
 
 def having_read(ctx, path):
@@ -341,3 +343,123 @@ async def test_the_diff_an_edit_returns_is_scrubbed_like_every_other_tool_output
     assert key not in outcome.content
     assert "[redacted:aws-key]" in outcome.content
     assert target.read_text() == f'aws_key = "{key}"\ndebug = True\n'
+
+
+# --------------------------------------------------------------------------
+# The diff never shows a line that is inside a private key block
+# --------------------------------------------------------------------------
+#
+# A diff carries three lines of context on each side of a change, and the context is a window
+# of the file like the one Read and Grep show: a block is recognised from its BEGIN line to its
+# END line, so three lines of the end of one are rows of base64 and a header that are not
+# recognisable as anything. The extent of a block is worked out on the whole old content and
+# the whole new content, and the lines in one are masked before the two are compared.
+
+MARK = PRIVATE_KEY_MARKER
+
+
+async def edit(ctx, target, old, new):
+    return await EditTool().run(
+        having_read(ctx, target),
+        "t1",
+        {"path": target.name, "edits": [{"old_string": old, "new_string": new}]},
+    )
+
+
+async def test_the_diff_does_not_show_the_end_of_a_key_as_context_before_a_change(ctx, tmp_repo):
+    block, rows = pem(lines=6)
+    target = tmp_repo / "notes.txt"
+    target.write_text("\n".join(["head", *block, "tail line", "more"]) + "\n")
+    outcome = await edit(ctx, target, "tail line", "tail line 2")
+    assert not outcome.is_error, outcome.content
+    assert outcome.content == (
+        "Edited notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -7,5 +7,5 @@\n"
+        f" {MARK}\n {MARK}\n {MARK}\n-tail line\n+tail line 2\n more\n"
+    )
+    # What is masked is what is shown. The file has what it had, and the edit.
+    assert target.read_text() == "\n".join(["head", *block, "tail line 2", "more"]) + "\n"
+    assert all(row in target.read_text() for row in rows)
+
+
+async def test_the_diff_does_not_show_the_start_of_a_key_as_context_after_a_change(ctx, tmp_repo):
+    block, rows = pem(lines=6)
+    target = tmp_repo / "notes.txt"
+    target.write_text("\n".join(["head", "x = 1", *block, "tail"]) + "\n")
+    outcome = await edit(ctx, target, "x = 1", "x = 2")
+    assert not outcome.is_error, outcome.content
+    assert outcome.content == (
+        "Edited notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,5 +1,5 @@\n"
+        f" head\n-x = 1\n+x = 2\n {MARK}\n {MARK}\n {MARK}\n"
+    )
+    assert not any(row in outcome.content for row in rows)
+    assert "BEGIN" not in outcome.content
+
+
+async def test_a_key_the_edit_adds_is_not_shown_in_the_lines_it_adds(ctx, tmp_repo):
+    block, rows = pem(lines=3)
+    target = tmp_repo / "notes.txt"
+    target.write_text("top\nplaceholder\nbottom\n")
+    outcome = await edit(ctx, target, "placeholder", "\n".join(block))
+    assert not outcome.is_error, outcome.content
+    assert not any(row in outcome.content for row in rows)
+    assert outcome.content.count(f"+{MARK}\n") == len(block)
+    assert "-placeholder\n" in outcome.content
+    assert all(row in target.read_text() for row in rows)
+
+
+async def test_a_key_the_edit_removes_is_not_shown_in_the_lines_it_removes(ctx, tmp_repo):
+    block, rows = pem(lines=3)
+    target = tmp_repo / "notes.txt"
+    target.write_text("\n".join(["top", *block, "bottom"]) + "\n")
+    outcome = await edit(ctx, target, "\n".join(block), "placeholder")
+    assert not outcome.is_error, outcome.content
+    assert not any(row in outcome.content for row in rows)
+    assert outcome.content.count(f"-{MARK}\n") == len(block)
+    assert "+placeholder\n" in outcome.content
+    assert target.read_text() == "top\nplaceholder\nbottom\n"
+
+
+async def test_a_change_inside_a_key_says_so_since_what_changed_is_not_shown(ctx, tmp_repo):
+    block, rows = pem(lines=3)
+    target = tmp_repo / "notes.txt"
+    target.write_text("\n".join(["top", *block, "bottom"]) + "\n")
+    outcome = await edit(ctx, target, rows[1], rows[2])
+    assert not outcome.is_error, outcome.content
+    assert outcome.content == (
+        "Edited notes.txt\n(the change is inside a private key block, which is not shown)\n"
+    )
+    assert rows[1] not in target.read_text()
+
+
+async def test_text_on_the_lines_of_a_block_stays_and_the_block_does_not(ctx, tmp_repo):
+    block, rows = pem(lines=3)
+    target = tmp_repo / "notes.txt"
+    quoted = [f'secret = "{block[0]}', *block[1:-1], f'{block[-1]}"  # rotate monthly']
+    target.write_text("\n".join([*quoted, "debug = False"]) + "\n")
+    outcome = await edit(ctx, target, "False", "True")
+    assert not outcome.is_error, outcome.content
+    assert not any(row in outcome.content for row in rows)
+    assert f'{MARK}"  # rotate monthly' in outcome.content
+    assert "-debug = False\n+debug = True\n" in outcome.content
+
+
+async def test_a_key_in_a_file_with_windows_line_endings_is_masked_too(ctx, tmp_repo):
+    block, rows = pem(lines=4)
+    target = tmp_repo / "notes.txt"
+    target.write_bytes(("\r\n".join(["head", *block, "tail line", "more"]) + "\r\n").encode())
+    outcome = await edit(ctx, target, "tail line", "tail line 2")
+    assert not outcome.is_error, outcome.content
+    assert not any(row in outcome.content for row in rows)
+    assert "-tail line" in outcome.content and "+tail line 2" in outcome.content
+
+
+async def test_with_redaction_switched_off_the_diff_is_what_it_was(ctx, tmp_repo):
+    """``--allow-secrets`` is the person's decision that credentials are shown, and the diff
+    follows it as Read does."""
+    block, rows = pem(lines=4)
+    target = tmp_repo / "notes.txt"
+    target.write_text("\n".join(["head", *block, "tail line", "more"]) + "\n")
+    off = dc_replace(ctx, redactor=Redactor(enabled=False))
+    outcome = await edit(off, target, "tail line", "tail line 2")
+    assert not outcome.is_error, outcome.content
+    assert rows[-1] in outcome.content and MARK not in outcome.content
