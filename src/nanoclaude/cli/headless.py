@@ -3,9 +3,14 @@
 Headless mode has nobody to ask, so a call the policy wanted confirmed is declined (spec 3.1).
 That is the right behaviour in CI, and it must not be silent: a script that wanted a file
 written finds out that it was not from the model's apology on stdout, if at all. Each declined
-call is one line on stderr, in the form of spec 17.9: what was declined, a dash, what to do.
-It starts ``ncc:`` and not ``error:``, because the run has not failed and its exit code is
-what it would have been.
+call is one line on stderr, in the form of spec 17.9: what was declined, with the id of the rule
+that asked in the parentheses every refusal has (``refused (sandbox.outside-root): ...``), a dash,
+what to do. It starts ``ncc:`` and not ``error:``, because the run has not failed and its exit
+code is what it would have been.
+
+Only a call that was asked about is reported here. One the policy denies outright is not: nobody
+was to be asked, the model is given the refusal with its rule id as the tool's result, and the
+audit records it.
 """
 
 from __future__ import annotations
@@ -56,9 +61,19 @@ def _advice(tool: str, mode: PermissionMode) -> str:
     return f'add "{visible(tool)}" to allow under [permissions] in your config to let -p run it'
 
 
-def declined_line(tool: str, request: PermissionRequest, *, root: str, mode: PermissionMode) -> str:
-    """``declined <tool> <subject> — <what to do>``, without the prefix."""
-    return f"declined {visible(tool)} {_subject_shown(request, root)} — {_advice(tool, mode)}"
+def declined_line(
+    tool: str, request: PermissionRequest, *, rule: str, root: str, mode: PermissionMode
+) -> str:
+    """``declined (<rule>) <tool> <subject> — <what to do>``, without the prefix.
+
+    ``rule`` is the id of the rule that produced the ask (``default.ask`` when nothing
+    matched, ``rule.ask`` when a rule did), so that a script that reads the line can tell the
+    two apart and knows which rule to change.
+    """
+    return (
+        f"declined ({visible(rule)}) {visible(tool)} {_subject_shown(request, root)} "
+        f"— {_advice(tool, mode)}"
+    )
 
 
 class ReportingDecline(AutoDecline):
@@ -70,8 +85,8 @@ class ReportingDecline(AutoDecline):
         self._mode = mode
 
     async def confirm(
-        self, call: ToolUseBlock, request: PermissionRequest, _result: PermissionResult
+        self, call: ToolUseBlock, request: PermissionRequest, result: PermissionResult
     ) -> Approval:
-        line = declined_line(call.name, request, root=self._root, mode=self._mode)
+        line = declined_line(call.name, request, rule=result.rule, root=self._root, mode=self._mode)
         self._err.print(Text.assemble((DECLINED_PREFIX, "bold"), line))
         return Approval.NO
