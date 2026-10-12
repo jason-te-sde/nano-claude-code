@@ -212,8 +212,15 @@ class GrepTool:
             if path not in verdicts:
                 # Both spellings, so that neither a link named like a harmless file to a
                 # credentials file, nor one named like a credentials file to a harmless
-                # one, gets past.
-                verdicts[path] = read_refusal(ctx.policy, path, os.path.realpath(path)) is None
+                # one, gets past. Nearly every file a search walks resolves to itself, has the
+                # one spelling, and is judged once: a second question with the same answer
+                # was half the cost of the walk. What is resolved is every path, not only
+                # a link: a backend may be led through a directory link (ripgrep is, when its
+                # configuration says --follow), and the file at the end of one is not itself
+                # a link, so asking only about links would let it past the sandbox.
+                resolved = os.path.realpath(path)
+                spellings = (path,) if resolved == path else (path, resolved)
+                verdicts[path] = read_refusal(ctx.policy, *spellings) is None
             return verdicts[path]
 
         return readable

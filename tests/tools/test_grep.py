@@ -2,10 +2,12 @@ import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
-from typing import Never
+from typing import Any, Never
 
 import pytest
 
+from nanoclaude.permissions.policy import PermissionRequest, PermissionResult
+from nanoclaude.permissions.policy import evaluate as real_evaluate
 from nanoclaude.permissions.redact import Redactor
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.tools.base import ToolArgumentError, ToolContext
@@ -397,6 +399,73 @@ async def test_a_link_named_like_a_credentials_file_is_dropped_by_its_name(layou
     _backend_that_reports(monkeypatch, layout.project / ".env")
     outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle"})
     assert ".env" not in outcome.content
+
+
+# ---- a file is judged by each spelling it has, and a file that resolves to itself has one
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_file_that_resolves_to_itself_is_judged_once(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    """The policy is asked about every spelling of a file, its own and what it resolves to, and
+    nearly every file a search walks resolves to itself: asking about it twice doubled the cost
+    of the walk and decided nothing."""
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    for directory in ("a", "a/b", "c"):
+        (tmp_repo / directory).mkdir(parents=True, exist_ok=True)
+        for i in range(5):
+            (tmp_repo / directory / f"f{i}.txt").write_text("needle\n")
+    asked: list[str] = []
+
+    def counting(request: PermissionRequest, *args: Any, **kwargs: Any) -> PermissionResult:
+        asked.append(request.subject)
+        return real_evaluate(request, *args, **kwargs)
+
+    monkeypatch.setattr("nanoclaude.permissions.policy.evaluate", counting)
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "output_mode": "count"})
+    assert "15 match(es)" in outcome.content, outcome.content
+    judged = [subject for subject in asked if subject.startswith(str(tmp_repo))]
+    assert len(judged) >= 15
+    assert len(judged) == len(set(judged))
+
+
+async def test_a_path_through_a_directory_link_is_judged_by_where_it_leads(layout, monkeypatch):
+    """A backend that follows links reports the file at the end of one by a path that is not
+    itself a link, and the verdict is for where that path leads, whatever the backend did: not
+    only a link is resolved, since a link can be anywhere along the way."""
+    (layout.outside / "private.txt").write_text("outside\n")
+    (layout.project / "vendor").symlink_to(layout.outside, target_is_directory=True)
+    (layout.project / "real").mkdir()
+    (layout.project / "real" / "ok.txt").write_text("fine\n")
+    (layout.project / "alias").symlink_to(layout.project / "real", target_is_directory=True)
+    _backend_that_reports(
+        monkeypatch,
+        layout.project / "vendor" / "private.txt",
+        layout.project / "alias" / "ok.txt",
+    )
+    outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle", "output_mode": "files"})
+    assert "private.txt" not in outcome.content, outcome.content
+    assert "alias/ok.txt" in outcome.content, outcome.content
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not on PATH")
+async def test_ripgrep_set_to_follow_links_cannot_bring_in_a_file_from_outside(
+    layout, monkeypatch, tmp_path
+):
+    """ripgrep reads a configuration file named by the environment, and a person may have
+    --follow in it: the file at the end of a directory link is then reported by a path that
+    is not a link."""
+    config = tmp_path / "ripgreprc"
+    config.write_text("--follow\n")
+    monkeypatch.setenv("RIPGREP_CONFIG_PATH", str(config))
+    (layout.outside / "private.txt").write_text("needle: the outside file\n")
+    (layout.project / "vendor").symlink_to(layout.outside, target_is_directory=True)
+    (layout.project / "ok.txt").write_text("needle: inside\n")
+    outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle"})
+    assert "the outside file" not in outcome.content, outcome.content
+    assert "private.txt" not in outcome.content, outcome.content
+    assert "ok.txt:1:needle: inside" in outcome.content, outcome.content
 
 
 def _deny_reading(ctx: ToolContext, *rules: str) -> ToolContext:
