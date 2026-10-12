@@ -845,7 +845,7 @@ def test_a_file_above_the_root_is_scrubbed_by_the_redactor_the_session_gave(tmp_
 # -- capped as a chain, under the assignment the other files have
 
 
-def test_files_above_the_root_count_toward_the_total_and_the_one_nearest_the_top_comes_first(
+def test_files_above_the_root_count_toward_the_total_and_the_one_nearest_the_root_comes_first(
     tmp_path, tmp_path_factory
 ):
     top, middle, app = above_the_root(tmp_path)
@@ -855,13 +855,59 @@ def test_files_above_the_root_count_toward_the_total_and_the_one_nearest_the_top
     write(middle, ABOVE_FILLERS["middle"] * 30_000)
     write(app, FILLERS["root"] * 20_000)
     loaded = load(app, home=home)
-    # 64,000 less the global file's 10,000 and the root's 20,000 is 34,000: all of the top
-    # level's 30,000, and what is left of it for the directory below.
+    # 64,000 less the global file's 10,000 and the root's 20,000 is 34,000: all of the 30,000
+    # of the directory next to the root, and what is left of it for the top level, which is the
+    # farthest above the root and so the first to be cut.
     assert loaded.count(FILLERS["global"]) == 10_000
     assert loaded.count(FILLERS["root"]) == 20_000
-    assert loaded.count(ABOVE_FILLERS["top"]) == 30_000
-    assert loaded.count(ABOVE_FILLERS["middle"]) == 4_000
+    assert loaded.count(ABOVE_FILLERS["middle"]) == 30_000
+    assert loaded.count(ABOVE_FILLERS["top"]) == 4_000
     assert "[truncated at 4000 bytes]" in loaded
+    # Only the order the total is shared in is by distance. The top level, served last, is
+    # still printed first, where it stands.
+    printed = [
+        loaded.index(char)
+        for char in (
+            FILLERS["global"],
+            ABOVE_FILLERS["top"],
+            ABOVE_FILLERS["middle"],
+            FILLERS["root"],
+        )
+    ]
+    assert printed == sorted(printed)
+
+
+def test_at_one_distance_from_the_root_the_directory_above_is_served_before_the_one_below(
+    tmp_path, tmp_path_factory
+):
+    _, middle, app = above_the_root(tmp_path)
+    service = app / "service"
+    home = tmp_path_factory.mktemp("home")
+    write(home / ".nanoclaude", FILLERS["global"] * 20_000)
+    write(app, FILLERS["root"] * 20_000)
+    write(middle, ABOVE_FILLERS["middle"] * 20_000)
+    write(service, FILLERS["a"] * 20_000)
+    loaded = load(app, cwd=service, home=home)
+    # 64,000 less 20,000 and 20,000 is 24,000. The directory above the root and the one below it
+    # are one directory from it: the one above is served first, whole, and what is left is the
+    # one below's.
+    assert loaded.count(ABOVE_FILLERS["middle"]) == 20_000
+    assert loaded.count(FILLERS["a"]) == 4_000
+
+
+def test_a_directory_below_the_root_is_nearer_than_the_top_level_two_above_it(
+    tmp_path, tmp_path_factory
+):
+    top, _, app = above_the_root(tmp_path)
+    service = app / "service"
+    home = tmp_path_factory.mktemp("home")
+    write(home / ".nanoclaude", FILLERS["global"] * 10_000)
+    write(app, FILLERS["root"] * 20_000)
+    write(top, ABOVE_FILLERS["top"] * 30_000)
+    write(service, FILLERS["a"] * 30_000)
+    loaded = load(app, cwd=service, home=home)
+    assert loaded.count(FILLERS["a"]) == 30_000
+    assert loaded.count(ABOVE_FILLERS["top"]) == 4_000
 
 
 def test_the_global_and_root_files_are_loaded_whole_however_large_the_files_above_the_root_are(

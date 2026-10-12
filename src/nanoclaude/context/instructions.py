@@ -182,9 +182,12 @@ def load_instructions(
 
     The global file and the root's are always loaded, each cut at
     :data:`MAX_INSTRUCTION_BYTES`. Every other file, above the root or below it, gets what is
-    left of :data:`MAX_INSTRUCTION_TOTAL_BYTES` in the order the files stand in the prompt, the
-    one nearest the repository's top level first: whole if it fits, cut with the marker if it
-    does not, and replaced by one line saying so if nothing is left.
+    left of :data:`MAX_INSTRUCTION_TOTAL_BYTES` in the order of its distance from the root,
+    nearest first, and a directory above the root before one below it at the same distance:
+    whole if it fits, cut with the marker if it does not, and replaced by one line saying so if
+    nothing is left. The repository's top level is the farthest above the root, so its file is
+    the first to be cut or left out. Only the order the total is shared in is by distance; the
+    files stand in the prompt as they are listed above.
     """
     root_path, cwd_path = Path(root).resolve(), Path(cwd).resolve()
     above = _above_the_root(root_path)
@@ -196,15 +199,21 @@ def load_instructions(
             current = current / part
             chain.append(current)
 
-    # The project's chain: (directory, boundary, always loaded), in the order they appear in the
-    # prompt. The directories above the root are bounded by the repository's top level, the
-    # first of them.
-    sources: list[tuple[Path, Path, bool]] = []
-    sources.extend((directory, above[0], False) for directory in above)
-    sources.append((root_path, root_path, True))
-    sources.extend((directory, root_path, False) for directory in chain[1:])
+    # The project's chain: (directory, boundary, always loaded, distance from the root in
+    # directories), in the order they appear in the prompt. The directories above the root are
+    # bounded by the repository's top level, the first of them and the farthest from the root.
+    sources: list[tuple[Path, Path, bool, int]] = []
+    sources.extend(
+        (directory, above[0], False, len(above) - nth) for nth, directory in enumerate(above)
+    )
+    sources.append((root_path, root_path, True, 0))
+    sources.extend(
+        (directory, root_path, False, nth) for nth, directory in enumerate(chain[1:], start=1)
+    )
 
-    items: list[tuple[_Instruction | None, bool]] = []
+    # (what was read, always loaded, distance from the root), in the order they appear in the
+    # prompt. The global file is not on the chain; it is always loaded, so it has no distance.
+    items: list[tuple[_Instruction | None, bool, int]] = []
     if home:
         global_directory = Path(home) / ".nanoclaude"
         items.append(
@@ -217,30 +226,49 @@ def load_instructions(
                     is_global=True,
                 ),
                 True,
+                0,
             )
         )
     items.extend(
-        (_read_one(directory, within=within, policy=policy, redactor=redactor), always)
-        for directory, within, always in sources
+        (_read_one(directory, within=within, policy=policy, redactor=redactor), always, distance)
+        for directory, within, always, distance in sources
     )
     left = MAX_INSTRUCTION_TOTAL_BYTES
-    for item, always in items:
+    for item, always, _distance in items:
         if item is not None and always:
             left -= min(len(item.text.encode("utf-8")), MAX_INSTRUCTION_BYTES)
 
-    parts: list[str] = []
-    for item, always in items:
-        if item is None:
-            continue
-        allowance = MAX_INSTRUCTION_BYTES if always else min(MAX_INSTRUCTION_BYTES, max(left, 0))
-        if not always and allowance == 0 and item.text:
-            parts.append(
+    # What is left goes to the other files nearest the root first, above it or below. The sort
+    # is stable and the list is in prompt order, so at one distance the directory above the
+    # root, which stands first in the prompt, is served before the one below it.
+    rest = sorted(
+        (
+            (distance, index, item)
+            for index, (item, always, distance) in enumerate(items)
+            if item is not None and not always
+        ),
+        key=lambda served: served[0],
+    )
+    shown_of_the_rest: dict[int, str] = {}
+    for _distance, index, item in rest:
+        allowance = min(MAX_INSTRUCTION_BYTES, max(left, 0))
+        if allowance == 0 and item.text:
+            shown_of_the_rest[index] = (
                 f"[{_one_line(str(item.path))} not loaded: instructions are capped at "
                 f"{MAX_INSTRUCTION_TOTAL_BYTES} bytes in total]"
             )
             continue
         text, used = _fit(item, allowance)
-        if not always:
-            left -= used
-        parts.append(f"<!-- {item.path} -->\n{text}")
+        left -= used
+        shown_of_the_rest[index] = f"<!-- {item.path} -->\n{text}"
+
+    parts: list[str] = []
+    for index, (item, always, _distance) in enumerate(items):
+        if item is None:
+            continue
+        if always:
+            text, _ = _fit(item, MAX_INSTRUCTION_BYTES)
+            parts.append(f"<!-- {item.path} -->\n{text}")
+        else:
+            parts.append(shown_of_the_rest[index])
     return "\n\n".join(parts)
