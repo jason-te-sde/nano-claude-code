@@ -5,8 +5,10 @@ names exists: a tool, a command, a key, a file. That is still most of how docume
 goes wrong, since it is code that moves and the prose that stays.
 """
 
+import ast
 import base64
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -21,10 +23,12 @@ from pathlib import Path
 import pytest
 
 from nanoclaude.agent.loop import StopReason
+from nanoclaude.cli import init as ncc_init
 from nanoclaude.cli.commands import COMMANDS
 from nanoclaude.cli.headless import DECLINED_PREFIX, declined_line
 from nanoclaude.cli.init import PRESETS
 from nanoclaude.cli.main import EXIT_CODES, build_parser, main
+from nanoclaude.cli.render import status_panel
 from nanoclaude.cli.repl import TEXT_TOOL_BANNER
 from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, ConfigError, load_config
 from nanoclaude.config.schema import ROLES, LimitsConfig, ModelConfig, PermissionsConfig, UiConfig
@@ -38,7 +42,8 @@ from nanoclaude.context.projectmap import project_map
 from nanoclaude.conversation.store import Store
 from nanoclaude.permissions import redact
 from nanoclaude.permissions.audit import AuditLog
-from nanoclaude.permissions.danger.regex import RegexClassifier
+from nanoclaude.permissions.danger import DangerLevel
+from nanoclaude.permissions.danger.regex import KNOWN_BLIND_SPOTS, RegexClassifier
 from nanoclaude.permissions.policy import (
     PROTECTED_DIRECTORIES,
     Decision,
@@ -51,9 +56,9 @@ from nanoclaude.permissions.policy import (
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
 from nanoclaude.permissions.rules import KNOWN_TOOLS, RuleSet, glob_matches_any
 from nanoclaude.permissions.sandbox import Sandbox
-from nanoclaude.private import create_private_file, make_private_directories
+from nanoclaude.private import create_private_file, make_private_directories, write_private
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CONSERVATIVE_DEFAULT, capabilities_for
-from nanoclaude.providers.pricing import PriceBook
+from nanoclaude.providers.pricing import STALE_AFTER_DAYS, PriceBook
 from nanoclaude.tools.edit import EditTool
 from nanoclaude.tools.fs import stamp_of
 from nanoclaude.tools.glob import GlobTool
@@ -185,6 +190,11 @@ _SLASH_COMMAND = re.compile(r"`/([a-z]+)(?=[`\s\[<])")
 
 def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _chunks(text: str) -> list[str]:
+    """The paragraphs of a document, with each item of a list a chunk of its own."""
+    return [chunk for part in text.split("\n\n") for chunk in re.split(r"\n(?=- |\d+\. )", part)]
 
 
 def _section(text: str, heading: str) -> str:
@@ -1013,7 +1023,7 @@ def test_the_credentials_list_in_the_reference_is_the_one_the_policy_refuses():
         assert not glob_matches_any(SECRET_PATH_PATTERNS, (public,), fold=True), public
 
 
-def test_a_deny_rule_folds_case_and_an_allow_rule_does_not(tmp_path):
+def test_a_deny_rule_folds_case_and_normalization_and_an_allow_rule_does_not(tmp_path):
     policy = Policy(
         sandbox=Sandbox((str(tmp_path),)),
         rules=RuleSet.build(allow=["Write(Docs/**)"], deny=["Read(secrets/**)"]),
@@ -1024,10 +1034,23 @@ def test_a_deny_rule_folds_case_and_an_allow_rule_does_not(tmp_path):
     assert _decide(policy, "Read", ".ENV", write=False).rule == "secret.path"
     assert _decide(policy, "Write", "Docs/a.md", write=True).rule == "rule.allow"
     assert _decide(policy, "Write", "docs/a.md", write=True).rule == "default.ask"
+    # A name in NFD is the same file as one in NFC on the file systems people use most.
+    nfc, nfd = "caf\u00e9", "cafe\u0301"
+    folding = Policy(
+        sandbox=Sandbox((str(tmp_path),)),
+        rules=RuleSet.build(allow=[f"Write({nfc}/**)"], deny=[f"Read({nfc}/**)"]),
+        mode=PermissionMode.DEFAULT,
+        secret_paths=SECRET_PATH_PATTERNS,
+    )
+    assert _decide(folding, "Read", f"{nfd}/key.txt", write=False).rule == "rule.deny"
+    assert _decide(folding, "Write", f"{nfc}/a.md", write=True).rule == "rule.allow"
+    assert _decide(folding, "Write", f"{nfd}/a.md", write=True).rule == "default.ask"
     for document in (CONFIGURATION, ARCHITECTURE):
         assert "case folding" in _text(document), document.name
+        assert "NFC normalization" in _text(document), document.name
     assert "`Read(secrets/**)`" in _text(CONFIGURATION)
     assert "`Secrets/key.txt`" in _text(CONFIGURATION)
+    assert "written in NFD where the rule has it in NFC" in _text(CONFIGURATION)
 
 
 def test_a_rule_naming_a_tool_that_does_not_exist_is_refused_and_two_names_are_reserved(tmp_path):
@@ -1111,6 +1134,7 @@ def test_the_prices_the_reference_gives_are_the_price_books():
         f"${haiku.above_threshold.input_per_mtok:.2f}",
         f"${haiku.above_threshold.output_per_mtok:.2f}",
         f"dated {book.last_updated.isoformat()}",
+        f"more than {STALE_AFTER_DAYS} days old",
     ):
         assert needle in text, f"the reference's Prices paragraph does not say {needle!r}"
 
@@ -1198,12 +1222,27 @@ def test_a_rules_glob_is_also_matched_against_the_absolute_path_without_its_lead
     narrow = policy_with(allow=(f"Write({root}/out/**)",))
     assert _decide(narrow, "Write", "out/a.py", write=True).rule == "rule.allow"
     assert _decide(narrow, "Write", "src/a.py", write=True).rule == "default.ask"
+    # It names that directory, and also one that a project repeats below its own root.
+    other = Path(os.path.realpath(tmp_path / "other"))
+    (other / str(root).lstrip("/") / "out").mkdir(parents=True)
+    repeated = Policy(
+        sandbox=Sandbox((str(other),)),
+        rules=narrow.rules,
+        mode=PermissionMode.DEFAULT,
+        secret_paths=SECRET_PATH_PATTERNS,
+    )
+    below = f"{str(root).lstrip('/')}/out/x.py"
+    assert _decide(repeated, "Write", below, write=True).rule == "rule.allow", (
+        "an absolute rule no longer matches a project that repeats its path below its root; "
+        "correct docs/configuration.md and SECURITY.md, which say that it does"
+    )
     for document in (CONFIGURATION, SECURITY):
-        text = _text(document)
+        text = " ".join(_text(document).split())
         assert "known issue" in text and "`Write(/home/you/app/tmp/**)`" in text, document.name
+        assert "a project that repeats the path below its root" in text, document.name
 
 
-def test_the_limits_the_reference_calls_reserved_are_read_by_nothing():
+def test_the_limits_table_calls_the_shell_limits_reserved():
     rows = _table_rows(_section(_text(CONFIGURATION), "Limits"))
     reserved = {
         row[0].strip("`"): row[2]
@@ -1225,7 +1264,7 @@ KNOWN_LIMITS = (
     "**Short and plain secrets.**",
     "**Names.**",
     "**Your instruction file.**",
-    "**Files you made.**",
+    "**Files `ncc` keeps private.**",
     "**A rule's glob and the leading slash.**",
     "**Line numbers.**",
 )
@@ -1297,7 +1336,25 @@ def test_a_short_or_plain_value_in_an_assignment_is_not_redacted_quoted_or_not()
         )
     assert scrubber.scrub(f"API_KEY={token[:22]}")[0] == "API_KEY=[redacted:assigned-secret]"
     assert redact.ENTROPY_FLOOR == 3.5
-    assert "16 characters" in _text(SECURITY) and "3.5 bits" in _text(SECURITY)
+    said = " ".join(_text(SECURITY).split())
+    assert "16 characters" in said and "3.5 bits" in said
+
+
+def test_a_value_is_redacted_as_far_as_its_first_run_goes_and_what_follows_stays():
+    """A known limit: the value is the first run of letters, digits and +/=_-, and no more."""
+    scrubber = Redactor()
+    digest = base64.b64encode(hashlib.sha256(b"a sample").digest()).decode()
+    token = digest.replace("+", "x").replace("/", "y")
+    cut = scrubber.scrub(f'password = "{token[:18]}!extra"')[0]
+    assert cut == 'password = "[redacted:assigned-secret]!extra"', (
+        "the tail of a value after its first run is no longer left readable; correct SECURITY.md"
+    )
+    spaced = scrubber.scrub(f'password = "{token[:18]} extra"')[0]
+    assert spaced == 'password = "[redacted:assigned-secret] extra"'
+    whole = f'password = "{token[:6]}!{token[6:24]}"'  # a first run of six: left as it is
+    assert scrubber.scrub(whole) == (whole, 0)
+    text = " ".join(_text(SECURITY).split())
+    assert "its first run" in text and "stays readable" in text
 
 
 def test_a_deny_rule_does_not_keep_the_global_instruction_file_out_but_does_the_projects(
@@ -1324,29 +1381,83 @@ def test_a_deny_rule_does_not_keep_the_global_instruction_file_out_but_does_the_
     )
 
 
-def test_a_config_toml_written_by_hand_keeps_its_mode_when_ncc_opens_its_home(tmp_path):
-    state = tmp_path / ".nanoclaude"
-    state.mkdir()
-    config = state / "config.toml"
-    config.write_text("[models]\n")
-    config.chmod(0o644)
-    Store(state / "sessions.db").open()
-    assert (mode_of(state), mode_of(state / "sessions.db"), mode_of(config)) == (
-        0o700,
-        0o600,
-        0o644,
-    ), "ncc now changes a config.toml it did not create; correct SECURITY.md"
+def test_ncc_never_changes_a_config_toml_that_is_there_and_ncc_init_makes_its_own_private(
+    tmp_path,
+):
+    assert vars(ncc_init)["write_private"] is write_private, (
+        "ncc init no longer writes its config with the routine that makes it private"
+    )
+    written = tmp_path / "written"
+    write_private(written / "config.toml", "[models]\n", replace=False)
+    assert mode_of(written / "config.toml") == 0o600
+    by_hand = tmp_path / "by-hand"
+    by_hand.mkdir()
+    (by_hand / "config.toml").write_text("[models]\n")
+    for home in (written, by_hand):
+        config = home / "config.toml"
+        config.chmod(0o644)  # left open: by an earlier version, or by whoever made it
+        home.chmod(0o755)
+        Store(home / "sessions.db").open()
+        assert (mode_of(home), mode_of(home / "sessions.db"), mode_of(config)) == (
+            0o700,
+            0o600,
+            0o644,
+        ), f"ncc now changes a config.toml that is there ({home.name}); correct the documents"
+    for document in (SECURITY, CONFIGURATION, ARCHITECTURE):
+        private_files = next(c for c in _chunks(_text(document)) if "write-ahead" in c)
+        said = " ".join(private_files.split())
+        assert "whoever wrote it" in said and "is never changed" in said, document.name
+        assert "narrows" not in said.split("config.toml")[-1].split(".")[0], document.name
+
+
+def test_a_config_file_holds_no_key_because_the_loader_refuses_one(tmp_path):
+    # Built when the test runs: a literal of this shape is not allowed in this repository.
+    digest = base64.b64encode(hashlib.sha256(b"another sample").digest()).decode()
+    key = digest.replace("+", "x").replace("/", "y")
+    home = tmp_path / "home"
+    (home / CONFIG_DIRNAME).mkdir(parents=True)
+    config = home / CONFIG_DIRNAME / CONFIG_FILENAME
+    entry = '[models.bad]\nadapter = "anthropic"\nmodel = "claude-sonnet-5-5"\n'
+    for line, said in (
+        (f'api_key = "{key}"', "keys never go in a config file"),
+        (f'api_key_env = "{key}"', "name of an environment variable"),
+    ):
+        config.write_text(EXAMPLE_HOME + "\n" + entry + line + "\n")
+        with pytest.raises(ConfigError, match=said) as refused:
+            load_config(home=str(home), project=None, env={})
+        assert key not in str(refused.value), "the error repeats the key it refused"
+    for document in (SECURITY, CONFIGURATION, ARCHITECTURE):
+        assert "holds no key" in " ".join(_text(document).split()), document.name
+
+
+def _other_line_breaks() -> list[str]:
+    """Every character, beside a newline, at which ``str.splitlines`` ends a line."""
+    return [
+        character
+        for character in map(chr, range(0x10000))
+        if character != "\n" and ("a" + character + "b").splitlines() == ["a", "b"]
+    ]
 
 
 async def test_read_numbers_a_line_where_str_splitlines_ends_it(ctx, tmp_repo):
-    (tmp_repo / "a.txt").write_bytes(b"one\x0ctwo\nthree\n")
-    outcome = await ReadTool().run(ctx, "t1", {"path": "a.txt"})
-    assert "1\tone\n2\ttwo\n3\tthree" in outcome.content, (
-        "Read no longer numbers lines as str.splitlines does; correct SECURITY.md and "
-        f"docs/architecture.md. It said: {outcome.content}"
-    )
+    breaks = _other_line_breaks()
+    assert len(breaks) >= 9, f"found only {breaks!r}, so the search for them is wrong"
+    for index, character in enumerate(breaks):
+        name = f"b{index}.txt"
+        (tmp_repo / name).write_bytes(f"one{character}two\nthree\n".encode())
+        outcome = await ReadTool().run(ctx, "t1", {"path": name})
+        assert "1\tone\n2\ttwo\n3\tthree" in outcome.content, (
+            f"Read no longer numbers a line at U+{ord(character):04X}, where str.splitlines ends "
+            f"one; correct SECURITY.md and docs/architecture.md. It said: {outcome.content}"
+        )
     for document in (SECURITY, ARCHITECTURE):
         assert "str.splitlines" in _text(document), document.name
+    item = next(c for c in _chunks(_text(SECURITY)) if c.startswith("- **Line numbers.**"))
+    listed = {int(code, 16) for code in re.findall(r"U\+([0-9A-F]{4})", item)}
+    assert listed == {ord(character) for character in breaks}, (
+        f"SECURITY.md lists {sorted(hex(code) for code in listed)} where Read and Grep number "
+        f"differently; str.splitlines ends a line at {sorted(hex(ord(c)) for c in breaks)}"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1368,11 +1479,27 @@ def test_the_kinds_the_redaction_note_names_are_the_ones_the_scrubber_writes():
     )
 
 
+#: What a sentence about a trailer says when it is about how a commit gets one, or loses it.
+_HOW_A_TRAILER_COMES_AND_GOES = re.compile(
+    r"\b(?:strip\w*|delet\w*|remov\w*|rewrit\w*|rewritten|drop\w*|append\w*"
+    r"|add(?:s|ed|ing)?|carr(?:y|ies|ied|ying))\b"
+)
+
+
 def test_the_attribution_note_and_the_guide_state_the_rule_and_not_how_commits_are_made():
-    for document in (DESIGN / "0016-attribution-policy.md", CONTRIBUTING):
-        text = " ".join(_text(document).lower().split())
+    shapes = 0
+    for document in _every_document():
+        text = " ".join(_text(document).split())
         for phrase in ("tools that write commit messages", "act of deleting"):
-            assert phrase not in text, f"{document.name} says {phrase!r}"
+            assert phrase not in text.lower(), f"{document.name} says {phrase!r}"
+        for sentence in re.split(r"(?<=[.!?])\s+|\s+- ", text):
+            if re.search(r"\btrailers?\b", sentence, re.IGNORECASE):
+                shapes += 1
+                assert _HOW_A_TRAILER_COMES_AND_GOES.search(sentence.lower()) is None, (
+                    f"{document.name} says how a trailer comes to be on a commit, or is taken "
+                    f"off it, where it should say only what the rule is: {sentence!r}"
+                )
+    assert shapes >= 2, f"only {shapes} sentences mention a trailer, so the check read too little"
 
 
 def test_the_readme_says_what_containment_and_redaction_add():
@@ -1388,6 +1515,34 @@ def test_the_readme_says_what_containment_and_redaction_add():
         assert phrase in text, f"the README does not say {phrase!r}"
 
 
+def test_the_readme_says_that_one_flag_lifts_the_credentials_rule_and_the_redaction(tmp_path):
+    text = _text(README)
+    paragraph = next(part for part in text.split("\n\n") if "gets past them" in part)
+    said = " ".join(paragraph.split())
+    assert "`--allow-secrets`" in said, (
+        "the README says that nothing gets past the checks that come first, and one flag does"
+    )
+    assert "turns the credentials rule and the redaction off together" in said
+    row = next(line for line in text.splitlines() if line.startswith("| Credentials:"))
+    assert "`--allow-secrets`" in row
+    # The flag is what the README says: one switch, and both defences go.
+    digest = base64.b64encode(hashlib.sha256(b"a third sample").digest()).decode()
+    token = digest.replace("+", "x").replace("/", "y")[:22]
+    sandbox = Sandbox((str(tmp_path),))
+    rules = RuleSet.build(allow=["Read"])
+    for lifted in (False, True):
+        policy = Policy(
+            sandbox=sandbox,
+            rules=rules,
+            mode=PermissionMode.DEFAULT,
+            secret_paths=SECRET_PATH_PATTERNS,
+            allow_secrets=lifted,
+        )
+        refused = _decide(policy, "Read", ".env", write=False).rule == "secret.path"
+        assert refused is not lifted
+        assert (Redactor(enabled=not lifted).scrub(f"API_KEY={token}")[1] == 0) is lifted
+
+
 def test_the_changelog_lists_what_the_two_fixes_added():
     text = _text(CHANGELOG)
     for phrase in (
@@ -1399,6 +1554,123 @@ def test_the_changelog_lists_what_the_two_fixes_added():
         "`shell` and `openai` extras",
     ):
         assert phrase in text, f"the changelog does not mention {phrase!r}"
+
+
+# --------------------------------------------------------------------------
+# What the documents say about the classifier, the schema and the suite
+# --------------------------------------------------------------------------
+
+
+def test_the_documents_say_how_many_of_the_classifiers_blind_spots_have_a_test():
+    """Eight are listed. A test shows a command getting through for four of them, and four have
+    none: a known gap, which the documents say plainly."""
+    classifier_tests = _text(ROOT / "tests" / "permissions" / "danger" / "test_regex.py")
+    loop = re.search(r"for obfuscated in \[(.*?)\]:", classifier_tests, re.DOTALL)
+    assert loop is not None, (
+        "the classifier's blind-spot test no longer loops over samples; correct README.md, "
+        "SECURITY.md, docs/architecture.md and docs/testing.md, which count them"
+    )
+    samples = [ast.literal_eval(literal) for literal in re.findall(r'"[^"\n]*"', loop.group(1))]
+    word_splitting = "rm$IFS-rf$IFS/"
+    assert word_splitting in _text(ROOT / "tests" / "test_measure.py")
+    classifier = RegexClassifier()
+    for sample in (*samples, word_splitting):
+        assert classifier.classify(sample).level is DangerLevel.SAFE, sample
+    shown = len(samples) + 1
+    assert (len(KNOWN_BLIND_SPOTS), shown) == (8, 4), (
+        f"{len(KNOWN_BLIND_SPOTS)} blind spots are listed and {shown} are shown getting through "
+        "by a test; correct README.md, SECURITY.md, docs/architecture.md and docs/testing.md"
+    )
+    for document in (README, SECURITY, ARCHITECTURE, TESTING):
+        said = " ".join(_text(document).lower().split())
+        assert "eight known blind spots" in said and "shows four" in said, document.name
+
+
+def test_the_documents_say_where_a_rule_id_is_shown_and_it_is_not_in_status():
+    sentence = next(
+        part
+        for part in _text(ARCHITECTURE).split("\n\n")
+        if part.startswith("The rule id of the decision")
+    )
+    assert "/status" not in sentence
+    for place in ("a refusal quotes", "declined line", "audit table"):
+        assert place in sentence, place
+    assert ".rule" not in inspect.getsource(status_panel), (
+        "/status now shows a rule id; correct docs/architecture.md and docs/configuration.md"
+    )
+
+
+def test_the_documents_say_a_file_is_refused_for_what_the_schema_does_not_have(tmp_path):
+    home = tmp_path / "home"
+    (home / CONFIG_DIRNAME).mkdir(parents=True)
+    config = home / CONFIG_DIRNAME / CONFIG_FILENAME
+    config.write_text(EXAMPLE_HOME + "\n[hooks]\nbefore = 1\n")
+    with pytest.raises(ConfigError, match="unknown section 'hooks'"):
+        load_config(home=str(home), project=None, env={})
+    # What the schema has and nothing reads yet is accepted, and the reference says which.
+    config.write_text(EXAMPLE_HOME + '\n[limits]\nbash_timeout_s = 5\n[ui]\ntheme = "dark"\n')
+    load_config(home=str(home), project=None, env={})
+    for document, said in (
+        (ARCHITECTURE, "a key or section that the schema does not have is an error"),
+        (SECURITY, "names a section this version does not have"),
+        (DESIGN / "0001-scope.md", "names a section this version does not have"),
+    ):
+        text = " ".join(_text(document).split())
+        assert said in text, f"{document.name} does not say {said!r}"
+        assert "section this version does not read" not in text, document.name
+        assert "a key or section that nothing reads" not in text, document.name
+
+
+def test_a_project_file_may_set_the_compaction_limits_and_the_reference_says_what_that_costs(
+    tmp_path,
+):
+    home, project = tmp_path / "home", tmp_path / "project"
+    for directory in (home, project):
+        (directory / CONFIG_DIRNAME).mkdir(parents=True)
+    (home / CONFIG_DIRNAME / CONFIG_FILENAME).write_text(EXAMPLE_HOME)
+    (project / CONFIG_DIRNAME / CONFIG_FILENAME).write_text(
+        "[limits]\ncompact_soft = 0.1\ncompact_hard = 0.2\nkeep_recent_turns = 1\n"
+    )
+    loaded = load_config(home=str(home), project=str(project), env={})
+    assert (loaded.limits.compact_soft, loaded.limits.keep_recent_turns) == (0.1, 1)
+    text = _text(CONFIGURATION)
+    assert "bound nothing" not in text
+    assert text.count("cap nothing a session may do") == 2
+
+
+def test_no_document_calls_the_hygiene_check_one_for_non_english_text():
+    for document in _every_document():
+        assert "non-English" not in _text(document), document.name
+    assert "Chinese characters" in _text(CHANGELOG)
+
+
+def test_the_layers_table_names_every_directory_and_file_of_the_suite():
+    helpers = {
+        "__init__.py",
+        "conftest.py",
+        "fifo.py",
+        "keys.py",
+        "script_modules.py",
+        "__pycache__",
+    }
+    layers = _section(_text(TESTING), "The layers")
+    named = [
+        f"tests/{entry.name}"
+        for entry in sorted((ROOT / "tests").iterdir())
+        if entry.name not in helpers
+    ]
+    assert len(named) >= 15, f"found only {named}, so the listing of the suite is wrong"
+    missing = [entry for entry in named if entry not in layers]
+    assert missing == [], f"the layers table in docs/testing.md does not name {missing}"
+
+
+def test_the_readme_says_why_the_design_notes_skip_numbers():
+    present = {int(note.name[:4]) for note in DESIGN.glob("*.md")}
+    skipped = [number for number in range(1, max(present)) if number not in present]
+    assert skipped, "no number is skipped, so the README's sentence about the gaps is stale"
+    text = _text(README)
+    for number in skipped:
+        assert f"{number:04d}" in text, f"the README does not say why note {number:04d} is missing"
 
 
 # --------------------------------------------------------------------------
