@@ -12,6 +12,7 @@ from nanoclaude.permissions.policy import (
     PermissionResult,
     Policy,
     evaluate,
+    protected_directory,
     read_refusal,
 )
 from nanoclaude.permissions.rules import RuleSet
@@ -768,6 +769,21 @@ def test_an_ask_rule_still_compares_exactly():
     assert evaluate(write_req("Write", "/p/DOCS/x"), p, Grants()).rule == "default.ask"
 
 
+def test_a_deny_rule_with_a_wildcard_still_refuses_a_name_that_folds_to_two_letters():
+    """``?`` held the sharp s before names were folded, and half of the "ss" it became after:
+    folding adds refusals, and does not take one away."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(vault/?.dat)"]))
+    name = "/p/vault/\u00df.dat"
+    result = evaluate(req(subject=name, paths=(name,)), p, Grants())
+    assert (result.decision, result.rule) == (Decision.DENY, "rule.deny")
+
+
+def test_a_credentials_pattern_with_a_class_still_refuses_the_same_name():
+    p = policy(secret_paths=("vault/[\u00df].dat",))
+    refusal = read_refusal(p, "/p/vault/\u00df.dat")
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
 # ---- a newline in a name is not a way past a refusal
 
 ODD = "/p/odd\ndir"
@@ -904,6 +920,25 @@ def test_every_path_of_a_request_is_checked_not_only_the_first():
 
 
 # ---- sandbox.protected-path is about the project's own .git and .nanoclaude
+
+
+def test_a_protected_name_is_matched_as_it_is_written_and_as_it_folds(monkeypatch):
+    """The names are compared as they are and folded, so that one that does not fold to itself
+    (a capital, a sharp s) is not a name that no directory can have."""
+    monkeypatch.setattr(
+        "nanoclaude.permissions.policy.PROTECTED_DIRECTORIES", (".Hooks", ".Stra\u00dfe")
+    )
+    sandbox = Sandbox((ROOT,))
+    spellings = [
+        (".Hooks", ".Hooks"),
+        (".hooks", ".Hooks"),
+        (".HOOKS", ".Hooks"),
+        (".Stra\u00dfe", ".Stra\u00dfe"),
+        (".STRASSE", ".Stra\u00dfe"),
+    ]
+    for spelling, name in spellings:
+        assert protected_directory(f"{ROOT}/{spelling}/x", sandbox) == name, spelling
+    assert protected_directory(f"{ROOT}/.Hook/x", sandbox) is None
 
 
 @pytest.mark.parametrize(

@@ -1,4 +1,6 @@
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from nanoclaude.permissions.rules import (
     KNOWN_TOOLS,
@@ -265,3 +267,95 @@ def test_only_the_deny_list_of_a_ruleset_folds():
     for kind, expected in cases:
         found = rules.first_match(kind, "Read", "/p/DOCS/x", "DOCS/x") is not None
         assert found is expected, kind
+
+
+# ---- folding adds refusals and never takes one away
+
+#: A pattern and a name it matches exactly, though the name folds to more characters than it
+#: has: the sharp s to "ss", the dotted capital I to an "i" and a combining dot, the fi ligature
+#: to "fi". ``?`` and a class hold one character, and the folded name has two. The last is a
+#: star before a combining mark, which the name's letter composes with and the pattern's cannot.
+FOLDS_TO_MORE = [
+    ("vault/?.dat", "vault/\u00df.dat"),
+    ("vault/[\u00df].dat", "vault/\u00df.dat"),
+    ("vault/[a-z\u00df].dat", "vault/\u00df.dat"),
+    ("vault/?.dat", "vault/\u0130.dat"),
+    ("vault/[\u0130].dat", "vault/\u0130.dat"),
+    ("vault/?.dat", "vault/\ufb01.dat"),
+    ("vault/[\ufb01].dat", "vault/\ufb01.dat"),
+    ("vault/*\u0301.dat", "vault/y\u0301.dat"),
+]
+
+
+@pytest.mark.parametrize(("pattern", "name"), FOLDS_TO_MORE)
+def test_a_name_a_pattern_matches_exactly_is_matched_when_folding_too(pattern, name):
+    assert glob_matches_any((pattern,), (f"/p/{name}", name))
+    assert glob_matches_any((pattern,), (f"/p/{name}", name), fold=True)
+
+
+@pytest.mark.parametrize(("pattern", "name"), FOLDS_TO_MORE)
+def test_a_deny_rule_refuses_the_name_it_refused_before_it_folded(pattern, name):
+    rule = Rule.parse(f"Read({pattern})")
+    assert rule.matches("Read", f"/p/{name}", name)
+    assert rule.matches("Read", f"/p/{name}", name, fold=True)
+
+
+@pytest.mark.parametrize(
+    ("pattern", "name"),
+    [
+        ("vault/secret.dat", "vault/SECRET.dat"),
+        ("vault/[a-z].dat", "vault/Q.dat"),
+        ("vault/\u00df.dat", "vault/SS.dat"),
+    ],
+)
+def test_folding_still_adds_the_spellings_the_exact_match_misses(pattern, name):
+    """Both ways at once: what folding adds is on top of what the exact match found."""
+    assert not glob_matches_any((pattern,), (name,))
+    assert glob_matches_any((pattern,), (name,), fold=True)
+    assert Rule.parse(f"Read({pattern})").matches("Read", f"/p/{name}", name, fold=True)
+
+
+_NAME_PIECES = [
+    "a",
+    "A",
+    "s",
+    "S",
+    "\u00df",
+    "\u0130",
+    "\ufb01",
+    "\u00e9",
+    "e\u0301",
+    "\u01f0",
+    "j\u030c",
+    ".",
+]
+_PATTERN_PIECES = [
+    *_NAME_PIECES,
+    "?",
+    "*",
+    "[\u00df]",
+    "[a\u00df]",
+    "[\u0130]",
+    "[\ufb01]",
+    "[\u00e9]",
+    "[e\u0301]",
+    "[\u01f0]",
+    "[sS]",
+]
+
+
+@settings(max_examples=500, deadline=None)
+@given(
+    st.lists(st.sampled_from(_PATTERN_PIECES), min_size=1, max_size=5),
+    st.lists(st.sampled_from(_NAME_PIECES), min_size=1, max_size=5),
+)
+def test_whatever_a_pattern_matches_exactly_it_matches_when_folding_too(pattern, name):
+    exact_pattern, exact_name = "dir/" + "".join(pattern), "dir/" + "".join(name)
+    if glob_matches_any((exact_pattern,), (exact_name,)):
+        assert glob_matches_any((exact_pattern,), (exact_name,), fold=True), (
+            exact_pattern,
+            exact_name,
+        )
+        assert Rule.parse(f"Read({exact_pattern})").matches(
+            "Read", f"/p/{exact_name}", exact_name, fold=True
+        ), (exact_pattern, exact_name)

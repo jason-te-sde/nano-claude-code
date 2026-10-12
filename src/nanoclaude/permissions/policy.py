@@ -46,9 +46,10 @@ EDIT_TOOLS = frozenset({"Edit", "Write"})
 #: configuration, its capability cache and its session store from ``.nanoclaude``. A write
 #: to one is a way for a tool call to run code that no confirmation described, so it is
 #: refused whatever the mode. They are looked for in the part of a path inside a sandbox root
-#: (see :func:`protected_directory`). Names are compared after ``fold_spelling`` (rules.py), since
-#: the filesystems people use most (macOS's default among them) treat ``.GIT`` as ``.git``;
-#: that errs towards refusing, which is the safe side for a refusal.
+#: (see :func:`protected_directory`). Names are compared whole, after ``fold_spelling``
+#: (rules.py) on both sides, since the filesystems people use most (macOS's default among
+#: them) treat ``.GIT`` as ``.git``; folding only adds spellings that are refused, which is
+#: the safe side for a refusal.
 PROTECTED_DIRECTORIES = (".git", ".nanoclaude")
 
 
@@ -66,13 +67,17 @@ def protected_directory(path: str, sandbox: Sandbox) -> str | None:
     counts: rewriting it points git somewhere else. Components are compared whole, so
     ``.github`` and ``.gitignore`` are nothing to do with it.
     """
+    # Both sides folded: a name that does not fold to itself (a capital, a sharp s) is looked
+    # for in the folded component, and not compared with its own spelling, which the folded
+    # component can never be equal to.
+    by_folded_name = {fold_spelling(name): name for name in PROTECTED_DIRECTORIES}
     for root in sandbox.roots:
         if not is_within(root, path):
             continue
         for part in PurePosixPath(path).relative_to(root).parts:
-            folded = fold_spelling(part)
-            if folded in PROTECTED_DIRECTORIES:
-                return folded
+            name = by_folded_name.get(fold_spelling(part))
+            if name is not None:
+                return name
     return None
 
 
