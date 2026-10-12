@@ -684,6 +684,31 @@ async def test_a_name_that_is_not_utf8_is_judged_by_the_rule_that_names_its_dire
 
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not on PATH")
+@pytest.mark.parametrize(
+    ("char", "shown"),
+    [
+        pytest.param("\u2028", "\u2028", id="u2028"),
+        pytest.param("\u2029", "\u2029", id="u2029"),
+        # A C1 control is taken out of what every tool returns, so the line shows without it.
+        pytest.param("\x85", "", id="u0085"),
+    ],
+)
+async def test_a_line_with_a_break_only_splitlines_knows_is_shown_not_a_crash(
+    ctx, tmp_repo, monkeypatch, char, shown
+):
+    """ripgrep writes these characters into its JSON as they are, and the call used to end in
+    a ``JSONDecodeError`` that nothing caught, as an internal error."""
+    (tmp_repo / "a.txt").write_text(
+        f"above{char}line\nneedle{char}here\nbelow{char}line\n", encoding="utf-8"
+    )
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "-C": 1})
+    assert not outcome.is_error, outcome.content
+    assert f"a.txt:2:needle{shown}here" in outcome.content, outcome.content
+    assert f"a.txt-1-above{shown}line" in outcome.content, outcome.content
+    assert f"a.txt-3-below{shown}line" in outcome.content, outcome.content
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not on PATH")
 async def test_a_line_that_is_not_utf8_is_shown_by_both_backends(ctx, tmp_repo, monkeypatch):
     (tmp_repo / "latin.txt").write_bytes(b"caf\xe9 needle\n")
     for force in (False, True):

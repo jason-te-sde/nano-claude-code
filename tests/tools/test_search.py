@@ -423,13 +423,19 @@ def test_the_fallback_does_not_even_read_a_file_that_is_not_kept(tmp_path, monke
     assert opened == ["open.txt"]
 
 
-def _canned_ripgrep(monkeypatch: pytest.MonkeyPatch, *events: dict[str, object]) -> None:
-    """``rg --json`` having printed ``events``: the search itself is not run."""
+def _canned_ripgrep(
+    monkeypatch: pytest.MonkeyPatch, *events: dict[str, object], raw_unicode: bool = False
+) -> None:
+    """``rg --json`` having printed ``events``: the search itself is not run.
+
+    ``raw_unicode`` writes the characters as they are, as ripgrep does, and not as ``\\uXXXX``
+    escapes, which is what ``json.dumps`` does unless it is told not to.
+    """
     import json
     import subprocess
     from types import SimpleNamespace
 
-    stdout = "\n".join(json.dumps(event) for event in events) + "\n"
+    stdout = "\n".join(json.dumps(event, ensure_ascii=not raw_unicode) for event in events) + "\n"
     monkeypatch.setattr(
         subprocess,
         "run",
@@ -550,3 +556,50 @@ def test_the_fallback_decodes_a_line_that_is_not_utf8_the_same_way(tmp_path):
     (tmp_path / "latin.txt").write_bytes(b"caf\xe9 needle\n")
     (found,) = python_search("needle", root=str(tmp_path), glob=None)
     assert found.line == "caf\ufffd needle"
+
+
+# ---- ripgrep's JSON is one event to a line, and only a newline ends a line
+
+#: What ``str.splitlines`` breaks at and a JSON string may hold as it is: ripgrep writes them
+#: unescaped, since JSON only requires the characters below U+0020 to be escaped.
+BREAKS_STR_SPLITLINES_ONLY = [
+    pytest.param("\u2028", id="line-separator"),
+    pytest.param("\u2029", id="paragraph-separator"),
+    pytest.param("\x85", id="next-line"),
+]
+
+
+@pytest.mark.parametrize("char", BREAKS_STR_SPLITLINES_ONLY)
+def test_a_line_break_that_only_splitlines_knows_does_not_end_an_event(monkeypatch, char):
+    _canned_ripgrep(
+        monkeypatch,
+        _event({"text": "/p/a.txt"}, 1, {"text": f"before{char}context\n"}, "context"),
+        _match("/p/a.txt", 2, f"needle{char}here\n"),
+        _event({"text": f"/p/b{char}c.txt"}, 1, {"text": "needle\n"}),
+        raw_unicode=True,
+    )
+    context, match, other = ripgrep_search("needle", root="/p", glob=None, before=1)
+    assert (context.is_context, context.line_no, context.line) == (True, 1, f"before{char}context")
+    assert (match.is_context, match.line_no, match.line) == (False, 2, f"needle{char}here")
+    assert (other.path, other.line) == (f"/p/b{char}c.txt", "needle")
+
+
+@pytest.mark.skipif(not ripgrep_available(), reason="ripgrep not on PATH")
+@pytest.mark.parametrize("char", BREAKS_STR_SPLITLINES_ONLY)
+def test_ripgrep_itself_reports_lines_and_names_with_such_a_character_in_them(tmp_path, char):
+    (tmp_path / "a.txt").write_text(
+        f"before{char}context\nneedle{char}here\nafter{char}context\n", encoding="utf-8"
+    )
+    (tmp_path / f"b{char}c.txt").write_text("needle\n", encoding="utf-8")
+    found = ripgrep_search("needle", root=str(tmp_path), glob=None, before=1, after=1)
+    by_name: dict[str, list[tuple[int, str, bool]]] = {}
+    for m in found:
+        by_name.setdefault(Path(m.path).name, []).append((m.line_no, m.line, m.is_context))
+    assert by_name == {
+        "a.txt": [
+            (1, f"before{char}context", True),
+            (2, f"needle{char}here", False),
+            (3, f"after{char}context", True),
+        ],
+        f"b{char}c.txt": [(1, "needle", False)],
+    }

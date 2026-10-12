@@ -234,7 +234,13 @@ def ripgrep_search(
     if completed.returncode not in (0, 1):
         raise RuntimeError(completed.stderr.strip() or "ripgrep failed")
     matches: list[Match] = []
-    for line in completed.stdout.splitlines():
+    # One event to a line, and only a newline ends one: ``str.splitlines`` also breaks at U+2028,
+    # U+2029 and U+0085, which a JSON string may hold as they are and which ripgrep writes
+    # unescaped, so a matched line, a context line or a file name with one of them in it was
+    # cut in two and the call died in ``json.loads``.
+    for line in completed.stdout.split("\n"):
+        if not line:
+            continue  # after the last newline
         event = json.loads(line)
         event_type = event.get("type")
         if event_type not in ("match", "context"):
