@@ -280,11 +280,12 @@ def test_the_flag_with_the_long_name_turns_permission_prompts_off(
         ["--mode", "bypass"],
         ["--mode=bypass"],
         ["--mode", "bypass", "--mode", "bypass"],
-        # The flag beside it does not make it a mode: the one way is the flag, by itself.
-        ["--mode", "bypass", "--dangerously-skip-permissions"],
-        ["--mode=bypass", "--dangerously-skip-permissions"],
+        # Past a bare -- nothing is a flag, so this is not the flag beside it either.
+        ["--mode", "bypass", "--", "--dangerously-skip-permissions"],
+        # Only the exact spelling is the flag, and no other turns anything off.
+        ["--mode", "bypass", "--dangerously-skip"],
     ],
-    ids=["mode bypass", "mode=bypass", "twice", "mode and flag", "mode= and flag"],
+    ids=["mode bypass", "mode=bypass", "twice", "flag after --", "abbreviated flag"],
 )
 def test_mode_bypass_is_refused_with_the_flag_that_does_it_and_nothing_runs(
     ncc_home, project, serve, capsys, stores, flags
@@ -296,6 +297,34 @@ def test_mode_bypass_is_refused_with_the_flag_that_does_it_and_nothing_runs(
     assert err == (
         "error: bypass is turned on by --dangerously-skip-permissions, not by --mode "
         "— pass that flag\n"
+    )
+    assert not written(project)
+    assert clients["m"].requests == []
+    assert stores == []  # refused before anything was opened
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        # The flag beside it does not make it a mode: the one way is the flag, by itself. The
+        # person has passed the flag already, so what is left to do is to leave the mode out.
+        ["--mode", "bypass", "--dangerously-skip-permissions"],
+        ["--mode=bypass", "--dangerously-skip-permissions"],
+        ["--dangerously-skip-permissions", "--mode", "bypass"],
+        ["--dangerously-skip-permissions", "--mode=bypass"],
+    ],
+    ids=["mode and flag", "mode= and flag", "flag and mode", "flag and mode="],
+)
+def test_mode_bypass_beside_the_flag_is_told_to_leave_the_mode_out_and_nothing_runs(
+    ncc_home, project, serve, capsys, stores, flags
+):
+    clients = serve(m=[WRITE, says("done")])
+    code, out, err = run_ncc(capsys, "--root", str(project), *flags, "-p", "write it")
+    assert code == EXIT_CODES["usage"]
+    assert out == ""
+    assert err == (
+        "error: bypass is turned on by --dangerously-skip-permissions, not by --mode "
+        "— leave --mode bypass out\n"
     )
     assert not written(project)
     assert clients["m"].requests == []

@@ -163,13 +163,29 @@ def _long(flag: str) -> str:
     return flag.rpartition("/")[2]
 
 
-def _flag_error(message: str) -> str:
+def _typed_the_flag(typed: Sequence[str], flag: str) -> bool:
+    """Whether the arguments, as typed, hold ``flag``: the exact word, before any bare ``--``.
+
+    For an error worded from the one argument argparse stopped at, when what to do about it
+    depends on what else was typed. Nothing after a bare ``--`` is a flag, and only the exact
+    spelling counts: no other turns anything on.
+    """
+    for word in typed:
+        if word == "--":
+            return False
+        if word == flag:
+            return True
+    return False
+
+
+def _flag_error(message: str, typed: Sequence[str] = ()) -> str:
     """What argparse found wrong, as spec 17.9 words an error: what happened, a dash, what to do.
 
     argparse words these for itself and puts what was typed into them as it was. The line is
     printed through ``show_error``, which makes it one line without anything in it for a
     terminal to act on; this gives it the form. What is not one of the cases it knows is
-    still said, with where to look.
+    still said, with where to look. ``typed`` is what was typed, for the one case whose advice
+    depends on it.
     """
     if match := _EXPECTED_ONE.fullmatch(message):
         flag = _long(match["flag"])
@@ -189,9 +205,16 @@ def _flag_error(message: str) -> str:
                 "to give ncc a task, pass it with -p"
             )
         if flag == "--mode" and value == PermissionMode.BYPASS:
+            # The flag is passed already when it is beside the mode, and what is left is to
+            # leave the mode out; advice to pass it would send the person round in a circle.
+            advice = (
+                "leave --mode bypass out"
+                if _typed_the_flag(typed, "--dangerously-skip-permissions")
+                else "pass that flag"
+            )
             return (
                 f"{PermissionMode.BYPASS} is turned on by --dangerously-skip-permissions, "
-                "not by --mode \u2014 pass that flag"
+                f"not by --mode \u2014 {advice}"
             )
         what, choices = ("mode", _MODES) if flag == "--mode" else ("format", _OUTPUT_FORMATS)
         return f"{flag} {value} is not a {what} — choose one of {', '.join(choices)}"
@@ -209,12 +232,17 @@ class _Parser(argparse.ArgumentParser):
     stdout and exit 0.
     """
 
+    #: What was typed, for a mistake whose advice depends on what else was: argparse words it
+    #: from the one argument it stopped at, and stops at the first.
+    _typed: Sequence[str] = ()
+
     def error(self, message: str) -> NoReturn:
-        raise UsageError(_flag_error(message))
+        raise UsageError(_flag_error(message, self._typed))
 
     def parse_args(  # type: ignore[override]
         self, args: Sequence[str] | None = None, namespace: argparse.Namespace | None = None
     ) -> argparse.Namespace:
+        self._typed = sys.argv[1:] if args is None else args
         parsed, extra = self.parse_known_args(args, namespace)
         if extra:
             plural = "s" if len(extra) > 1 else ""
