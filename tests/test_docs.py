@@ -1406,7 +1406,7 @@ def test_ncc_never_changes_a_config_toml_that_is_there_and_ncc_init_makes_its_ow
     for document in (SECURITY, CONFIGURATION, ARCHITECTURE):
         private_files = next(c for c in _chunks(_text(document)) if "write-ahead" in c)
         said = " ".join(private_files.split())
-        assert "whoever wrote it" in said and "is never changed" in said, document.name
+        assert "whoever wrote it" in said and "is never narrowed" in said, document.name
         assert "narrows" not in said.split("config.toml")[-1].split(".")[0], document.name
 
 
@@ -1429,10 +1429,10 @@ def test_a_config_file_holds_no_key_because_the_loader_refuses_one(tmp_path):
     for document in (SECURITY, CONFIGURATION, ARCHITECTURE):
         assert "holds no key" in " ".join(_text(document).split()), document.name
     # A base_url is checked for its scheme and for nothing else, so a credential put in one is
-    # kept, and the two documents that say what a config.toml shows say so too.
+    # kept, and the three documents that say what a config.toml shows say so too.
     config.write_text(EXAMPLE_HOME + "\n" + entry + f'base_url = "https://user:{key}@host/v1"\n')
     load_config(home=str(home), project=None, env={})
-    for document in (SECURITY, CONFIGURATION):
+    for document in (SECURITY, CONFIGURATION, ARCHITECTURE):
         private_files = next(c for c in _chunks(_text(document)) if "write-ahead" in c)
         said = " ".join(private_files.split())
         assert "checked only for starting with `http://` or `https://`" in said, document.name
@@ -1676,7 +1676,7 @@ def test_the_layers_table_names_every_directory_and_file_of_the_suite():
     named = [
         f"tests/{entry.name}"
         for entry in sorted((ROOT / "tests").iterdir())
-        if entry.name not in helpers
+        if entry.name not in helpers and not entry.name.startswith(".")
     ]
     assert len(named) >= 15, f"found only {named}, so the listing of the suite is wrong"
     missing = [entry for entry in named if entry not in layers]

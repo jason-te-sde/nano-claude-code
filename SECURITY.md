@@ -169,7 +169,7 @@ your shell profile is as safe as that file.
 - **Files `ncc` keeps private.** `ncc` creates the `.nanoclaude` directory, `sessions.db` and
   its write-ahead files, the history and the capability cache readable by you alone, and
   narrows them if an earlier version left them open. `ncc init` creates the `config.toml` it
-  writes private too. An existing `config.toml`, whoever wrote it, is never changed. It holds
+  writes private too. An existing `config.toml`, whoever wrote it, is never narrowed. It holds
   no key (a model entry names the environment variable that holds its key, and an `api_key` in
   a file is refused), so one left open to other users shows them your settings and no key. A
   `base_url` is checked only for starting with `http://` or `https://`, so a credential put
