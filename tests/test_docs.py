@@ -854,6 +854,19 @@ def test_the_reference_lists_the_checks_in_the_order_of_the_architecture_table()
     )
 
 
+def test_the_documents_count_the_hard_denials_as_the_checks_before_bypass():
+    section = _section(_text(CONFIGURATION), "Permissions")
+    numbered = re.findall(r"^(\d+)\. `([a-z]+\.[a-z-]+)`", section, re.MULTILINE)
+    position = next(int(number) for number, rule in numbered if rule == "mode.bypass")
+    words = {6: "six", 7: "seventh"}
+    assert position == 7, (
+        f"mode.bypass is check {position} of the reference's list, not the seventh"
+    )
+    assert f"The first {words[position - 1]} are the hard denials" in _text(CONFIGURATION)
+    note = _text(DESIGN / "0015-bypass-does-not-disable-the-sandbox.md")
+    assert f"Bypass is the {words[position]}, and the {words[position - 1]} before it" in note
+
+
 def _decide(policy: Policy, tool: str, relative: str, *, write: bool) -> PermissionResult:
     path = f"{policy.sandbox.roots[0]}/{relative}"
     return evaluate(PermissionRequest(tool, path, (path,), is_write=write), policy)
