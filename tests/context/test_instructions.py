@@ -1,5 +1,6 @@
 import hashlib
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,155 @@ def test_a_directory_without_instructions_contributes_nothing(tmp_repo):
     (nested / "NANO.md").write_text("leaf rule\n")
     loaded = load(tmp_repo, cwd=nested)
     assert loaded.index("root rule") < loaded.index("leaf rule")
+
+
+# --------------------------------------------------------------------------
+# Instructions layer from the repository's top level down to the project root (spec 7.1)
+# --------------------------------------------------------------------------
+
+
+def init_repository(path: Path) -> Path:
+    """A real repository at ``path``: the placeholder ``.git`` of ``tmp_repo`` is not one."""
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)  # noqa: S607
+    return path
+
+
+def write(directory: Path, text: str, name: str = "NANO.md") -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_text(text)
+
+
+def test_a_root_inside_a_repository_reads_every_directory_from_the_top_down(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "packages" / "app"
+    write(top, "top rule\n")
+    write(top / "packages", "packages rule\n")
+    write(app, "app rule\n")
+    loaded = load(app)
+    assert loaded.index("top rule") < loaded.index("packages rule") < loaded.index("app rule")
+
+
+def test_the_global_file_comes_first_and_the_directories_follow_it(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    write(tmp_path / "home" / ".nanoclaude", "global rule\n")
+    loaded = load(app, home=tmp_path / "home")
+    assert loaded.index("global rule") < loaded.index("top rule") < loaded.index("app rule")
+
+
+def test_the_chain_stops_at_the_top_of_the_repository(tmp_path):
+    write(tmp_path, "above the repository\n")
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    loaded = load(app)
+    assert "top rule" in loaded and "above the repository" not in loaded
+
+
+def test_outside_a_repository_only_the_root_is_read(tmp_path):
+    write(tmp_path, "the parent's rule\n")
+    root = tmp_path / "plain"
+    write(root, "root rule\n")
+    loaded = load(root)
+    assert "root rule" in loaded and "the parent's rule" not in loaded
+
+
+def test_a_root_that_is_the_top_is_read_once(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    write(top, "top rule\n")
+    loaded = load(top)
+    assert loaded.count("top rule") == 1
+
+
+def test_a_directory_in_the_chain_with_nothing_in_it_contributes_nothing(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "packages" / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    loaded = load(app)
+    assert (
+        loaded.count("<!--") == 2
+    )  # a header each for the two files there are, none for packages/
+
+
+def test_each_directory_in_the_chain_may_keep_its_instructions_under_either_name(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top is a CLAUDE.md\n", name="CLAUDE.md")
+    write(app, "app is a NANO.md\n")
+    write(app, "and its CLAUDE.md is ignored\n", name="CLAUDE.md")
+    loaded = load(app)
+    assert "top is a CLAUDE.md" in loaded and "app is a NANO.md" in loaded
+    assert "its CLAUDE.md is ignored" not in loaded
+
+
+def test_a_root_reached_through_a_symlink_is_placed_in_the_repository_it_leads_to(tmp_path):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    link = tmp_path / "link"
+    link.symlink_to(app)
+    loaded = load(link)
+    assert loaded.index("top rule") < loaded.index("app rule")
+
+
+def test_the_top_is_found_through_the_one_safe_way_of_running_git(tmp_path, monkeypatch):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+    asked: list[tuple[str, ...]] = []
+
+    def fail(root: str, *args: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        asked.append((root, *args))
+        raise OSError("no git here")
+
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", fail)
+    loaded = load(app)
+    assert asked == [(str(app.resolve()), "rev-parse", "--show-toplevel")]
+    assert "app rule" in loaded and "top rule" not in loaded
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("git is not installed"), subprocess.TimeoutExpired("git", 5.0)],
+    ids=["no git", "timeout"],
+)
+def test_when_git_cannot_answer_only_the_root_is_read_and_nothing_is_raised(
+    tmp_path, monkeypatch, failure
+):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+
+    def cannot(*_args: object, **_kwargs: object) -> None:
+        raise failure
+
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", cannot)
+    loaded = load(app)
+    assert "app rule" in loaded and "top rule" not in loaded
+
+
+def test_an_answer_from_a_git_that_failed_is_not_trusted_for_the_path_it_printed(
+    tmp_path, monkeypatch
+):
+    top = init_repository(tmp_path / "repo")
+    app = top / "app"
+    write(top, "top rule\n")
+    write(app, "app rule\n")
+
+    def failed_but_printed(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 128, stdout=f"{top}\n", stderr="fatal: oops")
+
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", failed_but_printed)
+    loaded = load(app)
+    assert "app rule" in loaded and "top rule" not in loaded
 
 
 # ---- the real path of an instruction file is inside the boundary it belongs to
@@ -522,3 +672,264 @@ def test_a_file_that_is_cut_where_it_is_read_says_so_even_when_what_is_left_is_s
     loaded = load(tmp_repo)
     assert "[truncated at 32000 bytes]" in loaded
     assert TOKEN[:6] not in loaded
+
+
+# ---- the directories above the root are held to what every other instruction file is
+#
+# They are read from the top of the repository down to the root, and they are above the sandbox
+# by design. Each test below is a way a file there could get past a check the root's own file
+# is held to: one recognizer and one reader serve every directory, and the refusal is asked
+# without the rows that say where a file is, because where it is is the boundary's question.
+
+
+def above_the_root(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A repository, and a project root two levels down in it: the repository's top level, the
+    directory between, and the root. The sandbox ``load`` puts around the root holds neither of
+    the first two."""
+    top = init_repository(tmp_path / "repo")
+    app = top / "packages" / "app"
+    app.mkdir(parents=True)
+    return top, top / "packages", app
+
+
+#: What fills each file above the root, as ``FILLERS`` does for the others: a character that
+#: no path of a test directory has, so that what of a file reached the output can be counted.
+ABOVE_FILLERS = {"top": "#", "middle": "@"}
+
+
+def a_cut_message(path: Path) -> str:
+    return f"[{os.path.realpath(path)} not loaded: instructions are capped at 64000 bytes in total]"
+
+
+# -- contained: the boundary of these files is the top of the repository, not the root
+
+
+@pytest.mark.parametrize("level", ["top", "middle"])
+def test_a_file_above_the_root_that_is_a_link_out_of_the_repository_is_not_loaded(
+    tmp_path, tmp_path_factory, level
+):
+    top, middle, app = above_the_root(tmp_path)
+    outside = tmp_path_factory.mktemp("outside")
+    (outside / "private.txt").write_text("outside secret: orange\n")
+    link({"top": top, "middle": middle}[level] / "NANO.md", outside / "private.txt")
+    write(app, "app rule\n")
+    loaded = load(app)
+    assert "app rule" in loaded and "orange" not in loaded
+
+
+def test_a_file_above_the_root_may_be_a_link_to_a_file_elsewhere_in_the_repository(tmp_path):
+    top, _, app = above_the_root(tmp_path)
+    write(top / "docs", "shared rule\n", name="rules.md")
+    link(top / "NANO.md", top / "docs" / "rules.md")
+    assert "shared rule" in load(app)
+
+
+def test_the_next_name_is_not_tried_in_place_of_a_link_above_the_root_that_leads_out(
+    tmp_path, tmp_path_factory
+):
+    top, _, app = above_the_root(tmp_path)
+    outside = tmp_path_factory.mktemp("outside")
+    (outside / "private.txt").write_text("outside secret: orange\n")
+    link(top / "NANO.md", outside / "private.txt")
+    write(top, "claude rule\n", name="CLAUDE.md")
+    write(app, "app rule\n")
+    loaded = load(app)
+    assert "app rule" in loaded and "orange" not in loaded and "claude rule" not in loaded
+
+
+def test_a_dangling_link_above_the_root_does_not_let_the_next_name_in(tmp_path):
+    top, _, app = above_the_root(tmp_path)
+    link(top / "NANO.md", top / "missing.md")
+    write(top, "claude rule\n", name="CLAUDE.md")
+    write(app, "app rule\n")
+    loaded = load(app)
+    assert "app rule" in loaded and "claude rule" not in loaded
+
+
+def test_a_link_above_the_root_to_a_pipe_is_not_opened(tmp_path):
+    top, _, app = above_the_root(tmp_path)
+    pipe = make_fifo(top / "pipe")
+    link(top / "NANO.md", pipe)
+    write(app, "app rule\n")
+    assert "app rule" in call_without_blocking(pipe, load, app)
+
+
+# -- refused like a read: a credentials path, or a Read deny rule, whatever the sandbox holds
+
+
+@pytest.mark.parametrize("level", ["top", "middle"])
+def test_a_file_above_the_root_that_is_a_link_to_a_credentials_file_is_not_loaded(tmp_path, level):
+    top, middle, app = above_the_root(tmp_path)
+    (top / ".env").write_text("PGPASSWORD=orange\n")
+    link({"top": top, "middle": middle}[level] / "NANO.md", top / ".env")
+    write(app, "app rule\n")
+    loaded = load(app)
+    assert "app rule" in loaded and "orange" not in loaded
+
+
+def test_a_read_deny_rule_naming_a_file_above_the_root_keeps_it_out(tmp_path):
+    top, middle, app = above_the_root(tmp_path)
+    write(top, "top rule: orange\n")
+    write(middle, "packages rule\n")
+    write(app, "app rule\n")
+    loaded = load(app, deny=[f"Read({top.resolve() / 'NANO.md'})"])
+    assert "packages rule" in loaded and "app rule" in loaded and "orange" not in loaded
+
+
+def test_a_read_deny_rule_with_a_glob_keeps_out_only_the_directories_it_covers(tmp_path):
+    top, middle, app = above_the_root(tmp_path)
+    write(top, "top rule\n")
+    write(middle, "packages rule: orange\n")
+    write(app, "app rule\n")
+    loaded = load(app, deny=["Read(**/packages/NANO.md)"])
+    assert "top rule" in loaded and "app rule" in loaded and "orange" not in loaded
+
+
+def test_a_deny_rule_is_judged_by_where_a_link_above_the_root_leads_as_well_as_by_its_name(
+    tmp_path,
+):
+    top, _, app = above_the_root(tmp_path)
+    write(top / "restricted", "restricted rule: orange\n", name="rules.md")
+    link(top / "NANO.md", top / "restricted" / "rules.md")
+    write(app, "app rule\n")
+    loaded = load(app, deny=["Read(**/restricted/**)"])
+    assert "app rule" in loaded and "orange" not in loaded
+
+
+def test_a_deny_rule_that_does_not_cover_a_file_above_the_root_leaves_it_loaded(tmp_path):
+    top, middle, app = above_the_root(tmp_path)
+    write(top, "top rule\n")
+    write(middle, "packages rule\n")
+    loaded = load(app, deny=["Read(service/**)", "Read(**/vault.txt)", "Write(**/NANO.md)"])
+    assert "top rule" in loaded and "packages rule" in loaded
+
+
+def test_the_global_file_is_judged_like_any_other_when_the_sandbox_holds_it(tmp_repo):
+    """A root that is the person's home holds ``.nanoclaude`` too, and then the global file is
+    a file of the project like the rest: the sandbox has no say over a file only when the file
+    is outside it."""
+    write(tmp_repo / ".nanoclaude", "global rule: orange\n")
+    write(tmp_repo, "root rule\n")
+    loaded = load(tmp_repo, home=tmp_repo, deny=["Read(.nanoclaude/**)"])
+    assert "root rule" in loaded and "orange" not in loaded
+
+
+def test_a_file_above_the_root_that_is_a_link_into_the_root_is_loaded(tmp_path):
+    """Where the file is the sandbox's question and not this one: the link is outside the
+    sandbox and what it leads to is inside it, and neither is a reason to refuse it."""
+    top, _, app = above_the_root(tmp_path)
+    write(app / "docs", "shared rule\n", name="rules.md")
+    link(top / "NANO.md", app / "docs" / "rules.md")
+    assert "shared rule" in load(app)
+
+
+# -- scrubbed
+
+
+def test_a_credential_in_a_file_above_the_root_does_not_reach_the_prompt(tmp_path):
+    top, middle, app = above_the_root(tmp_path)
+    write(top, f"Deploy with {TOKEN} from CI.\n")
+    write(middle, f"packages {TOKEN}\n")
+    write(app, "app rule\n")
+    loaded = load(app)
+    assert TOKEN not in loaded
+    assert loaded.count("[redacted:github-token]") == 2 and "Deploy with" in loaded
+
+
+def test_a_file_above_the_root_is_scrubbed_by_the_redactor_the_session_gave(tmp_path):
+    top, _, app = above_the_root(tmp_path)
+    write(top, f"Deploy with {TOKEN}.\n")
+    assert TOKEN in load(app, redactor=Redactor(enabled=False))
+
+
+# -- capped as a chain, under the assignment the other files have
+
+
+def test_files_above_the_root_count_toward_the_total_and_the_one_nearest_the_root_comes_first(
+    tmp_path, tmp_path_factory
+):
+    top, middle, app = above_the_root(tmp_path)
+    home = tmp_path_factory.mktemp("home")
+    write(home / ".nanoclaude", FILLERS["global"] * 10_000)
+    write(top, ABOVE_FILLERS["top"] * 30_000)
+    write(middle, ABOVE_FILLERS["middle"] * 30_000)
+    write(app, FILLERS["root"] * 20_000)
+    loaded = load(app, home=home)
+    # 64,000 less the global file's 10,000 and the root's 20,000 is 34,000: all of the 30,000
+    # of the directory next to the root, and what is left of it for the top level, which is the
+    # farthest above the root and so the first to be cut.
+    assert loaded.count(FILLERS["global"]) == 10_000
+    assert loaded.count(FILLERS["root"]) == 20_000
+    assert loaded.count(ABOVE_FILLERS["middle"]) == 30_000
+    assert loaded.count(ABOVE_FILLERS["top"]) == 4_000
+    assert "[truncated at 4000 bytes]" in loaded
+    # Only the order the total is shared in is by distance. The top level, served last, is
+    # still printed first, where it stands.
+    printed = [
+        loaded.index(char)
+        for char in (
+            FILLERS["global"],
+            ABOVE_FILLERS["top"],
+            ABOVE_FILLERS["middle"],
+            FILLERS["root"],
+        )
+    ]
+    assert printed == sorted(printed)
+
+
+def test_at_one_distance_from_the_root_the_directory_above_is_served_before_the_one_below(
+    tmp_path, tmp_path_factory
+):
+    _, middle, app = above_the_root(tmp_path)
+    service = app / "service"
+    home = tmp_path_factory.mktemp("home")
+    write(home / ".nanoclaude", FILLERS["global"] * 20_000)
+    write(app, FILLERS["root"] * 20_000)
+    write(middle, ABOVE_FILLERS["middle"] * 20_000)
+    write(service, FILLERS["a"] * 20_000)
+    loaded = load(app, cwd=service, home=home)
+    # 64,000 less 20,000 and 20,000 is 24,000. The directory above the root and the one below it
+    # are one directory from it: the one above is served first, whole, and what is left is the
+    # one below's.
+    assert loaded.count(ABOVE_FILLERS["middle"]) == 20_000
+    assert loaded.count(FILLERS["a"]) == 4_000
+
+
+def test_a_directory_below_the_root_is_nearer_than_the_top_level_two_above_it(
+    tmp_path, tmp_path_factory
+):
+    top, _, app = above_the_root(tmp_path)
+    service = app / "service"
+    home = tmp_path_factory.mktemp("home")
+    write(home / ".nanoclaude", FILLERS["global"] * 10_000)
+    write(app, FILLERS["root"] * 20_000)
+    write(top, ABOVE_FILLERS["top"] * 30_000)
+    write(service, FILLERS["a"] * 30_000)
+    loaded = load(app, cwd=service, home=home)
+    assert loaded.count(FILLERS["a"]) == 30_000
+    assert loaded.count(ABOVE_FILLERS["top"]) == 4_000
+
+
+def test_the_global_and_root_files_are_loaded_whole_however_large_the_files_above_the_root_are(
+    tmp_path, tmp_path_factory
+):
+    top, middle, app = above_the_root(tmp_path)
+    home = tmp_path_factory.mktemp("home")
+    write(home / ".nanoclaude", FILLERS["global"] * 32_000)
+    write(top, ABOVE_FILLERS["top"] * 5_000)
+    write(middle, ABOVE_FILLERS["middle"] * 5_000)
+    write(app, FILLERS["root"] * 32_000)
+    loaded = load(app, home=home)
+    assert loaded.count(FILLERS["global"]) == 32_000 and loaded.count(FILLERS["root"]) == 32_000
+    assert loaded.count(ABOVE_FILLERS["top"]) == 0 and loaded.count(ABOVE_FILLERS["middle"]) == 0
+
+
+def test_a_file_above_the_root_that_gets_nothing_is_named_in_one_line(tmp_path, tmp_path_factory):
+    top, middle, app = above_the_root(tmp_path)
+    home = tmp_path_factory.mktemp("home")
+    write(home / ".nanoclaude", FILLERS["global"] * 32_000)
+    write(top, ABOVE_FILLERS["top"] * 5_000)
+    write(middle, ABOVE_FILLERS["middle"] * 5_000)
+    write(app, FILLERS["root"] * 32_000)
+    notes = [line for line in load(app, home=home).splitlines() if "not loaded" in line]
+    assert notes == [a_cut_message(top / "NANO.md"), a_cut_message(middle / "NANO.md")]

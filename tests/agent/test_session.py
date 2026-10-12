@@ -23,18 +23,21 @@ import hashlib
 import itertools
 import json
 import re
+import subprocess
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 
 from nanoclaude.agent.loop import StopReason
+from nanoclaude.agent.router import Router
 from nanoclaude.agent.session import Session, new_session_id
 from nanoclaude.agent.ui import Approval, AutoApprove, AutoDecline
-from nanoclaude.config.schema import LimitsConfig, ModelConfig, RolesConfig
+from nanoclaude.config.schema import Config, LimitsConfig, ModelConfig, RolesConfig
+from nanoclaude.context.git import run_git
 from nanoclaude.conversation.budget import (
     Budget,
     ContextTooSmallError,
@@ -54,9 +57,18 @@ from nanoclaude.conversation.transcript import (
     user_text,
     validate,
 )
+from nanoclaude.permissions.policy import PermissionRequest
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.prompts import SYSTEM_PROMPT
-from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, StopKind, Usage
+from nanoclaude.providers.base import (
+    CredentialsError,
+    ModelError,
+    ModelReply,
+    ModelRequest,
+    StopKind,
+    ToolSpec,
+    Usage,
+)
 from nanoclaude.providers.capabilities import (
     CONSERVATIVE_DEFAULT,
     Capabilities,
@@ -67,6 +79,7 @@ from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.testing.scripted import calls, calls_many, cut_off, says
 from nanoclaude.testing.session import ScriptedClient, ScriptedSession, build_session
 from nanoclaude.tools.base import ToolContext, ToolOutcome
+from nanoclaude.tools.registry import ToolRegistry, default_registry
 
 #: A model id neither the capability table nor the price book has heard of. Its
 #: cost is unknown, and it gets the conservative capabilities unless a test gives
@@ -106,8 +119,17 @@ def _no_git(monkeypatch: pytest.MonkeyPatch) -> None:
     Which branch the repository is on has no bearing on anything tested here, and
     a temp directory that happened to sit inside another repository would change
     the system prompt from machine to machine. assemble() has its own tests.
+
+    The same goes for the question of which repository the project is in, which decides
+    whose instructions are read (spec 7.1): here it is none, and the tests that want one
+    ask for the ``repository`` fixture.
     """
     monkeypatch.setattr("nanoclaude.context.assemble.git_state", lambda _root: "")
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", _git_is_not_asked)
+
+
+def _git_is_not_asked(*_args: object, **_kwargs: object) -> NoReturn:
+    raise OSError("git is not run by these tests")
 
 
 class Watcher(AutoApprove):
@@ -960,7 +982,7 @@ async def test_the_context_is_assembled_once_for_each_request_and_shared_with_th
 
 async def test_a_window_smaller_than_the_fixed_prompt_cannot_be_compacted_and_says_so(tmp_repo):
     session = build_session(tmp_repo, [says("never asked")], context_window=2_000)
-    with pytest.raises(ContextTooSmallError, match="Compacting cannot help"):
+    with pytest.raises(ContextTooSmallError, match="compacting cannot help"):
         await session.run("hello")
     assert session.model.requests == []  # refused before anything was sent
 
@@ -3663,3 +3685,116 @@ async def test_a_client_that_cannot_be_made_leaves_no_request_open(tmp_repo, mon
         await session.run("hello")
     assert stage.events == []
     assert stage.open == 0
+
+
+# --------------------------------------------------------------------------
+# What the prompt says about running commands follows the tools the session has
+# --------------------------------------------------------------------------
+
+
+class _Shell:
+    """A tool named Bash, for a registry that has one. It runs nothing."""
+
+    name = "Bash"
+    read_only = False
+
+    def spec(self) -> ToolSpec:
+        return ToolSpec("Bash", "Run a command.", {"type": "object", "properties": {}})
+
+    def permission_request(
+        self,
+        ctx: ToolContext,  # noqa: ARG002 - the protocol's signature
+        arguments: Mapping[str, Any],  # noqa: ARG002 - the protocol's signature
+    ) -> PermissionRequest:
+        return PermissionRequest("Bash", "true")
+
+    async def run(
+        self,
+        ctx: ToolContext,  # noqa: ARG002 - the protocol's signature
+        call_id: str,
+        arguments: Mapping[str, Any],  # noqa: ARG002 - the protocol's signature
+    ) -> ToolOutcome:
+        return ToolOutcome(call_id, "")
+
+
+async def test_a_session_without_a_tool_that_runs_commands_is_not_told_to_run_tests(tmp_repo):
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert "After changing code, run the project's tests" not in system
+    assert "cannot run commands" in system
+
+
+async def test_a_session_whose_registry_has_bash_is_told_to_run_tests(tmp_repo):
+    session = build_session(tmp_repo, [says("ok")])
+    session.registry = ToolRegistry([*default_registry(), _Shell()])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert "After changing code, run the project's tests" in system
+    assert "cannot run commands" not in system
+
+
+# --------------------------------------------------------------------------
+# A role whose model has no key stops the session at the start
+# --------------------------------------------------------------------------
+
+
+def test_a_session_whose_compact_model_has_no_key_is_refused_before_anything_is_stored(tmp_repo):
+    built = build_session(tmp_repo, [says("never asked")])
+    models = {
+        "m": ModelConfig("anthropic", "claude-sonnet-5"),
+        "cheap": ModelConfig("anthropic", "claude-haiku-4-5", api_key_env="CHEAP_KEY"),
+    }
+    config = Config(
+        models=models,
+        roles=RolesConfig("m", "m", "m", "m", "cheap", "m"),
+        env={"ANTHROPIC_API_KEY": "k"},
+    )
+    router = Router(config, built.router.cache)
+    store = Store(tmp_repo / "sessions.db")
+    store.open()
+    with pytest.raises(CredentialsError) as caught:
+        Session(
+            root=str(tmp_repo),
+            config=config,
+            router=router,
+            registry=built.registry,
+            policy=built.policy,
+            store=store,
+            session_id="abc123",
+        )
+    assert str(caught.value) == (
+        "role 'compact' uses model 'cheap', which needs CHEAP_KEY — set it, or run: ncc init"
+    )
+    # Refused first: a session that never started leaves no row behind to resume.
+    assert store.session_row("abc123") is None
+
+
+# --------------------------------------------------------------------------
+# The instructions a session sends are the repository's, from its top level down to the root
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def repository(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A real git repository, and git asked about it for real again.
+
+    The placeholder ``.git`` of ``tmp_repo`` is not one, and the autouse fixture above has
+    stopped the session asking.
+    """
+    monkeypatch.setattr("nanoclaude.context.instructions.run_git", run_git)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)  # noqa: S607
+    return tmp_path
+
+
+async def test_a_session_whose_root_is_inside_a_repository_sends_the_repositorys_instructions(
+    repository,
+):
+    (repository / "NANO.md").write_text("Rule from the top of the repository.\n")
+    app = repository / "app"
+    app.mkdir()
+    (app / "NANO.md").write_text("Rule from the project.\n")
+    session = build_session(app, [says("ok")])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert system.index("Rule from the top") < system.index("Rule from the project")

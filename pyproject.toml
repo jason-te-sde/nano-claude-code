@@ -14,8 +14,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-shell = ["tree-sitter>=0.22", "tree-sitter-bash>=0.21"]
-openai = ["tiktoken>=0.7"]
+# Only extras whose packages the source imports are declared (tests/test_packaging.py checks
+# it). A `shell` extra for tree-sitter comes back with the syntax-tree command classifier.
 dev = [
   "pytest>=8.2", "pytest-asyncio>=0.23", "pytest-cov>=5.0",
   "hypothesis>=6.100", "mypy>=1.10", "ruff>=0.5",

@@ -25,7 +25,7 @@ from nanoclaude.cli.main import EXIT_CODES
 from nanoclaude.conversation.store import Store
 from nanoclaude.providers.base import ModelReply, StopKind, Usage
 from nanoclaude.testing.session import ScriptedClient
-from tests.cli.helpers import INTERRUPTED, run_ncc
+from tests.cli.helpers import INTERRUPTED, assert_failed_run_stdout, run_ncc
 
 FORMATS = [[], ["--output-format", "json"]]
 
@@ -71,7 +71,7 @@ def test_an_exception_nobody_mapped_is_one_line_and_exit_one(
     client = explode_with(monkeypatch, RuntimeError("boom"))
     code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello", *fmt)
     assert code == EXIT_CODES["stopped"]
-    assert out == ""
+    assert_failed_run_stdout(fmt, out, err, code)
     assert err == UNEXPECTED.format(what="RuntimeError: boom")
     # The session was closed on the way out, as for any other end.
     assert client.closed and closed(stores[0])
@@ -119,7 +119,8 @@ def test_a_store_that_fails_part_way_is_reported_in_the_same_way(
     code, out, err = run_ncc(
         capsys, "--root", str(project), "-p", "hello", "--output-format", "json"
     )
-    assert (code, out) == (EXIT_CODES["stopped"], "")
+    assert code == EXIT_CODES["stopped"]
+    assert_failed_run_stdout(["json"], out, err, code)
     assert err == UNEXPECTED.format(what="OperationalError: disk I/O error")
 
 
@@ -166,8 +167,9 @@ def test_a_page_where_a_reply_stream_should_be_is_a_provider_error_and_not_a_bug
 
 
 def test_the_exceptions_that_are_mapped_are_not_swallowed_by_the_general_one(
-    ncc_home, project, capsys
+    ncc_home, project, serve, capsys
 ):
+    serve(m=[])
     # The general clause is last. If it came first, each of these would be exit 1.
     assert run_ncc(capsys, "--root", str(project), "--model", "ghost", "-p", "hi")[0] == 3
     assert run_ncc(capsys, "--root", str(project), "--resume", "nope", "-p", "hi")[0] == 2
@@ -185,7 +187,9 @@ def test_an_interrupt_is_still_130_and_not_an_unexpected_error(
     assert (code, out, err) == (EXIT_CODES["interrupted"], "", INTERRUPTED)
 
 
-def test_the_repl_is_covered_too(ncc_home, project, capsys, monkeypatch):
+def test_the_repl_is_covered_too(ncc_home, project, serve, capsys, monkeypatch):
+    serve(m=[])
+
     async def explodes(*_args: object, **_kwargs: object) -> int:
         raise RuntimeError("the REPL broke")
 
@@ -229,7 +233,8 @@ def test_a_store_another_ncc_holds_a_lock_on_is_busy_and_not_a_bug(
     finally:
         other.rollback()
         other.close()
-    assert (code, out, err) == (EXIT_CODES["stopped"], "", BUSY)
+    assert (code, err) == (EXIT_CODES["stopped"], BUSY)
+    assert_failed_run_stdout(fmt, out, err, code)
     assert closed(stores[0])
 
 
@@ -323,7 +328,8 @@ def test_a_database_that_cannot_be_opened_names_the_path_too(ncc_home, project, 
     code, out, err = run_ncc(
         capsys, "--root", str(project), "-p", "hello", "--output-format", "json"
     )
-    assert (code, out) == (EXIT_CODES["stopped"], "")
+    assert code == EXIT_CODES["stopped"]
+    assert_failed_run_stdout(["json"], out, err, code)
     assert err == CANNOT_OPEN.format(path=database, detail="unable to open database file")
     assert closed(stores[0])  # the connection it did make is not left open
 

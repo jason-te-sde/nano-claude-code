@@ -14,12 +14,40 @@ from collections.abc import Hashable
 
 import pytest
 
+from nanoclaude.permissions.policy import (
+    Decision,
+    Grants,
+    PermissionMode,
+    PermissionRequest,
+    Policy,
+    evaluate,
+)
 from nanoclaude.permissions.redact import (
     ENTROPY_FLOOR,
     SECRET_PATH_PATTERNS,
     Redactor,
     shannon_entropy,
 )
+from nanoclaude.permissions.rules import RuleSet
+from nanoclaude.permissions.sandbox import Sandbox
+
+
+def refused_as_a_secret(path: str) -> bool:
+    """Whether the policy refuses a read of ``path`` for being a credentials path.
+
+    The question is put to the policy because it is what applies SECRET_PATH_PATTERNS to a
+    call: the table is only as right as what the policy makes of it.
+    """
+    absolute = f"/p/{path}"
+    policy = Policy(
+        sandbox=Sandbox(("/p",)),
+        rules=RuleSet.build(allow=["Read"]),
+        mode=PermissionMode.DEFAULT,
+        secret_paths=SECRET_PATH_PATTERNS,
+    )
+    result = evaluate(PermissionRequest("Read", absolute, (absolute,)), policy, Grants())
+    return result.decision is Decision.DENY and result.rule == "secret.path"
+
 
 AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 GITHUB_CLASSIC = "ghp_" + "A" * 36
@@ -112,19 +140,26 @@ def test_empty_text_is_returned_unchanged():
     ],
 )
 def test_secret_paths_are_recognised(path):
-    assert Redactor().is_secret_path(f"/p/{path}", path)
+    assert refused_as_a_secret(path)
 
 
 @pytest.mark.parametrize(
     "path", [".ENV", "svc/.Env.Local", "ID_RSA", ".SSH/known_hosts", "Key.PEM"]
 )
 def test_secret_paths_are_recognised_whatever_their_letter_case(path):
-    assert Redactor().is_secret_path(f"/p/{path}", path)
+    assert refused_as_a_secret(path)
 
 
 @pytest.mark.parametrize("path", ["src/environment.py", "docs/env.md", "keyboard.py"])
 def test_paths_that_merely_look_similar_are_not(path):
-    assert not Redactor().is_secret_path(f"/p/{path}", path)
+    assert not refused_as_a_secret(path)
+
+
+def test_what_a_secret_path_is_has_one_judge_and_it_is_the_policy():
+    # Redactor.is_secret_path answered the same question beside the policy's own, and after
+    # the policy took over matching the table nothing called it: two answers to one question
+    # drift apart, and the one nobody calls is the one nobody notices is wrong.
+    assert not hasattr(Redactor, "is_secret_path")
 
 
 def test_secret_path_patterns_is_a_tuple_and_includes_dotenv():
@@ -498,7 +533,7 @@ def test_a_public_key_block_and_a_certificate_are_left_alone():
     ],
 )
 def test_more_credentials_by_convention_are_secret_paths(path):
-    assert Redactor().is_secret_path(f"/p/{path}", path)
+    assert refused_as_a_secret(path)
 
 
 @pytest.mark.parametrize(
@@ -522,7 +557,7 @@ def test_more_credentials_by_convention_are_secret_paths(path):
     ],
 )
 def test_public_material_and_things_that_only_look_similar_stay_readable(path):
-    assert not Redactor().is_secret_path(f"/p/{path}", path)
+    assert not refused_as_a_secret(path)
 
 
 # ---- more credentials by path
@@ -551,7 +586,7 @@ def test_public_material_and_things_that_only_look_similar_stay_readable(path):
     ],
 )
 def test_the_credentials_paths_of_the_second_list_are_secret_paths(path):
-    assert Redactor().is_secret_path(f"/p/{path}", path)
+    assert refused_as_a_secret(path)
 
 
 @pytest.mark.parametrize(
@@ -574,7 +609,7 @@ def test_the_credentials_paths_of_the_second_list_are_secret_paths(path):
     ],
 )
 def test_names_that_only_look_like_the_second_list_stay_readable(path):
-    assert not Redactor().is_secret_path(f"/p/{path}", path)
+    assert not refused_as_a_secret(path)
 
 
 def test_every_path_pattern_the_second_list_names_is_in_the_list():

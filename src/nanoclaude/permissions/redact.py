@@ -53,8 +53,6 @@ import re
 from dataclasses import dataclass
 from itertools import pairwise
 
-from nanoclaude.permissions.rules import glob_matches_any
-
 SECRET_PATH_PATTERNS: tuple[str, ...] = (
     "**/.env",
     "**/.env.*",
@@ -311,9 +309,3 @@ class Redactor:
         if not self.enabled:
             return ()
         return tuple(match.span() for match in _PRIVATE_KEY.finditer(text))
-
-    def is_secret_path(self, absolute: str, relative: str) -> bool:
-        # The shared matcher rather than a pathspec of its own: it already tries
-        # each candidate with and without leading slashes, and it keeps the
-        # deprecated pathspec factory name in exactly one place.
-        return glob_matches_any(SECRET_PATH_PATTERNS, (relative, absolute), fold=True)

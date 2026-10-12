@@ -44,7 +44,8 @@ CONSERVATIVE_DEFAULT = Capabilities(
     max_output=2_048,
 )
 
-# Checked 2026-10-02 against each model's page on platform.claude.com: the
+# Checked 2026-10-02 against each model's page on platform.claude.com, and again on
+# 2026-10-07 for Fable 5.1, Opus 5.5, Sonnet 5.5 and Haiku 5.5 on the models overview: the
 # context window and the synchronous Messages API's max output.
 _CURRENT_CLAUDE = Capabilities(True, True, "explicit", 1_000_000, 128_000, "thinking", True)
 _HAIKU_4_5 = Capabilities(True, True, "explicit", 200_000, 64_000, "thinking", True)
@@ -55,7 +56,9 @@ _KNOWN: dict[tuple[str, str], Capabilities] = {
     ("anthropic", "claude-opus-5"): _CURRENT_CLAUDE,
     ("anthropic", "claude-sonnet-5-5"): _CURRENT_CLAUDE,
     ("anthropic", "claude-sonnet-5"): _CURRENT_CLAUDE,
-    # The alias and the dated id it points to.
+    # 1M window, 128K max output, adaptive thinking (models overview, 2026-10-07).
+    ("anthropic", "claude-haiku-5-5"): _CURRENT_CLAUDE,
+    # Legacy since 2026-10-07 but still served. The alias and the dated id it points to.
     ("anthropic", "claude-haiku-4-5"): _HAIKU_4_5,
     ("anthropic", "claude-haiku-4-5-20251001"): _HAIKU_4_5,
     # The model ncc init offers for OpenRouter. Checked 2026-10-07 against OpenRouter's public

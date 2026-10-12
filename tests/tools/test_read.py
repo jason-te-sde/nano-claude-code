@@ -109,6 +109,19 @@ def test_reading_a_fifo_is_an_error_result_and_does_not_wait_for_a_writer(ctx, t
     assert outcome.is_error and "pipe.fifo is not a regular file" in outcome.content
 
 
+async def test_a_file_too_large_to_read_is_sent_to_grep_and_grep_can_search_it(ctx, tmp_repo):
+    from nanoclaude.tools.grep import GrepTool
+
+    big = tmp_repo / "big.log"
+    big.write_text("filler\n" * 150_000 + "the needle\n")  # a little over the 1 MB limit
+    assert big.stat().st_size > 1_000_000
+    refused = await ReadTool().run(ctx, "t1", {"path": "big.log", "offset": 150_001, "limit": 1})
+    assert refused.is_error and "Grep" in refused.content and "Bash" not in refused.content
+    # The advice is only worth giving if it works.
+    found = await GrepTool().run(ctx, "t2", {"pattern": "needle", "output_mode": "content"})
+    assert not found.is_error and "the needle" in found.content
+
+
 # ---- a window of a file never shows part of a private key block
 
 

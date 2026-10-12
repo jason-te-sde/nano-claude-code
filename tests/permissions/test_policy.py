@@ -689,6 +689,55 @@ def test_the_read_verdict_is_the_one_read_itself_gets():
         assert (refusal is not None) == (direct.decision is Decision.DENY), path
 
 
+# ---- the read verdict without the rows that say where a file is
+#
+# For a file that is outside the sandbox by design (an instruction file in a directory above the
+# project root), where it is has been settled by the caller's own boundary, and the sandbox's
+# answer would be a refusal of every one of them. What the file is still decides.
+
+
+def test_a_path_outside_the_sandbox_is_not_refused_when_where_it_is_is_not_asked():
+    assert read_refusal(policy(), "/etc/passwd", check_location=False) is None
+
+
+def test_a_credentials_path_outside_the_sandbox_is_refused_when_where_it_is_is_not_asked():
+    refusal = read_refusal(policy(), "/elsewhere/.env", check_location=False)
+    assert refusal is not None and refusal.rule == "secret.path"
+
+
+def test_a_read_deny_rule_covers_a_path_outside_the_sandbox_when_where_it_is_is_not_asked():
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(**/vault.txt)"]))
+    refusal = read_refusal(p, "/elsewhere/vault.txt", check_location=False)
+    assert refusal is not None and refusal.rule == "rule.deny"
+
+
+def test_allow_secrets_lifts_the_credentials_refusal_when_where_a_path_is_is_not_asked():
+    assert read_refusal(policy(allow_secrets=True), "/elsewhere/.env", check_location=False) is None
+
+
+def test_the_first_spelling_that_is_refused_decides_when_where_it_is_is_not_asked():
+    p = policy()
+    assert read_refusal(p, "/x/notes.txt", "/x/.env", check_location=False) is not None
+    assert read_refusal(p, "/x/.env", "/x/notes.txt", check_location=False) is not None
+    assert read_refusal(p, "/x/notes.txt", "/x/real.txt", check_location=False) is None
+
+
+def test_without_the_location_the_verdict_is_what_evaluate_says_apart_from_the_sandbox_rows():
+    """The sandbox's row is the one thing the question leaves out, and every other reason to
+    refuse a Read is still one: the two cannot drift apart, because both ask the same rows."""
+    p = policy(rules=RuleSet.build(allow=["Read"], deny=["Read(secrets/**)"]))
+    for path in ("/p/secrets/notes.txt", "/p/.env", "/etc/passwd", "/elsewhere/.env", "/p/a.py"):
+        direct = evaluate(req(subject=path, paths=(path,)), p, Grants())
+        refusal = read_refusal(p, path, check_location=False)
+        by_what_it_is = direct.decision is Decision.DENY and direct.rule in {
+            "rule.deny",
+            "secret.path",
+        }
+        assert (refusal is not None) == by_what_it_is, path
+        if refusal is not None:
+            assert refusal.rule == direct.rule, path
+
+
 # ---- a refusal covers every spelling the filesystem treats as the same file
 
 # "e" with an acute accent, composed (NFC) and as "e" followed by a combining accent (NFD).

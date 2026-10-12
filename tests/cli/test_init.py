@@ -53,6 +53,7 @@ from nanoclaude.cli.main import EXIT_CODES, main, nanoclaude_home
 from nanoclaude.config.load import ConfigError, load_config
 from nanoclaude.config.schema import ROLES, Config, PermissionsConfig
 from nanoclaude.conversation.transcript import Transcript, user_text
+from nanoclaude.permissions.rules import KNOWN_TOOLS
 from nanoclaude.providers.base import ModelRequest
 from nanoclaude.providers.capabilities import (
     CONSERVATIVE_DEFAULT,
@@ -61,6 +62,7 @@ from nanoclaude.providers.capabilities import (
 )
 from nanoclaude.providers.openai_compat import OpenAICompatClient
 from nanoclaude.testing.scripted import says
+from nanoclaude.tools.registry import default_registry
 from tests.cli.helpers import INTERRUPTED, colour_codes, plain_console, run_ncc
 
 
@@ -226,6 +228,67 @@ def test_the_comment_above_the_roles_says_what_a_role_is_for():
     lines = render_config(PRESETS["anthropic"], "a", "m").splitlines()
     above = lines[: lines.index("[roles]")]
     assert any(line.startswith("#") and "explore" in line for line in above)
+
+
+def test_the_comment_above_the_roles_says_which_are_routed_and_promises_no_saving():
+    # Only main and compact are routed to a model of their own in this version; the rest wait
+    # for sub-agents (spec 13, v0.3). A file that calls pointing `explore` at a cheap model
+    # "the easiest saving available" invites somebody to change a line that changes nothing.
+    lines = render_config(PRESETS["anthropic"], "a", "m").splitlines()
+    above = " ".join(line.lstrip("# ") for line in lines[: lines.index("[roles]")]).lower()
+    assert "saving" not in above and "easiest" not in above
+    assert "main" in above and "compact" in above
+    assert "v0.3" in above and "sub-agent" in above
+
+
+def comment_above(lines: list[str], header: str) -> str:
+    """The comment that introduces the section ``header``, as one line of lower-case text."""
+    block: list[str] = []
+    for line in reversed(lines[: lines.index(header)]):
+        if not line.startswith("#"):
+            break
+        block.append(line.lstrip("# "))
+    return " ".join(reversed(block)).lower()
+
+
+def test_the_comment_above_the_limits_says_the_shell_timeout_is_reserved_for_a_tool_not_here():
+    # There is no shell tool in this version: bash_timeout_s is accepted and checked, and
+    # nothing uses it. A comment that says it is how long a shell command may run tells a
+    # person there is a shell to wait for, and a line to change that changes nothing.
+    lines = render_config(PRESETS["anthropic"], "a", "m").splitlines()
+    above = comment_above(lines, "[limits]")
+    assert "bash_timeout_s" in above and "reserved" in above
+    assert "shell tool" in above and "does not have" in above
+
+
+def test_the_generated_config_does_not_present_a_shell_tool_as_available():
+    """Every sentence of its comments that speaks of a shell says there is none in this version,
+    and at least one does: the setting for it is still in the file."""
+    rendered = render_config(PRESETS["anthropic"], "a", "m")
+    comments = " ".join(line.lstrip("# ") for line in rendered.splitlines() if line.startswith("#"))
+    sentences = [sentence.strip() for sentence in comments.lower().split(". ")]
+    about_a_shell = [
+        sentence for sentence in sentences if "shell" in sentence or "bash" in sentence
+    ]
+    assert about_a_shell
+    for sentence in about_a_shell:
+        assert "reserved" in sentence and "does not have" in sentence, sentence
+
+
+def test_the_permissions_part_says_that_the_tools_it_names_and_this_version_lacks_are_reserved():
+    # The ask list is the program's own default and names Bash and Git, which a rule may name
+    # so that one written today keeps working. Neither is a tool in this version, and a person
+    # who reads the list and nothing more would take them for tools they have. What is reserved
+    # is what rules accept and the registry lacks, so the day a tool arrives this fails until
+    # the comment is changed.
+    reserved = set(KNOWN_TOOLS) - {tool.name for tool in default_registry()}
+    lines = render_config(PRESETS["anthropic"], "a", "m").splitlines()
+    part = lines[lines.index("[permissions]") + 1 :]
+    part = part[: part.index("")]
+    comment = " ".join(line.lstrip("# ") for line in part if line.startswith("#"))
+    assert "reserved" in comment and "does not have" in comment, comment
+    assert all(f"`{name}`" in comment for name in reserved), (reserved, comment)
+    assert not any(f"`{name}`" in comment for name in set(KNOWN_TOOLS) - reserved), comment
 
 
 def test_the_rendered_config_names_the_variable_and_never_holds_a_key():
@@ -1553,11 +1616,15 @@ def test_init_takes_no_flag_that_shapes_a_session_and_does_not_ignore_one(
     reached = not_called(monkeypatch)
     code, out, err = run_ncc(capsys, *argv)
     assert code == EXIT_CODES["usage"]
-    assert out == ""
     assert err == (
         f"error: ncc init takes no {flag} \u2014 run it on its own "
         "(--no-color is the only flag that goes with it)\n"
     )
+    if flag == "--output-format":
+        # JSON was asked for, and with it that stdout is one object whatever happens.
+        assert json.loads(out)["exit_code"] == EXIT_CODES["usage"]
+    else:
+        assert out == ""
     assert reached == []
 
 
