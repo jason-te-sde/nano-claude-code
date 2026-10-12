@@ -239,6 +239,40 @@ def test_the_comment_above_the_roles_says_which_are_routed_and_promises_no_savin
     assert "v0.3" in above and "sub-agent" in above
 
 
+def comment_above(lines: list[str], header: str) -> str:
+    """The comment that introduces the section ``header``, as one line of lower-case text."""
+    block: list[str] = []
+    for line in reversed(lines[: lines.index(header)]):
+        if not line.startswith("#"):
+            break
+        block.append(line.lstrip("# "))
+    return " ".join(reversed(block)).lower()
+
+
+def test_the_comment_above_the_limits_says_the_shell_timeout_is_reserved_for_a_tool_not_here():
+    # There is no shell tool in this version: bash_timeout_s is accepted and checked, and
+    # nothing uses it. A comment that says it is how long a shell command may run tells a
+    # person there is a shell to wait for, and a line to change that changes nothing.
+    lines = render_config(PRESETS["anthropic"], "a", "m").splitlines()
+    above = comment_above(lines, "[limits]")
+    assert "bash_timeout_s" in above and "reserved" in above
+    assert "shell tool" in above and "does not have" in above
+
+
+def test_the_generated_config_does_not_present_a_shell_tool_as_available():
+    """Every sentence of its comments that speaks of a shell says there is none in this version,
+    and at least one does: the setting for it is still in the file."""
+    rendered = render_config(PRESETS["anthropic"], "a", "m")
+    comments = " ".join(line.lstrip("# ") for line in rendered.splitlines() if line.startswith("#"))
+    sentences = [sentence.strip() for sentence in comments.lower().split(". ")]
+    about_a_shell = [
+        sentence for sentence in sentences if "shell" in sentence or "bash" in sentence
+    ]
+    assert about_a_shell
+    for sentence in about_a_shell:
+        assert "reserved" in sentence and "does not have" in sentence, sentence
+
+
 def test_the_rendered_config_names_the_variable_and_never_holds_a_key():
     entry = tomllib.loads(render_config(PRESETS["anthropic"], "sonnet", "claude-sonnet-5"))[
         "models"
