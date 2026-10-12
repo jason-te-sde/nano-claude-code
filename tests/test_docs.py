@@ -1428,6 +1428,15 @@ def test_a_config_file_holds_no_key_because_the_loader_refuses_one(tmp_path):
         assert key not in str(refused.value), "the error repeats the key it refused"
     for document in (SECURITY, CONFIGURATION, ARCHITECTURE):
         assert "holds no key" in " ".join(_text(document).split()), document.name
+    # A base_url is checked for its scheme and for nothing else, so a credential put in one is
+    # kept, and the two documents that say what a config.toml shows say so too.
+    config.write_text(EXAMPLE_HOME + "\n" + entry + f'base_url = "https://user:{key}@host/v1"\n')
+    load_config(home=str(home), project=None, env={})
+    for document in (SECURITY, CONFIGURATION):
+        private_files = next(c for c in _chunks(_text(document)) if "write-ahead" in c)
+        said = " ".join(private_files.split())
+        assert "checked only for starting with `http://` or `https://`" in said, document.name
+        assert "no secret" not in said, document.name
 
 
 def _other_line_breaks() -> list[str]:
