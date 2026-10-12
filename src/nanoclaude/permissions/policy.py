@@ -12,6 +12,11 @@ write to any file git or ncc itself reads its behaviour from (see
 extended it, because the spec's sandbox rows answer where a path is and none of them
 answers what it is.
 
+The first two rows, which say what a file is (a deny rule, a credentials path) and not where it
+is, are one function, :func:`_refusal_of_the_file`, that :func:`evaluate` runs first. It is the
+only place they are written, so that :func:`read_refusal` can ask them alone for a file that is
+outside the sandbox by design, and answer for it exactly as :func:`evaluate` would.
+
 Nothing here touches the filesystem. Paths arriving in a
 :class:`PermissionRequest` are already resolved -- following a symlink after the
 permission check is how sandboxes get escaped.
@@ -238,7 +243,9 @@ def _unpromotable(danger: DangerVerdict | None) -> bool:
     return danger is not None and danger.level is DangerLevel.SAFE and not danger.authoritative
 
 
-def read_refusal(policy: Policy, *paths: str) -> PermissionResult | None:
+def read_refusal(
+    policy: Policy, *paths: str, check_location: bool = True
+) -> PermissionResult | None:
     """Why ``policy`` refuses to show the model this file, or None when it does not.
 
     The Read tool is one way a file's contents reach the model; Grep's matches, an ``@``
@@ -252,17 +259,31 @@ def read_refusal(policy: Policy, *paths: str) -> PermissionResult | None:
     A file reached through a link has more than one spelling -- the link's own, and what it
     resolves to -- and any of them being refused refuses the file: ``paths`` are all
     spellings of one file, and the first refusal is the one returned.
+
+    ``check_location=False`` leaves out the sandbox's row and asks the rest. It is for a file
+    that is outside the sandbox by design, whose place the caller has already settled by a
+    boundary of its own (the instruction files of the directories above the project root):
+    the sandbox's answer for it is always no, and says nothing about the file. What the file
+    is, a ``Read(...)`` deny rule or a credentials path, still decides, through the same rows
+    :func:`evaluate` runs.
     """
     for path in paths:
-        verdict = evaluate(PermissionRequest("Read", path, (path,)), policy)
-        if verdict.decision is Decision.DENY:
+        request = PermissionRequest("Read", path, (path,))
+        verdict = (
+            evaluate(request, policy) if check_location else _refusal_of_the_file(request, policy)
+        )
+        if verdict is not None and verdict.decision is Decision.DENY:
             return verdict
     return None
 
 
-def evaluate(
-    request: PermissionRequest, policy: Policy, grants: Grants = _NO_GRANTS
-) -> PermissionResult:
+def _refusal_of_the_file(request: PermissionRequest, policy: Policy) -> PermissionResult | None:
+    """Rows 1 and 2 of :func:`evaluate`: what the call's paths are, not where they are.
+
+    A ``Read(...)`` deny rule, then a credentials path. They are one question asked by
+    :func:`evaluate` first and by :func:`read_refusal` alone, so that a file the sandbox
+    does not cover is refused for the same reasons as one it does.
+    """
     subjects = (request.subject, policy.relative(request.subject))
 
     # 1. rule.deny
@@ -284,6 +305,18 @@ def evaluate(
                     # the path from secret_paths changes the outcome.
                     "Pass --allow-secrets to override.",
                 )
+    return None
+
+
+def evaluate(
+    request: PermissionRequest, policy: Policy, grants: Grants = _NO_GRANTS
+) -> PermissionResult:
+    subjects = (request.subject, policy.relative(request.subject))
+
+    # 1. rule.deny, 2. secret.path -- in that order, in _refusal_of_the_file
+    refused = _refusal_of_the_file(request, policy)
+    if refused is not None:
+        return refused
 
     # 3. sandbox.outside-root / sandbox.symlink-escape
     for path in request.resolved_paths:
