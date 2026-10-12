@@ -16,7 +16,7 @@ The second rule is the interesting one, and it does not look for words. The name
 
 The patterns themselves are one per line in `scripts/attribution-patterns.txt`, matched without regard to case. They are in their own file so that the one file that has to contain the needles is the only one the scan skips, and a shape added to the script itself would be found like anywhere else. The exact set is pinned by `tests/test_hygiene.py`, which splits each pattern across two source lines so that the test file does not match what it checks, and the script refuses to run with fewer than five (`test_attribution_patterns_file_has_the_five_expected_patterns`).
 
-It is on from the first commit because it cannot depend on being remembered. Tools that write commit messages add their own trailer by default, and the rule is therefore an act of deleting it and not of not writing it; one missed instance has to be undone by rewriting history. The history is scanned, so CI checks out every commit and not only the latest.
+It is on from the first commit because it cannot depend on being remembered: one missed instance has to be undone by rewriting history. The history is scanned, so CI checks out every commit and not only the latest.
 
 The first rule is a byte pattern, not a Unicode-aware one, on purpose. Stock macOS ships a `grep` without `-P`, and its `bash` 3.2 does not understand `\u` escapes in `$'...'` strings, and both fail by quietly doing the wrong thing. The script forces `LC_ALL=C` and matches the three-byte UTF-8 sequences of the block directly, so it behaves the same on a developer's laptop and on the CI runner (`test_repository_passes_hygiene`, `test_legitimate_claude_mentions_are_not_flagged`).
 

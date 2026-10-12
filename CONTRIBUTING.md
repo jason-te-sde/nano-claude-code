@@ -67,9 +67,10 @@ Rules that matter in practice:
 ## Documentation
 
 The documents make claims, and `tests/test_docs.py` checks the ones a test can: the commands,
-keys, defaults, exit codes, rule ids and tools a document names exist, every TOML example is
-loaded by the real configuration loader, every link resolves, and the figures in the README's
-numbers table are the ones `scripts/measure.py` produces.
+keys, defaults, exit codes, rule ids, flag choices, prices and tools a document names exist and are
+the code's, the credentials list is the policy's, every TOML example is loaded by the real
+configuration loader, every link resolves, and the figures in the README's numbers table are the
+ones `scripts/measure.py` produces.
 
 - When a number in the README goes stale the docs test says so. Run `python scripts/measure.py`
   and copy its output into the table. Never write a figure there that the script did not print.
@@ -77,8 +78,8 @@ numbers table are the ones `scripts/measure.py` produces.
   `docs/design/`, numbered next after the last, with exactly three sections: `## Why`,
   `## Costs` and `## Rejected alternatives`. The costs say where the code falls short of the
   idea. A change to a tool's description, which is a prompt, needs a note too.
-- A document that says a thing is not built is checked by a test that fails when it is built.
-  When one fails for that reason, the document is what to correct.
+- A document that says a thing is not built, or is a known limit, is checked by a test that fails
+  when it is built or closed. When one fails for that reason, the document is what to correct.
 - Every hosted model id in an example is checked against the provider's own list on the day it
   is written, and the date is said.
 - An example that shows `allow`, `base_url` or `api_key_env` belongs in the home file's
@@ -101,5 +102,8 @@ onward:
    [`docs/design/0016-attribution-policy.md`](docs/design/0016-attribution-policy.md), in words
    that do not themselves match.
 
-The check reads tracked files only, so run `git add` on a new file before you run it. Tools that
-write commit messages may add their own trailer by default; delete it before you commit.
+The check reads tracked files only, so run `git add` on a new file before you run it.
+
+The test suite enforces a third rule: no tracked file holds a credential-shaped literal, a row of
+base64 or a token that a scanner would take for a real key, since the repository is public. Build a
+key or a token when the test runs (`tests/keys.py`, a slice of a hash) or write plainly fake text.
