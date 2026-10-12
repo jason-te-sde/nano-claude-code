@@ -41,7 +41,7 @@ Defended when the file is loaded, with an error that names the file and the sett
 - It may not change the adapter of a model your own file defines, which would send the key
   you set up for one vendor to another's endpoint.
 - It may lower `max_turns`, `bash_timeout_s` and `output_cap_bytes`, and may not raise them.
-- A file that names a section this version does not read (`hooks` and `mcp` among them) is
+- A file that names a section this version does not have (`hooks` and `mcp` among them) is
   refused, and not ignored: a guard that is silently dropped is worse than none.
 
 A project's `deny` and `ask` lists are added to yours, so your own `deny` rules always apply.
@@ -153,10 +153,11 @@ your shell profile is as safe as that file.
 - **Editing a key's first line.** An `Edit` you approve that changes the `BEGIN` line of a
   private-key block leaves a block that is no longer recognised, so the diff that `Edit`
   returns and every later `Read` show its rows.
-- **Short and plain secrets.** In a `name = value` assignment a value is replaced only when it
-  is at least 16 characters of letters, digits and `+/=_-` and at least 3.5 bits of entropy
-  per character. A shorter value, a plainer one, or one with other punctuation in it is read
-  as it is, quoted or not.
+- **Short and plain secrets.** In a `name = value` assignment a value is replaced as far as its
+  first run of letters, digits and `+/=_-` goes, and only when that run is at least 16
+  characters long and has at least 3.5 bits of entropy per character. What follows the run
+  (another punctuation mark, a space) stays readable. A value whose first run is shorter or
+  plainer is read as it is, quoted or not.
 - **Names.** The project map lists a directory whose contents are refused (`.ssh/`, `.aws/`,
   `.gnupg/`, or one a `Read(dir/**)` rule covers) by name, with nothing inside it. `Glob`
   asks the policy nothing: apart from what `.gitignore` hides, it lists the names of the files
@@ -177,11 +178,14 @@ your shell profile is as safe as that file.
   `/private/`, and `Write(tmp/**)` in your home file also allows every `Write` in a project
   that lives under `/tmp/`. This is a known issue, to be fixed. Until then, write a home
   `allow` rule with the absolute path of the project directory
-  (`Write(/home/you/app/tmp/**)`), which names one place.
+  (`Write(/home/you/app/tmp/**)`), which names that directory and a project that repeats the
+  path below its root.
 - **Line numbers.** `Read` numbers lines as `str.splitlines` does, and `Grep` as ripgrep does
-  when ripgrep is on `PATH`. The two differ in a file that holds a form feed, a lone carriage
-  return or U+0085, U+2028 or U+2029, so a line number carried from one tool to the other can
-  name another line. Masking a key block covers both numberings.
+  when ripgrep is on `PATH`. ripgrep ends a line at a newline only, so the two differ in a file
+  that holds any other character that `str.splitlines` ends a line at: a vertical tab
+  (U+000B), a form feed (U+000C), a lone carriage return (U+000D), the separators U+001C,
+  U+001D and U+001E, U+0085, U+2028 and U+2029. A line number carried from one tool to the
+  other can name another line. Masking a key block covers both numberings.
 
 ## Supported versions
 
