@@ -185,9 +185,9 @@ def load_instructions(
     left of :data:`MAX_INSTRUCTION_TOTAL_BYTES` in the order of its distance from the root,
     nearest first, and a directory above the root before one below it at the same distance:
     whole if it fits, cut with the marker if it does not, and replaced by one line saying so if
-    nothing is left. The repository's top level is the farthest above the root, so its file is
-    the first to be cut or left out. Only the order the total is shared in is by distance; the
-    files stand in the prompt as they are listed above.
+    nothing is left. Of the files above the root, the repository top's is the farthest, so it is
+    the first of them to be cut or left out. Only the order the total is shared in is by
+    distance; the files stand in the prompt as they are listed above.
     """
     root_path, cwd_path = Path(root).resolve(), Path(cwd).resolve()
     above = _above_the_root(root_path)
