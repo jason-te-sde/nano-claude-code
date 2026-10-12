@@ -804,6 +804,16 @@ def test_a_deny_rule_that_does_not_cover_a_file_above_the_root_leaves_it_loaded(
     assert "top rule" in loaded and "packages rule" in loaded
 
 
+def test_the_global_file_is_judged_like_any_other_when_the_sandbox_holds_it(tmp_repo):
+    """A root that is the person's home holds ``.nanoclaude`` too, and then the global file is
+    a file of the project like the rest: the sandbox has no say over a file only when the file
+    is outside it."""
+    write(tmp_repo / ".nanoclaude", "global rule: orange\n")
+    write(tmp_repo, "root rule\n")
+    loaded = load(tmp_repo, home=tmp_repo, deny=["Read(.nanoclaude/**)"])
+    assert "root rule" in loaded and "orange" not in loaded
+
+
 def test_a_file_above_the_root_that_is_a_link_into_the_root_is_loaded(tmp_path):
     """Where the file is the sandbox's question and not this one: the link is outside the
     sandbox and what it leads to is inside it, and neither is a reason to refuse it."""

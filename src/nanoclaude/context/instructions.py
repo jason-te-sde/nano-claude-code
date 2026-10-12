@@ -18,7 +18,8 @@ other ways a file's contents reach the model are held to:
   rule, or a credentials path under another name (``NANO.md`` a link to ``.env``), means it
   is not loaded. The sandbox's own row is left out, because the directories above the root
   are outside the sandbox by design and where a file is has been settled by its boundary. The
-  global file is the person's own, and is not judged by the project's rules.
+  global file is the person's own, and is not judged by the project's rules unless the
+  sandbox holds it (a root that is the home directory).
 * **Scrubbed.** The text goes through the session's redactor before it is placed in the
   prompt, whole, before it is cut, so that a credential which straddles a cut is not left
   as a fragment nothing recognises.
@@ -94,7 +95,7 @@ def _read_one(
 
     Every file is held to the same checks wherever it is: contained in ``within``, refused when
     the policy refuses a Read of it, scrubbed. ``is_global`` marks the one file that is not held
-    to the policy's refusal, the person's own.
+    to the policy's refusal, the person's own, unless the sandbox holds it.
     """
     for name in INSTRUCTION_FILENAMES:
         candidate = directory / name
@@ -107,9 +108,12 @@ def _read_one(
         # path under another name (NANO.md a link to .env). Where the file is has been settled
         # by the boundary above, and the sandbox's answer to it is no for every directory above
         # the root, which is outside the sandbox by design, so it is not asked. Only the global
-        # file is not judged: it is the person's own, in their home, and neither the project's
-        # rules nor its sandbox have a say over it.
-        if not is_global and read_refusal(policy, str(candidate), real, check_location=False):
+        # file is not judged, and only while the sandbox does not hold it: it is the person's own,
+        # in their home, and neither the project's rules nor its sandbox have a say over a file
+        # outside them. A root that is the home directory holds it, and then it is a file of the
+        # project like the rest.
+        judged = not is_global or policy.sandbox.contains(real)
+        if judged and read_refusal(policy, str(candidate), real, check_location=False):
             return None
         try:
             if not stat.S_ISREG(os.lstat(real).st_mode):
