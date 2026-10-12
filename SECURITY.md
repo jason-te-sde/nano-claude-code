@@ -22,8 +22,9 @@ down: a hallucinated path, an edit to the wrong file, a destructive command type
 complete confidence. Defended by the sandbox, by confirmation before anything changes a
 file, by `plan` mode, and by the rules that no mode switches off (see below). A regex
 classifier for destructive commands is written and not yet reachable, since nothing runs a
-command; it has known blind spots, each checked by a test, and there is no corpus to say how
-many dangerous commands it misses. A command it finds nothing in is not treated as cleared: an
+command; it has eight known blind spots, of which a test shows four getting through and four
+have no test, and there is no corpus to say how many dangerous commands it misses. A command
+it finds nothing in is not treated as cleared: an
 `allow` rule or an "always" answer does not skip the question for it. Checkpoints that would
 make an edit cheap to undo are not built: `git` is how an edit is undone, and an edit is
 confirmed first.

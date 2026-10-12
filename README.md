@@ -101,7 +101,7 @@ With `-p` nothing can answer a question, so every call that would have asked is 
 | A repository cannot make `ncc` run a program through git: git runs only as `git rev-parse`, which never reads the working tree | Built |
 | A record of every call, written before the call runs, in `~/.nanoclaude/sessions.db`; rows are only added, and an outcome is set once | Built; nothing reads it back yet |
 | What `ncc` creates under `~/.nanoclaude` is readable by you alone, and `ncc` run in `/` or in a home directory is refused unless `--root` says it was meant | Built |
-| Classifying a shell command as dangerous | **Not measured yet.** The regex classifier is written and has known blind spots, each checked by a test, and there is no corpus of dangerous commands to say how many it misses (`tests/corpus/dangerous.jsonl` does not exist), so there is no figure. The syntax-tree classifier, meant to be the authority and to be installed as an optional extra, is not built, and nothing calls either until `Bash` exists. A command the regex classifier finds nothing in is not treated as cleared. |
+| Classifying a shell command as dangerous | **Not measured yet.** The regex classifier is written and has eight known blind spots, of which a test shows four getting through and four have no test, and there is no corpus of dangerous commands to say how many it misses (`tests/corpus/dangerous.jsonl` does not exist), so there is no figure. The syntax-tree classifier, meant to be the authority and to be installed as an optional extra, is not built, and nothing calls either until `Bash` exists. A command the regex classifier finds nothing in is not treated as cleared. |
 | Undoing an edit | Not built. A write is confirmed first, and `git` is how you undo one. |
 
 ## Configuration
