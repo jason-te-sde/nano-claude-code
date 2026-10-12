@@ -150,6 +150,14 @@ def test_the_detector_finds_a_row_of_a_key_and_a_token_and_leaves_plain_text_alo
         assert credential_shaped(plain) == [], plain
 
 
+def test_the_scan_reads_the_sources_and_the_tests_it_is_meant_to_guard():
+    """A scan that read nothing would pass: it has to be seen to read the places a literal of
+    the kind has been, the library and the tests."""
+    names = {name for name, _ in tracked_text_files()}
+    assert "src/nanoclaude/permissions/redact.py" in names
+    assert "tests/tools/test_keyblocks.py" in names
+
+
 def test_no_tracked_file_holds_a_credential_shaped_literal():
     found = [
         f"{name}:{number}: {run[:6]}... ({len(run)} characters)"
