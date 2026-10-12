@@ -8,6 +8,7 @@ the others later does not break it.
 
 from __future__ import annotations
 
+import datetime as dt
 import errno
 import json
 import os
@@ -231,6 +232,21 @@ async def test_cost_says_it_covers_this_run(tmp_repo):
     session = build_session(tmp_repo, [])
     _, text = await run_command(session, "cost")
     assert "this run" in text
+
+
+async def test_cost_says_when_the_price_table_is_old(tmp_repo):
+    session = build_session(tmp_repo, [])
+    session.router.prices = replace(session.router.prices, last_updated=dt.date(2020, 1, 1))
+    _, text = await run_command(session, "cost", width=120)
+    assert "price table last checked 2020-01-01" in text
+    assert "out of date" in text
+
+
+async def test_cost_says_nothing_of_the_price_table_while_it_is_recent(tmp_repo):
+    session = build_session(tmp_repo, [])
+    session.router.prices = replace(session.router.prices, last_updated=dt.date.today())
+    _, text = await run_command(session, "cost", width=120)
+    assert "price table" not in text
 
 
 # --------------------------------------------------------------------------

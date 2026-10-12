@@ -29,3 +29,7 @@ junit*.xml
 .vscode/
 .idea/
 .DS_Store
+
+# Produced by scripts/measure.py; regenerate rather than commit
+metrics.json
+coverage.json
