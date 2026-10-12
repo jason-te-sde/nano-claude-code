@@ -76,7 +76,7 @@ The idea is that reading a codebase to work out what to change is much of the to
 | `accept-edits` | `Edit` and `Write` apply without asking |
 | `bypass` | Nothing asks. Needs `--dangerously-skip-permissions`, and prints a warning |
 
-`bypass` skips the question and not the protections. The sandbox, the rule for `.git` and `.nanoclaude` directories, the credentials rule, the dangerous-command rule and your own `deny` rules are checked first, in every mode, and nothing gets past them.
+`bypass` skips the question and not the protections. The sandbox, the rule for `.git` and `.nanoclaude` directories, the credentials rule, the dangerous-command rule and your own `deny` rules are checked first, in every mode, and nothing gets past them but `--allow-secrets`, which turns the credentials rule and the redaction off together and prints a warning.
 
 With `-p` nothing can answer a question, so every call that would have asked is declined, and each is one line on stderr that names the rule that asked. A call the policy refuses outright gets no such line: the model receives the refusal, with its rule id, as the tool's result.
 
@@ -95,7 +95,7 @@ With `-p` nothing can answer a question, so every call that would have asked is 
 | --- | --- |
 | The sandbox: a path is judged by where it resolves to, a write through a symlink that leaves the project is refused, and no search, listing or `@` mention follows a symlink out; `--add-dir` adds a root | Built |
 | Protected paths: a write into `.git` or a `.nanoclaude` directory is refused in every mode, since git and `ncc` run or obey what is kept there | Built |
-| Credentials: paths such as `.env`, `*.pem`, SSH keys and `.aws/` are refused, whatever their case, and a private-key block is masked whole wherever a file is shown; other keys and tokens are scrubbed from what tools return, before it is stored | Built, with gaps listed in [`SECURITY.md`](SECURITY.md) |
+| Credentials: paths such as `.env`, `*.pem`, SSH keys and `.aws/` are refused, whatever their case, and a private-key block is masked whole wherever a file is shown; other keys and tokens are scrubbed from what tools return, before it is stored. `--allow-secrets` turns the refusal and the scrubbing off together | Built, with gaps listed in [`SECURITY.md`](SECURITY.md) |
 | Your own `deny`, `ask` and `allow` rules, with `deny` always winning, and `deny` holding for `Grep`, `@` mentions and the project map as it does for `Read`. A rule that names a tool there is not is refused when the file loads | Built |
 | Instruction files: `NANO.md` and `CLAUDE.md` from the top of the repository down to the project root go into the prompt only if their real path stays inside the repository and a `Read` of them would be allowed, scrubbed and capped | Built |
 | A repository cannot make `ncc` run a program through git: git runs only as `git rev-parse`, which never reads the working tree | Built |
