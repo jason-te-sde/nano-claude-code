@@ -11,11 +11,22 @@ paths the caller already cleared, so a broad search can surface a file the
 caller never named -- an un-ignored ``.env`` sitting next to code, say. That
 file is covered by the policy's refusal to read it, which the executor enforces
 before a call that *names* it, but a path discovered mid-walk never goes through
-that check. Matches are filtered against the same verdict here, after the
-backend returns, so it applies regardless of which backend ran: a credentials
-path, a path outside the sandbox, and any file a ``Read(...)`` deny rule covers.
-A path is judged by its own spelling and by what it resolves to, so a link
-cannot carry a file past the verdict that its target would not get.
+that check. So Grep asks the same verdict itself of every file a search comes
+upon: a credentials path, a path outside the sandbox, and any file a ``Read(...)``
+deny rule covers. The backends are given the verdict and apply it as they go,
+before ``head_limit`` is counted (a refused file's matches would otherwise use up
+a limit that the files that are shown should have filled, and the fallback does
+not so much as open it), and Grep applies it again to whatever a backend
+returns, so that it does not depend on the backend having done so. A path is
+judged by its own spelling and by what it resolves to, so a link cannot carry a
+file past the verdict that its target would not get.
+
+What is shown of the files that pass has the lines that are inside a private key
+block masked, matches and context alike, in ``content`` mode, the only one that
+shows lines. Whether a line is inside a block is a fact about the whole file (see
+``tools/keyblocks.py``), which no scrub of the lines shown can know, so it is worked
+out after the limit, for the files that have lines to show. What is left is then
+scrubbed like the output of every tool.
 """
 
 from __future__ import annotations
