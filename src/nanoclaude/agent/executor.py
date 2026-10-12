@@ -170,7 +170,76 @@ class Executor:
         ``turn`` is the number the audit records the batch under. It defaults to the
         state's own count, which starts again with every prompt: a session that
         wants its audit numbered across prompts says which turn this is.
+
+        A batch that is stopped (the person pressed Ctrl+C at a confirmation, or while a
+        tool ran) or that fails leaves nothing decided without an outcome: each call that
+        was audited and had not finished is recorded as ``cancelled``, or as ``error``
+        when it was not a cancellation, and the exception goes on. The row of a call from
+        an earlier batch, or an earlier process, is not this batch's to close.
+
+        What a batch owes is kept in a dictionary this call makes and hands to the helpers:
+        the calls of the batch under way whose decision is in the audit log and whose outcome
+        is not yet, with that decision, in the order they were decided. It is not the
+        executor's, because two batches can be under way on one executor (one waiting at a
+        confirmation while another runs), and one finishing must not make the other forget
+        what it owes.
         """
+        unfinished: dict[str, PermissionResult] = {}
+        try:
+            return await self._run_batch(calls, state, turn, unfinished)
+        except BaseException as exc:
+            self._close_unfinished(unfinished, exc)
+            raise
+
+    def _close_unfinished(
+        self, unfinished: dict[str, PermissionResult], stopped_by: BaseException
+    ) -> None:
+        """Record an outcome for every call of the batch that was decided and not finished.
+
+        A call that was refused, or whose tool broke while being asked, was final when it
+        was decided: the loop that records those had not reached it, and is recording what
+        it would have. Every other call is owed the reason it did not finish. Nothing was
+        delivered to the model for any of them, so ``bytes_out`` is 0.
+        """
+        cancelled = isinstance(stopped_by, asyncio.CancelledError | KeyboardInterrupt)
+        stopped_error = None
+        if not cancelled:
+            stopped_error, _ = self.redactor.scrub(
+                sanitize(f"{type(stopped_by).__name__}: {stopped_by}")
+            )
+        for call_id, result in tuple(unfinished.items()):
+            if result.decision is Decision.DENY and result.rule == INTERNAL_ERROR_RULE:
+                outcome, error = "error", result.reason
+            elif result.decision is Decision.DENY:
+                outcome, error = "refused", None
+            elif cancelled:
+                outcome, error = "cancelled", None
+            else:
+                outcome, error = "error", stopped_error
+            # Best effort: this runs while something else is being raised, and a store that
+            # cannot take the row, or a bug in what records it, must not replace that with an
+            # error of its own: whatever is an Exception is held back, and the row stays NULL,
+            # which is what a call nobody could record is. Anything that is not an Exception
+            # (the person pressing Ctrl+C again) is let through.
+            try:
+                self._audit_outcome(
+                    unfinished,
+                    call_id,
+                    outcome=outcome,
+                    duration_ms=0,
+                    bytes_out=0,
+                    error=error,
+                )
+            except Exception:  # noqa: S112 - see above
+                continue
+
+    async def _run_batch(
+        self,
+        calls: Sequence[ToolUseBlock],
+        state: LoopState,
+        turn: int | None,
+        unfinished: dict[str, PermissionResult],
+    ) -> tuple[ToolOutcome, ...]:
         ctx = self.context(state)
         audit_turn = state.turn if turn is None else turn
         # Every call's _Plan is built from this one snapshot of self.grants,
@@ -182,23 +251,26 @@ class Executor:
         # run_batch, not retroactively within this one; that is what keeps
         # the first phase's promise that no call's outcome in a batch depends
         # on how a *later* one in the same batch turns out.
-        plans = [self._decide(ctx, call, audit_turn) for call in calls]
+        plans = [self._decide(ctx, call, audit_turn, unfinished) for call in calls]
         results: dict[str, ToolOutcome] = {}
 
         for plan in plans:
             if plan.refusal is not None:
                 results[plan.call.id] = plan.refusal
-                if plan.crashed:
-                    # Not a refusal: the call ended in an error, so the front end
-                    # hears of it as it hears of any other, and it is audited as one.
-                    self.ui.on_outcome(plan.call, plan.refusal)
                 self._audit_outcome(
+                    unfinished,
                     plan.call.id,
                     outcome="error" if plan.crashed else "refused",
                     duration_ms=0,
                     bytes_out=len(plan.refusal.content.encode("utf-8")),
                     error=plan.result.reason if plan.crashed else None,
                 )
+                if plan.crashed:
+                    # Not a refusal: the call ended in an error, so the front end
+                    # hears of it as it hears of any other, and it is audited as one.
+                    # After the audit: a front end that raises on hearing of it must
+                    # not leave a decided call without its outcome.
+                    self.ui.on_outcome(plan.call, plan.refusal)
                 continue
             if plan.result.decision is not Decision.ASK:
                 continue
@@ -212,6 +284,7 @@ class Executor:
                 )
                 results[plan.call.id] = declined
                 self._audit_outcome(
+                    unfinished,
                     plan.call.id,
                     outcome="declined",
                     duration_ms=0,
@@ -235,7 +308,7 @@ class Executor:
 
         async def guarded(plan: _Plan) -> ToolOutcome:
             async with limit:
-                return await self._run(ctx, plan)
+                return await self._run(ctx, plan, unfinished)
 
         for read_only, group in _consecutive_read_only_runs(runnable):
             if read_only:
@@ -245,22 +318,34 @@ class Executor:
                     results[plan.call.id] = outcome
             else:
                 for plan in group:
-                    results[plan.call.id] = await self._run(ctx, plan)
+                    results[plan.call.id] = await self._run(ctx, plan, unfinished)
 
         return tuple(results[call.id] for call in calls)
 
-    def _decide(self, ctx: ToolContext, call: ToolUseBlock, turn: int) -> _Plan:
+    def _decide(
+        self,
+        ctx: ToolContext,
+        call: ToolUseBlock,
+        turn: int,
+        unfinished: dict[str, PermissionResult],
+    ) -> _Plan:
         try:
             tool = self.registry.get(call.name)
         except UnknownToolError as exc:
-            return self._refused(call, str(exc), turn, "tool.unknown")
+            return self._refused(call, str(exc), turn, "tool.unknown", unfinished)
         try:
             request = tool.permission_request(ctx, call.arguments)
         except ToolArgumentError as exc:
-            return self._refused(call, f"bad arguments: {exc}", turn, "tool.bad-arguments")
+            return self._refused(
+                call, f"bad arguments: {exc}", turn, "tool.bad-arguments", unfinished
+            )
         except (ValueError, OSError) as exc:
             return self._refused(
-                call, f"bad arguments: {type(exc).__name__}: {exc}", turn, "tool.bad-arguments"
+                call,
+                f"bad arguments: {type(exc).__name__}: {exc}",
+                turn,
+                "tool.bad-arguments",
+                unfinished,
             )
         except Exception as exc:
             # The tool broke while being asked what the call would touch. As with a
@@ -269,7 +354,7 @@ class Executor:
             # already decided. It sits after the clauses above, which keep the
             # failures a tool is allowed to have, and names Exception so that
             # cancellation and KeyboardInterrupt still propagate.
-            return self._crashed(call, exc, turn)
+            return self._crashed(call, exc, turn, unfinished)
 
         try:
             result = evaluate(request, self.policy, self.grants)
@@ -279,12 +364,12 @@ class Executor:
             # That is the same failure as a tool that cannot answer, and it ends the
             # call the same way: as an error under tool.internal-error, not run, with
             # the batch going on.
-            return self._crashed(call, exc, turn)
+            return self._crashed(call, exc, turn, unfinished)
         # A reason quotes what the model asked for (the path that is outside the
         # sandbox, the command that was refused).
         result = replace(result, reason=sanitize(result.reason))
         self.ui.on_decision(call, request, result)
-        self._audit_decision(call, turn, result)
+        self._audit_decision(call, turn, result, unfinished)
         if result.decision is Decision.DENY:
             return _Plan(
                 call,
@@ -295,7 +380,14 @@ class Executor:
             )
         return _Plan(call, tool, request, result, None)
 
-    def _refused(self, call: ToolUseBlock, message: str, turn: int, rule: str) -> _Plan:
+    def _refused(
+        self,
+        call: ToolUseBlock,
+        message: str,
+        turn: int,
+        rule: str,
+        unfinished: dict[str, PermissionResult],
+    ) -> _Plan:
         # Reaches here before evaluate() ever runs (an unknown tool name, or
         # arguments bad enough that permission_request() itself raises), so
         # there is no real PermissionRequest to report -- the same placeholder
@@ -306,7 +398,7 @@ class Executor:
         request = PermissionRequest(sanitize(call.name), "")
         result = PermissionResult(Decision.DENY, rule, message)
         self.ui.on_decision(call, request, result)
-        self._audit_decision(call, turn, result)
+        self._audit_decision(call, turn, result, unfinished)
         return _Plan(
             call,
             None,
@@ -315,14 +407,20 @@ class Executor:
             ToolOutcome(call.id, _refusal_text(rule, message), is_error=True),
         )
 
-    def _crashed(self, call: ToolUseBlock, exc: Exception, turn: int) -> _Plan:
+    def _crashed(
+        self,
+        call: ToolUseBlock,
+        exc: Exception,
+        turn: int,
+        unfinished: dict[str, PermissionResult],
+    ) -> _Plan:
         outcome, detail = self._internal_error(call, exc)
         # Reaches here before evaluate() ever runs, so, as in _refused, there is no
         # real PermissionRequest to report.
         request = PermissionRequest(call.name, "")
         result = PermissionResult(Decision.DENY, INTERNAL_ERROR_RULE, detail)
         self.ui.on_decision(call, request, result)
-        self._audit_decision(call, turn, result)
+        self._audit_decision(call, turn, result, unfinished)
         return _Plan(call, None, request, result, outcome, crashed=True)
 
     def _internal_error(self, call: ToolUseBlock, exc: Exception) -> tuple[ToolOutcome, str]:
@@ -345,7 +443,13 @@ class Executor:
         )
         return outcome, detail
 
-    def _audit_decision(self, call: ToolUseBlock, turn: int, result: PermissionResult) -> None:
+    def _audit_decision(
+        self,
+        call: ToolUseBlock,
+        turn: int,
+        result: PermissionResult,
+        unfinished: dict[str, PermissionResult],
+    ) -> None:
         if self.audit is None:
             return
         self.audit.record_decision(
@@ -357,9 +461,19 @@ class Executor:
             decision=result.decision,
             rule=result.rule,
         )
+        # After the insert, so that a call whose decision was not stored is not owed an
+        # outcome for a row that is not there.
+        unfinished[call.id] = result
 
     def _audit_outcome(
-        self, call_id: str, *, outcome: str, duration_ms: int, bytes_out: int, error: str | None
+        self,
+        unfinished: dict[str, PermissionResult],
+        call_id: str,
+        *,
+        outcome: str,
+        duration_ms: int,
+        bytes_out: int,
+        error: str | None,
     ) -> None:
         # The single place every path that closes out a call's audit row
         # goes through -- refused and declined (both added here per this
@@ -380,8 +494,11 @@ class Executor:
             bytes_out=bytes_out,
             error=error,
         )
+        unfinished.pop(call_id, None)
 
-    async def _run(self, ctx: ToolContext, plan: _Plan) -> ToolOutcome:
+    async def _run(
+        self, ctx: ToolContext, plan: _Plan, unfinished: dict[str, PermissionResult]
+    ) -> ToolOutcome:
         assert plan.tool is not None  # noqa: S101 - refused plans never reach here
         started = time.monotonic()
         error: str | None = None
@@ -402,12 +519,16 @@ class Executor:
             # BaseException so cancellation and KeyboardInterrupt still stop the
             # batch instead of being reported to the model as a bug.
             outcome, error = self._internal_error(plan.call, exc)
-        self.ui.on_outcome(plan.call, outcome)
+        # The audit first, then the front end: a front end that raises on hearing of an outcome
+        # must find the call's own outcome already recorded, and not leave the close-out to
+        # write that the call failed when it did not.
         self._audit_outcome(
+            unfinished,
             plan.call.id,
             outcome="error" if outcome.is_error else "ok",
             duration_ms=int((time.monotonic() - started) * 1000),
             bytes_out=len(outcome.content.encode("utf-8")),
             error=error,
         )
+        self.ui.on_outcome(plan.call, outcome)
         return outcome

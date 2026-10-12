@@ -14,8 +14,11 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 
+from nanoclaude.context.git import run_git
 from nanoclaude.context.instructions import load_instructions
 from nanoclaude.context.projectmap import project_map
+from nanoclaude.permissions.policy import Policy
+from nanoclaude.permissions.redact import Redactor
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,47 +28,47 @@ class AssembledContext:
 
 
 def git_state(root: str) -> str:
+    """The branch, or "" when there is nothing to say.
+
+    Only the branch: how many files differ is a question about the working tree, which git
+    answers by reading it, and reading a repository somebody else prepared is how it runs a
+    program that repository names (see ``context/git.py``). Nothing to say is also what a
+    failed question is: a branch name printed by a git that then failed (an unborn branch
+    prints ``HEAD`` and exits non-zero) would be a statement the model would believe.
+    """
     try:
-        branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],  # noqa: S607
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        ).stdout.strip()
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],  # noqa: S607
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        ).stdout.strip()
+        done = run_git(root, "rev-parse", "--abbrev-ref", "HEAD")
     except (OSError, subprocess.SubprocessError):
         return ""
-    if not branch:
+    branch = done.stdout.strip()
+    if done.returncode != 0 or not branch:
         return ""
-    changed = len(status.splitlines())
-    return f"git branch: {branch} ({changed} file(s) with uncommitted changes)"
+    return f"git branch: {branch}"
 
 
-def environment_block(root: str, *, depth: int = 3) -> str:
+def environment_block(root: str, *, policy: Policy, depth: int = 3) -> str:
     parts = [f"Working directory: {root}"]
     state = git_state(root)
     if state:
         parts.append(state)
-    parts.append("Project structure:\n" + project_map(root, depth=depth))
+    parts.append("Project structure:\n" + project_map(root, policy=policy, depth=depth))
     return "\n\n".join(parts)
 
 
 def assemble(
-    root: str, *, cwd: str, home: str | None, tool_protocol: str | None = None, depth: int = 3
+    root: str,
+    *,
+    cwd: str,
+    home: str | None,
+    policy: Policy,
+    redactor: Redactor,
+    tool_protocol: str | None = None,
+    depth: int = 3,
 ) -> AssembledContext:
     from nanoclaude.prompts import build_system_prompt
 
-    instructions = load_instructions(root, cwd=cwd, home=home)
+    instructions = load_instructions(root, cwd=cwd, home=home, policy=policy, redactor=redactor)
     return AssembledContext(
         system=build_system_prompt(root, instructions=instructions, tool_protocol=tool_protocol),
-        environment=environment_block(root, depth=depth),
+        environment=environment_block(root, policy=policy, depth=depth),
     )

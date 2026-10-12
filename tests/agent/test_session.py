@@ -19,6 +19,7 @@ a delay of a millisecond, and cancellation is driven with events.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import json
 import re
@@ -53,6 +54,7 @@ from nanoclaude.conversation.transcript import (
     user_text,
     validate,
 )
+from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.prompts import SYSTEM_PROMPT
 from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, StopKind, Usage
 from nanoclaude.providers.capabilities import (
@@ -701,6 +703,30 @@ async def test_a_bug_in_one_tool_does_not_end_the_session(tmp_repo, monkeypatch)
         "SELECT outcome, session_id FROM tool_calls WHERE tool_use_id = 't1'"
     ).fetchone()
     assert (row["outcome"], row["session_id"]) == ("error", session.session_id)
+
+
+async def test_a_cancelled_confirmation_leaves_the_audit_row_with_the_outcome_cancelled(tmp_repo):
+    """What Ctrl+C at a confirmation does, end to end: the REPL catches the cancellation and
+    carries on, so the row of the call it cancelled must say so, and the next prompt, which
+    mends the transcript, finds nothing in the audit left open."""
+
+    class Cancelling(AutoApprove):
+        async def confirm(self, *_args: object) -> Approval:
+            raise asyncio.CancelledError
+
+    session = build_session(
+        tmp_repo,
+        [calls("Write", {"path": "a.txt", "content": "A"}, call_id="t1")],
+        ui=Cancelling(),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await session.run("write it")
+    assert session.store is not None
+    row = session.store.db.execute(
+        "SELECT outcome, decision FROM tool_calls WHERE tool_use_id = 't1'"
+    ).fetchone()
+    assert (row["outcome"], row["decision"]) == ("cancelled", "ask")
+    assert not (tmp_repo / "a.txt").exists()
 
 
 # --------------------------------------------------------------------------
@@ -2311,6 +2337,17 @@ async def test_a_mention_of_a_secrets_file_is_expanded_only_when_the_policy_allo
     assert "GREETING=hello" in allowing.model.requests[0].transcript.messages[0].text()
 
 
+async def test_a_mention_of_a_file_a_read_deny_rule_covers_is_not_inlined(tmp_repo):
+    (tmp_repo / "secrets").mkdir()
+    (tmp_repo / "secrets" / "notes.txt").write_text("launch code 1234\n")
+    session = build_session(tmp_repo, [says("ok")])
+    session.policy = replace(session.policy, rules=RuleSet.build(deny=["Read(secrets/**)"]))
+    await session.run("what is in @secrets/notes.txt")
+    first = session.model.requests[0].transcript.messages[0].text()
+    assert "launch code" not in first
+    assert "was not inlined" in first and "rule.deny" in first
+
+
 async def test_global_instructions_come_from_the_sessions_home(tmp_repo):
     home = tmp_repo / "elsewhere"
     (home / ".nanoclaude").mkdir(parents=True)
@@ -2318,6 +2355,56 @@ async def test_global_instructions_come_from_the_sessions_home(tmp_repo):
     session = build_session(tmp_repo, [says("ok")], home=home)
     await session.run("hello")
     assert "Always answer in haiku." in session.model.requests[0].system
+
+
+async def test_an_instruction_file_that_leads_out_of_the_root_is_not_in_the_request(tmp_repo):
+    outside = tmp_repo.parent / f"{tmp_repo.name}-outside"
+    outside.mkdir()
+    (outside / "private.txt").write_text("outside secret: orange\n")
+    (tmp_repo / "NANO.md").symlink_to(outside / "private.txt")
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    assert "orange" not in session.model.requests[0].system
+
+
+async def test_the_instructions_in_the_request_are_scrubbed_by_the_sessions_redactor(tmp_repo):
+    token = "ghp_" + hashlib.sha256(b"session").hexdigest()[:36]
+    (tmp_repo / "NANO.md").write_text(f"Deploy with {token}.\n")
+    session = build_session(tmp_repo, [says("ok")])
+    await session.run("hello")
+    system = session.model.requests[0].system
+    assert token not in system and "Deploy with" in system
+
+
+async def test_the_instructions_are_scrubbed_by_the_redactor_the_session_holds(tmp_repo):
+    token = "ghp_" + hashlib.sha256(b"session-own").hexdigest()[:36]
+    (tmp_repo / "NANO.md").write_text(f"Deploy with {token}.\n")
+    session = build_session(tmp_repo, [says("ok")])
+    session.redactor = replace(session.redactor, enabled=False)
+    await session.run("hello")
+    assert token in session.model.requests[0].system
+
+
+async def test_a_read_deny_rule_keeps_an_instruction_file_out_of_the_request(tmp_repo):
+    (tmp_repo / "NANO.md").write_text("Never mention the orange.\n")
+    session = build_session(tmp_repo, [says("ok")])
+    session.policy = replace(session.policy, rules=RuleSet.build(deny=["Read(NANO.md)"]))
+    await session.run("hello")
+    assert "orange" not in session.model.requests[0].system
+
+
+async def test_the_project_map_in_the_request_leaves_out_what_the_policy_would_not_show(tmp_repo):
+    (tmp_repo / ".env").write_text("x")
+    (tmp_repo / "app.py").write_text("")
+    (tmp_repo / "vault").mkdir()
+    (tmp_repo / "vault" / "keys.txt").write_text("x")
+    session = build_session(tmp_repo, [says("ok")])
+    session.policy = replace(session.policy, rules=RuleSet.build(deny=["Read(vault)"]))
+    await session.run("hello")
+    system = session.model.requests[0].system
+    shown = {line.strip() for line in system.split("Project structure:", 1)[1].splitlines()}
+    assert "app.py" in shown
+    assert shown.isdisjoint({".env", "vault/", "keys.txt"}), shown
 
 
 async def test_the_todo_list_the_model_writes_is_the_one_the_session_holds(tmp_repo):

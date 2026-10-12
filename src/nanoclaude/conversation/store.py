@@ -18,6 +18,10 @@ reads as free and that is the one answer known to be wrong. The column was
 additive change, but no build that created such a database was ever released, so
 there is nothing to migrate and the schema below is simply the schema.
 
+``tool_calls``, the audit trail, is append-only in the database itself: three triggers,
+created on every open, refuse a delete, a second row with a key, and any update that is not
+an outcome set once on a row that has none. They are additive, like the archive.
+
 Blocks are stored as JSON with an explicit ``type`` discriminator rather than
 pickled, so a session written today is still readable when the dataclasses gain
 a field.
@@ -42,6 +46,12 @@ from nanoclaude.conversation.transcript import (
     ToolResultBlock,
     ToolUseBlock,
     Transcript,
+)
+from nanoclaude.private import (
+    create_private_file,
+    make_private_directories,
+    narrow_directory,
+    narrow_file,
 )
 from nanoclaude.providers.base import Usage
 
@@ -90,6 +100,42 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     PRIMARY KEY (session_id, tool_use_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+
+-- The audit table is append-only in the file, not only in the code that writes to it.
+-- A row is never deleted; a row is never replaced by another with its key (REPLACE deletes
+-- what it replaces without running a delete trigger, so it is refused where it inserts); and
+-- the only update is an outcome, once, onto a row that has none, which may bring its
+-- duration, size and error with it. What was decided (every other column) is never rewritten.
+-- IF NOT EXISTS, and run on every open: a database an earlier version made gets them too.
+CREATE TRIGGER IF NOT EXISTS tool_calls_never_deleted
+BEFORE DELETE ON tool_calls
+BEGIN
+    SELECT RAISE(ABORT, 'tool_calls is append-only: a row is never deleted');
+END;
+CREATE TRIGGER IF NOT EXISTS tool_calls_key_is_never_reused
+BEFORE INSERT ON tool_calls
+WHEN EXISTS (
+    SELECT 1 FROM tool_calls
+    WHERE session_id = NEW.session_id AND tool_use_id = NEW.tool_use_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'tool_calls is append-only: a row is never replaced');
+END;
+CREATE TRIGGER IF NOT EXISTS tool_calls_only_gains_an_outcome
+BEFORE UPDATE ON tool_calls
+WHEN OLD.outcome IS NOT NULL
+    OR NEW.outcome IS NULL
+    OR NEW.session_id IS NOT OLD.session_id
+    OR NEW.turn IS NOT OLD.turn
+    OR NEW.tool_use_id IS NOT OLD.tool_use_id
+    OR NEW.ts IS NOT OLD.ts
+    OR NEW.tool IS NOT OLD.tool
+    OR NEW.args_json IS NOT OLD.args_json
+    OR NEW.decision IS NOT OLD.decision
+    OR NEW.rule IS NOT OLD.rule
+BEGIN
+    SELECT RAISE(ABORT, 'tool_calls is append-only: a row only gains its outcome, once');
+END;
 """
 
 
@@ -222,12 +268,22 @@ class Store:
         self._db: sqlite3.Connection | None = None
 
     def open(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The file exists, and is private, before SQLite opens it: SQLite gives its
+        # write-ahead log and index the mode of the database, and the database holds the
+        # whole conversation, tool output included.
+        make_private_directories(self.path.parent)
+        create_private_file(self.path)
+        # What an earlier version made with the default mode is narrowed now: the directory,
+        # the database, and the log and index that SQLite opened with whatever mode they had.
+        narrow_directory(self.path.parent)
+        narrow_file(self.path)
         self._db = sqlite3.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
         self._db.commit()
+        for sidecar in ("-wal", "-shm"):
+            narrow_file(self.path.with_name(self.path.name + sidecar))
 
     def close(self) -> None:
         if self._db is not None:

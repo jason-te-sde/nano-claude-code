@@ -285,7 +285,7 @@ class Session:
             prompt,
             root=self.root,
             redactor=self.redactor,
-            allow_secrets=self.policy.allow_secrets,
+            policy=self.policy,
         )
         return text
 
@@ -364,6 +364,8 @@ class Session:
             self.root,
             cwd=self.root,
             home=self.home,
+            policy=self.policy,
+            redactor=self.redactor,
             tool_protocol=None if native else render_tools(specs),
         )
         return f"{context.system}\n\n{context.environment}", specs if native else ()

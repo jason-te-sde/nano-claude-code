@@ -5,14 +5,17 @@ way to say "this file". Anything outside the working directory, or that does
 not exist, is left as literal text -- an unexpanded mention is confusing, but a
 silently expanded `/etc/passwd` is worse.
 
-A mention of a credentials-shaped path (``redactor.is_secret_path``) is left
-unexpanded the same way, unless ``allow_secrets`` is set. Without this check,
-an ``@.env`` mention would place the file's content in the request sent to the
-model provider with only the generic content redactor in the way -- and that
-redactor matches known shapes, not every line a credentials file can contain
-(a database URL with an inline password, for one). The secret-path rule is
-what already refuses this file to Read and skips it in Grep; a mention goes
-through neither of those, so it needed this check of its own.
+A mention of a file the policy would not let Read show the model is not inlined
+either, and says so in one line where the file would have gone: a credentials-shaped
+path (unless ``allow_secrets`` is set), or any file a ``Read(...)`` deny rule covers.
+Without this check, an ``@.env`` mention would place the file's content in the request
+sent to the model provider with only the generic content redactor in the way -- and that
+redactor matches known shapes, not every line a credentials file can contain (a database
+URL with an inline password, for one). The refusal is what already stops Read and Grep
+from showing the file; a mention goes through neither of those, so it asks the same
+question of its own (``read_refusal``). The line is there because the person wrote
+``@path`` believing the model would see the file, and the model should not be left to
+guess at what it was not shown.
 """
 
 from __future__ import annotations
@@ -21,8 +24,10 @@ import os
 import re
 from pathlib import Path
 
+from nanoclaude.permissions.policy import Policy, read_refusal
 from nanoclaude.permissions.redact import Redactor
 from nanoclaude.permissions.sandbox import is_within
+from nanoclaude.tools.base import sanitize
 from nanoclaude.tools.fs import FileSystemError, read_text
 
 #: Not preceded by a word character, so an email address is not a mention, and
@@ -32,10 +37,16 @@ MAX_MENTION_BYTES = 100_000
 
 
 def expand_mentions(
-    text: str, *, root: str, redactor: Redactor, allow_secrets: bool = False
+    text: str, *, root: str, redactor: Redactor, policy: Policy
 ) -> tuple[str, tuple[str, ...]]:
+    """``text`` with each ``@path`` it names followed by that file, and the files inlined.
+
+    ``policy`` is required, and there is no default that would let a caller leave it out: a
+    mention that does not ask it is a way past every refusal the policy makes.
+    """
     expanded: list[str] = []
     paths: list[str] = []
+    refused: set[str] = set()
     position = 0
     # Resolved like the candidate is: a root reached through a symlink (on macOS,
     # anything under /tmp or /var) would otherwise never contain any resolved
@@ -50,10 +61,23 @@ def expand_mentions(
         candidate = os.path.realpath(raw if Path(raw).is_absolute() else Path(real_root) / raw)
         if not is_within(real_root, candidate) or not Path(candidate).is_file():
             continue
-        if candidate in paths:
+        if candidate in paths or candidate in refused:
             continue  # inline each file once, however often it is mentioned
         relative = os.path.relpath(candidate, real_root)
-        if redactor.is_secret_path(candidate, relative) and not allow_secrets:
+        # The name the mention gave the file as well as what it leads to, when that
+        # is a name inside the root (an absolute spelling through an alias of the root is
+        # not, and is judged by what it resolves to).
+        spelled = os.path.normpath(Path(real_root) / raw)
+        spellings = (spelled, candidate) if is_within(real_root, spelled) else (candidate,)
+        refusal = read_refusal(policy, *spellings)
+        if refusal is not None:
+            refused.add(candidate)
+            reason = " ".join(sanitize(refusal.reason).split())
+            expanded.append(text[position : match.end()])
+            expanded.append(
+                f"\n\n[@{raw} was not inlined \u2014 refused ({refusal.rule}): {reason}]\n\n"
+            )
+            position = match.end()
             continue
         try:
             snapshot = read_text(candidate)

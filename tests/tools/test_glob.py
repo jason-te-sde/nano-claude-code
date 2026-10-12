@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 from nanoclaude.tools.base import ToolArgumentError
@@ -59,6 +61,98 @@ async def test_hitting_the_result_limit_says_so_in_the_header(ctx, tmp_repo):
         (tmp_repo / f"f{i}.py").write_text("")
     outcome = await GlobTool().run(ctx, "t1", {"pattern": "*.py"})
     assert "truncated at 200" in outcome.content
+
+
+async def test_a_symlink_to_a_file_outside_the_sandbox_is_not_listed(layout):
+    (layout.outside / "private.txt").write_text("")
+    (layout.project / "notes.txt").symlink_to(layout.outside / "private.txt")
+    (layout.project / "real.txt").write_text("")
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "**/*.txt"})
+    assert "real.txt" in outcome.content
+    assert "notes.txt" not in outcome.content
+
+
+async def test_nothing_is_listed_through_a_symlink_to_a_directory_outside_the_sandbox(layout):
+    (layout.outside / "private.txt").write_text("")
+    (layout.project / "vendor").symlink_to(layout.outside, target_is_directory=True)
+    (layout.project / "real.txt").write_text("")
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "**/*"})
+    assert "real.txt" in outcome.content
+    assert "vendor" not in outcome.content
+    assert "private.txt" not in outcome.content
+
+
+async def test_a_symlink_to_a_file_inside_the_sandbox_is_still_listed(layout):
+    """The check must not alarm on everything: a link within the project is as visible
+    as the file it leads to."""
+    (layout.project / "real.txt").write_text("")
+    (layout.project / "alias.txt").symlink_to(layout.project / "real.txt")
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "**/*.txt"})
+    assert "alias.txt" in outcome.content and "real.txt" in outcome.content
+
+
+async def test_links_that_lead_outside_do_not_use_up_the_result_limit(layout):
+    """Entries are dropped before the limit is applied. Filtering the capped list
+    afterwards would let a directory full of fresh links to outside push every real
+    file out of the answer."""
+    (layout.outside / "private.txt").write_text("")
+    for i in range(DEFAULT_LIMIT):
+        (layout.project / f"link{i}.txt").symlink_to(layout.outside / "private.txt")
+    real = layout.project / "real.txt"
+    real.write_text("")
+    os.utime(real, (1, 1))  # older than every link
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "*.txt"})
+    assert "real.txt" in outcome.content
+    assert "link" not in outcome.content
+
+
+def _count_realpath(monkeypatch: pytest.MonkeyPatch, under: str) -> list[str]:
+    """Patch ``os.path.realpath`` to record the paths under ``under`` it is asked about."""
+    real = os.path.realpath
+    asked: list[str] = []
+
+    def counting(path: str | os.PathLike[str], **kwargs: bool) -> str:
+        if str(path).startswith(under) and str(path) != under:
+            asked.append(str(path))
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", counting)
+    return asked
+
+
+async def test_a_tree_with_no_links_costs_no_realpath_at_all(layout, monkeypatch):
+    """One ``realpath`` is a system call for every component of the path, and the walk does
+    not enter a directory link, so an entry that is not a link cannot lead outside."""
+    for directory in ("a", "a/b", "c"):
+        (layout.project / directory).mkdir(parents=True, exist_ok=True)
+        for i in range(5):
+            (layout.project / directory / f"f{i}.py").write_text("")
+    asked = _count_realpath(monkeypatch, str(layout.project))
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "**/*.py"})
+    assert "15 file(s)" in outcome.content, outcome.content
+    assert asked == []
+
+
+async def test_a_tree_with_one_link_costs_one_realpath_and_the_link_is_judged(layout, monkeypatch):
+    for i in range(10):
+        (layout.project / f"f{i}.py").write_text("")
+    (layout.outside / "private.py").write_text("")
+    (layout.project / "escape.py").symlink_to(layout.outside / "private.py")
+    asked = _count_realpath(monkeypatch, str(layout.project))
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "*.py"})
+    assert asked == [str(layout.project / "escape.py")]
+    assert "10 file(s)" in outcome.content and "escape.py" not in outcome.content
+
+
+async def test_a_link_to_a_file_inside_the_root_costs_one_realpath_and_is_listed(
+    layout, monkeypatch
+):
+    (layout.project / "real.py").write_text("")
+    (layout.project / "alias.py").symlink_to(layout.project / "real.py")
+    asked = _count_realpath(monkeypatch, str(layout.project))
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "*.py"})
+    assert asked == [str(layout.project / "alias.py")]
+    assert "alias.py" in outcome.content and "real.py" in outcome.content
 
 
 def test_the_description_is_byte_identical_to_the_spec():

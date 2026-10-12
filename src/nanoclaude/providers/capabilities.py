@@ -9,11 +9,12 @@ just runs its calls one at a time.
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
+
+from nanoclaude.private import write_private
 
 #: The cache's file, inside the directory ncc keeps its state in. Named once, so that the
 #: command that reads the cache and the one that clears it cannot disagree about where it is.
@@ -156,17 +157,14 @@ class CapabilityCache:
             "reasoning": caps.reasoning,
             "vision": caps.vision,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # Written atomically: a sibling temp file is fully flushed first, then
-        # swapped into place with a single rename. A reader can only ever see
-        # the old complete file or the new complete file, never a half-written
-        # one from a process that died mid-write. The pid qualifies the temp
-        # name so two `ncc` processes racing on the same cache file write
-        # their own temp file rather than clobbering each other's partial
-        # write before either gets to replace().
-        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-        tmp.replace(self.path)
+        # Written atomically and privately, by the one routine ncc keeps files under its
+        # home with: a sibling temp file, made private as it is made and fully flushed
+        # first, is swapped into place with a single rename. A reader can only ever see
+        # the old complete file or the new complete file, never a half-written one from a
+        # process that died mid-write. The pid qualifies the temp name so two `ncc`
+        # processes racing on the same cache file write their own temp file rather than
+        # clobbering each other's partial write before either gets to replace().
+        write_private(self.path, json.dumps(data, indent=2, sort_keys=True), replace=True)
 
 
 async def resolve_capabilities(
