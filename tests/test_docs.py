@@ -5,27 +5,64 @@ names exists: a tool, a command, a key, a file. That is still most of how docume
 goes wrong, since it is code that moves and the prose that stays.
 """
 
+import base64
+import hashlib
+import json
+import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tomllib
-from dataclasses import fields
+from dataclasses import fields, replace
 from pathlib import Path
 
 import pytest
 
+from nanoclaude.agent.loop import StopReason
 from nanoclaude.cli.commands import COMMANDS
+from nanoclaude.cli.headless import DECLINED_PREFIX, declined_line
 from nanoclaude.cli.init import PRESETS
-from nanoclaude.cli.main import EXIT_CODES, main
+from nanoclaude.cli.main import EXIT_CODES, build_parser, main
 from nanoclaude.cli.repl import TEXT_TOOL_BANNER
-from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, load_config
+from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, ConfigError, load_config
 from nanoclaude.config.schema import ROLES, LimitsConfig, ModelConfig, PermissionsConfig, UiConfig
+from nanoclaude.context.git import ALLOWED_SUBCOMMAND
+from nanoclaude.context.instructions import (
+    MAX_INSTRUCTION_BYTES,
+    MAX_INSTRUCTION_TOTAL_BYTES,
+    load_instructions,
+)
 from nanoclaude.context.projectmap import project_map
+from nanoclaude.conversation.store import Store
+from nanoclaude.permissions import redact
+from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.danger.regex import RegexClassifier
+from nanoclaude.permissions.policy import (
+    PROTECTED_DIRECTORIES,
+    Decision,
+    PermissionMode,
+    PermissionRequest,
+    PermissionResult,
+    Policy,
+    evaluate,
+)
+from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
+from nanoclaude.permissions.rules import KNOWN_TOOLS, RuleSet, glob_matches_any
+from nanoclaude.permissions.sandbox import Sandbox
+from nanoclaude.private import create_private_file, make_private_directories
 from nanoclaude.providers.capabilities import CACHE_FILENAME, CONSERVATIVE_DEFAULT, capabilities_for
+from nanoclaude.providers.pricing import PriceBook
+from nanoclaude.tools.edit import EditTool
+from nanoclaude.tools.fs import stamp_of
+from nanoclaude.tools.glob import GlobTool
+from nanoclaude.tools.grep import GrepTool
+from nanoclaude.tools.read import ReadTool
 from nanoclaude.tools.registry import default_registry
 from nanoclaude.tools.todo import TodoState
+from tests.conftest import mode_of
+from tests.keys import pem
 from tests.script_modules import load_script
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -267,7 +304,7 @@ def test_the_presets_in_the_reference_are_the_ones_init_offers():
 
 #: The ids of hosted models that the documents may use: the ones the capability table has a
 #: row for, which were checked against each provider's own list. A legacy id is not among them.
-CURRENT_ANTHROPIC = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-4-5", "claude-fable-5-1"}
+CURRENT_ANTHROPIC = {"claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-1"}
 
 
 def test_every_hosted_model_id_in_the_documents_is_a_current_one_the_program_knows():
@@ -300,7 +337,7 @@ model   = "claude-opus-5-5"
 
 [models.haiku]
 adapter = "anthropic"
-model   = "claude-haiku-4-5"
+model   = "claude-haiku-5-5"
 
 [models.local]
 adapter = "ollama"
@@ -479,9 +516,11 @@ def test_the_rule_ids_in_the_architecture_document_are_the_ones_the_code_decides
     )
 
 
-def test_the_architecture_document_states_the_two_extensions_of_the_plan():
+def test_the_architecture_document_states_the_three_extensions_of_the_plan():
     text = _text(ARCHITECTURE)
+    assert "**Three extensions of the plan.**" in text
     assert "tool.internal-error" in text
+    assert "sandbox.protected-path" in text
     assert "messages_archive(session_id, seq, role, blocks_json, created_at, archived_at)" in text
 
 
@@ -581,17 +620,42 @@ def test_the_regex_classifier_marks_its_clear_verdicts_as_unreliable():
     assert "marked not authoritative" in _text(ARCHITECTURE)
 
 
-def test_the_project_map_lists_credentials_files_by_name_as_the_documents_say(tmp_path):
-    """A known gap: the map hides what .gitignore hides and nothing of its own."""
-    (tmp_path / ".env").write_text("TOKEN=x\n")
-    (tmp_path / "app.py").write_text("")
-    listing = project_map(str(tmp_path))
-    assert ".env" in listing.splitlines(), (
-        "the project map now hides credentials files; correct docs/design/0013-thin-context.md, "
-        "SECURITY.md and CHANGELOG.md, which say that it lists them by name"
+async def test_glob_lists_the_names_of_files_the_project_map_leaves_out(tmp_repo, ctx):
+    """A known gap: the map asks the policy what it would refuse a Read of, and Glob does not."""
+    for name in (
+        ".env",
+        "id_rsa",
+        ".ssh/config",
+        ".gnupg/pubring.kbx",
+        "docs/private.md",
+        "app.py",
+    ):
+        file = tmp_repo / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text("x\n")
+    policy = replace(
+        ctx.policy, rules=RuleSet.build(allow=["Read", "Glob"], deny=["Read(docs/private.md)"])
     )
-    for document in (DESIGN / "0013-thin-context.md", SECURITY, CHANGELOG):
-        assert "credentials files" in _text(document)
+    refused = (".env", "id_rsa", ".ssh/config", ".gnupg/pubring.kbx", "docs/private.md")
+
+    shown = {line.strip() for line in project_map(str(tmp_repo), policy=policy).splitlines()}
+    assert {"app.py", ".ssh/", ".gnupg/", "docs/"} <= shown, (
+        f"the map shows {sorted(shown)}: a directory whose contents are refused is listed by its "
+        "name, which is what SECURITY.md and docs/design/0013-thin-context.md say"
+    )
+    assert shown.isdisjoint({Path(name).name for name in refused}), (
+        f"the map shows {sorted(shown)}, and names a file that the policy would refuse a Read of"
+    )
+
+    listing = await GlobTool().run(replace(ctx, policy=policy), "t1", {"pattern": "**/*"})
+    listed = set(listing.content.splitlines()[1:])
+    missing = [name for name in refused if name not in listed]
+    assert missing == [], (
+        f"Glob no longer lists {missing}; correct SECURITY.md, docs/design/0013-thin-context.md, "
+        "docs/testing.md and CHANGELOG.md, which say that it asks the policy nothing"
+    )
+    for document in (SECURITY, DESIGN / "0013-thin-context.md", TESTING, CHANGELOG):
+        assert "`Glob`" in _text(document), f"{document.name} does not say what Glob lists"
 
 
 def test_the_text_tool_banner_the_documents_quote_is_the_one_the_repl_prints():
@@ -711,6 +775,617 @@ def test_the_security_document_lists_an_untrusted_project_configuration_and_what
         "bash_timeout_s",
     ):
         assert f"`{setting}`" in text, f"SECURITY.md does not mention {setting}"
+
+
+# --------------------------------------------------------------------------
+# The policy, the audit and git
+# --------------------------------------------------------------------------
+
+NUMBER_WORDS = {
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "twenty-one": 21,
+    "twenty-two": 22,
+}
+
+#: The rule ids decided before the policy runs. The others are what ``evaluate`` decides with.
+_DECIDED_BEFORE_THE_POLICY = {"tool.unknown", "tool.bad-arguments", "tool.internal-error"}
+
+#: An item of the reference's numbered list begins with the id or ids of its check.
+_LEADING_IDS = re.compile(r"`[a-z]+\.[a-z-]+`(?: and `[a-z]+\.[a-z-]+`)*")
+
+
+def _rule_ids_in_the_table() -> list[str]:
+    rows = _table_rows(_text(ARCHITECTURE))
+    return [row[0].strip("`") for row in rows if re.fullmatch(r"`[a-z]+\.[a-z-]+`", row[0])]
+
+
+def _rule_ids_in_the_order_of_the_checks() -> list[str]:
+    """The ids of the numbered list in the reference, in the order it gives them."""
+    section = _section(_text(CONFIGURATION), "Permissions")
+    ids: list[str] = []
+    for item in re.findall(r"^\d+\. (.*)$", section, re.MULTILINE):
+        leading = _LEADING_IDS.match(item)
+        if leading is not None:
+            ids += re.findall(r"`([a-z]+\.[a-z-]+)`", leading.group(0))
+    return ids
+
+
+def _policy_rule_ids_in_the_order_the_source_names_them() -> list[str]:
+    source = _text(SRC / "permissions" / "policy.py")
+    found = re.findall(r'"((?:rule|secret|sandbox|bash|mode|grant|tool|default)\.[a-z-]+)"', source)
+    return list(dict.fromkeys(found))
+
+
+def test_the_architecture_document_counts_its_rule_ids():
+    ids = _rule_ids_in_the_table()
+    found = re.search(r"These ([a-z-]+) exist", _text(ARCHITECTURE))
+    assert found is not None, "the architecture document does not say how many rule ids exist"
+    assert NUMBER_WORDS.get(found.group(1)) == len(ids), (
+        f"the architecture document says that {found.group(1)} rule ids exist; "
+        f"its table has {len(ids)}"
+    )
+
+
+def test_the_architecture_table_lists_the_rule_ids_in_the_order_the_policy_decides_them():
+    # The sandbox's first row is decided in sandbox.py, so policy.py does not name it.
+    in_the_table = [
+        i
+        for i in _rule_ids_in_the_table()
+        if i not in _DECIDED_BEFORE_THE_POLICY and i != "sandbox.outside-root"
+    ]
+    in_the_source = _policy_rule_ids_in_the_order_the_source_names_them()
+    assert len(in_the_source) >= 14, f"found only {in_the_source}, so the pattern is wrong"
+    assert in_the_table == in_the_source, (
+        f"the table gives the order {in_the_table}; "
+        f"policy.py names them in the order {in_the_source}"
+    )
+
+
+def test_the_reference_lists_the_checks_in_the_order_of_the_architecture_table():
+    in_the_reference = _rule_ids_in_the_order_of_the_checks()
+    in_the_table = [i for i in _rule_ids_in_the_table() if i not in _DECIDED_BEFORE_THE_POLICY]
+    assert len(in_the_reference) >= 15, f"found only {in_the_reference} in the reference's list"
+    assert in_the_reference == in_the_table, (
+        f"the reference gives the order {in_the_reference}; the table gives {in_the_table}"
+    )
+
+
+def _decide(policy: Policy, tool: str, relative: str, *, write: bool) -> PermissionResult:
+    path = f"{policy.sandbox.roots[0]}/{relative}"
+    return evaluate(PermissionRequest(tool, path, (path,), is_write=write), policy)
+
+
+@pytest.mark.parametrize("mode", list(PermissionMode))
+def test_a_write_into_git_or_nanoclaude_is_refused_in_every_mode(tmp_path, mode):
+    policy = Policy(
+        sandbox=Sandbox((str(tmp_path),)),
+        rules=RuleSet.build(allow=["Read", "Write"]),
+        mode=mode,
+        secret_paths=SECRET_PATH_PATTERNS,
+    )
+    for relative in (
+        ".git/config",
+        "sub/.GIT/hooks/pre-commit",
+        ".git",
+        ".nanoclaude/config.toml",
+        "a/.nanoclaude/sessions.db",
+    ):
+        refused = _decide(policy, "Write", relative, write=True)
+        assert (refused.decision, refused.rule) == (Decision.DENY, "sandbox.protected-path"), (
+            mode,
+            relative,
+            refused,
+        )
+    for relative in (".github/workflows/ci.yml", ".gitignore", "src/gitlab.py"):
+        assert _decide(policy, "Write", relative, write=True).rule != "sandbox.protected-path"
+    assert _decide(policy, "Read", ".git/config", write=False).rule != "sandbox.protected-path"
+
+
+def test_the_documents_name_the_protected_directories_and_the_rule_that_refuses_them():
+    assert PROTECTED_DIRECTORIES == (".git", ".nanoclaude"), (
+        f"the protected directories are {PROTECTED_DIRECTORIES}; "
+        "correct the documents that name them"
+    )
+    for document in (ARCHITECTURE, CONFIGURATION):
+        assert "`sandbox.protected-path`" in _text(document), document.name
+    for document in (ARCHITECTURE, CONFIGURATION, SECURITY, README):
+        for name in PROTECTED_DIRECTORIES:
+            assert f"`{name}`" in _text(document), f"{document.name} does not name {name}"
+
+
+def test_the_audit_record_is_as_the_documents_describe_it(tmp_path):
+    written = set(
+        re.findall(r'"(ok|error|refused|declined|cancelled)"', _text(SRC / "agent" / "executor.py"))
+    )
+    paragraph = next(
+        part
+        for part in _text(ARCHITECTURE).split("\n\n")
+        if part.startswith("**The audit record**")
+    )
+    sessions = _section(_text(CONFIGURATION), "Sessions")
+    for where, text in (("the architecture document", paragraph), ("the reference", sessions)):
+        documented = set(re.findall(r"`(ok|error|refused|declined|cancelled)`", text))
+        assert documented == written, (
+            f"{where} lists the outcomes {sorted(documented)}; "
+            f"the executor writes {sorted(written)}"
+        )
+
+    triggers = _text(SRC / "conversation" / "store.py").count("CREATE TRIGGER")
+    assert triggers == 3, f"the store has {triggers} triggers; the architecture document says three"
+    assert "three triggers" in paragraph
+
+    store = Store(tmp_path / "sessions.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    log = AuditLog(store)
+    log.record_decision(
+        "s1",
+        turn=0,
+        tool_use_id="t1",
+        tool="Write",
+        arguments={"path": "a"},
+        decision=Decision.ASK,
+        rule="default.ask",
+    )
+    refused = (
+        "DELETE FROM tool_calls",
+        (
+            "INSERT OR REPLACE INTO tool_calls (session_id, turn, tool_use_id, ts, tool, "
+            "args_json, decision, rule) VALUES ('s1', 0, 't1', 0, 'Write', '{}', 'allow', 'x')"
+        ),
+        "UPDATE tool_calls SET decision = 'allow'",
+    )
+    for statement in refused:
+        with pytest.raises(sqlite3.DatabaseError):
+            store.db.execute(statement)
+    log.record_outcome("s1", "t1", outcome="declined", duration_ms=0, bytes_out=0, error=None)
+    log.record_outcome("s1", "t1", outcome="ok", duration_ms=1, bytes_out=1, error=None)
+    assert store.db.execute("SELECT outcome FROM tool_calls").fetchone()["outcome"] == "declined"
+    with pytest.raises(sqlite3.DatabaseError):
+        store.db.execute("UPDATE tool_calls SET outcome = 'ok'")
+
+
+def test_git_is_run_only_as_rev_parse_and_the_documents_say_so():
+    assert ALLOWED_SUBCOMMAND == "rev-parse"
+    for document in (ARCHITECTURE, SECURITY, README):
+        assert "git rev-parse" in _text(document), f"{document.name} does not say that"
+
+
+def test_a_default_root_that_is_too_wide_is_refused_before_anything_is_opened(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("NANOCLAUDE_HOME", str(home))
+    monkeypatch.setenv("HOME", str(home))
+    for wide in ("/", str(home), str(tmp_path)):
+        monkeypatch.chdir(wide)
+        assert main(["-p", "hello"]) == EXIT_CODES["usage"], wide
+        error = capsys.readouterr().err
+        assert error.startswith("error: ") and "--root" in error, (wide, error)
+    assert not (home / ".nanoclaude").exists(), "something was opened before the root was refused"
+    text = _text(CONFIGURATION)
+    assert "`/`, a home directory" in text and "before it opens anything" in text
+
+
+# --------------------------------------------------------------------------
+# The reference
+# --------------------------------------------------------------------------
+
+
+def _credentials_list_in_the_reference() -> list[str]:
+    section = _section(_text(CONFIGURATION), "Permissions")
+    blocks = [body for language, body in _fenced_blocks(section) if language == ""]
+    assert len(blocks) == 1, (
+        f"found {len(blocks)} unlabelled code blocks in the Permissions section"
+    )
+    return blocks[0].splitlines()
+
+
+def test_the_credentials_list_in_the_reference_is_the_one_the_policy_refuses():
+    documented = _credentials_list_in_the_reference()
+    assert all(pattern.startswith("**/") for pattern in SECRET_PATH_PATTERNS), (
+        "a credentials pattern that is not in any directory; the reference says that they are"
+    )
+    refused = [pattern.removeprefix("**/") for pattern in SECRET_PATH_PATTERNS]
+    assert sorted(documented) == sorted(refused), (
+        f"in the reference and not the policy: {sorted(set(documented) - set(refused))}; "
+        f"in the policy and not the reference: {sorted(set(refused) - set(documented))}"
+    )
+    for public in ("certs/server.crt", "keys/id_ed25519.pub"):
+        assert not glob_matches_any(SECRET_PATH_PATTERNS, (public,), fold=True), public
+
+
+def test_a_deny_rule_folds_case_and_an_allow_rule_does_not(tmp_path):
+    policy = Policy(
+        sandbox=Sandbox((str(tmp_path),)),
+        rules=RuleSet.build(allow=["Write(Docs/**)"], deny=["Read(secrets/**)"]),
+        mode=PermissionMode.DEFAULT,
+        secret_paths=SECRET_PATH_PATTERNS,
+    )
+    assert _decide(policy, "Read", "Secrets/key.txt", write=False).rule == "rule.deny"
+    assert _decide(policy, "Read", ".ENV", write=False).rule == "secret.path"
+    assert _decide(policy, "Write", "Docs/a.md", write=True).rule == "rule.allow"
+    assert _decide(policy, "Write", "docs/a.md", write=True).rule == "default.ask"
+    for document in (CONFIGURATION, ARCHITECTURE):
+        assert "case folding" in _text(document), document.name
+    assert "`Read(secrets/**)`" in _text(CONFIGURATION)
+    assert "`Secrets/key.txt`" in _text(CONFIGURATION)
+
+
+def test_a_rule_naming_a_tool_that_does_not_exist_is_refused_and_two_names_are_reserved(tmp_path):
+    registry = {tool.name for tool in default_registry(TodoState())}
+    assert set(KNOWN_TOOLS) - registry == {"Bash", "Git"}, (
+        "the names a rule may use that no tool has are not Bash and Git; correct "
+        "docs/configuration.md and SECURITY.md, which say that those two are reserved"
+    )
+    home = tmp_path / "home"
+    (home / CONFIG_DIRNAME).mkdir(parents=True)
+    config = home / CONFIG_DIRNAME / CONFIG_FILENAME
+    config.write_text(EXAMPLE_HOME + '\n[permissions]\ndeny = ["read(.env)"]\n')
+    with pytest.raises(ConfigError, match="unknown tool 'read'"):
+        load_config(home=str(home), project=None, env={})
+    config.write_text(EXAMPLE_HOME + '\n[permissions]\nallow = ["Bash(npm test:*)", "Git"]\n')
+    load_config(home=str(home), project=None, env={})
+    for document in (CONFIGURATION, SECURITY):
+        assert "reserved" in _text(document), document.name
+
+
+def _flag_choices(flag: str) -> tuple[str, ...]:
+    for action in build_parser()._actions:
+        if flag in action.option_strings:
+            return tuple(str(choice) for choice in action.choices or ())
+    raise AssertionError(f"ncc has no flag {flag}")
+
+
+def test_the_flag_choices_in_the_reference_are_the_parsers():
+    text = _section(_text(CONFIGURATION), "The command line")
+    for flag in ("--mode", "--output-format"):
+        found = re.search(rf"`{flag} ([^`]+)`", text)
+        assert found is not None, f"the reference does not give the choices of {flag}"
+        assert tuple(found.group(1).split("\\|")) == _flag_choices(flag), flag
+    assert "bypass" not in _flag_choices("--mode")
+
+
+def _json_paragraph() -> str:
+    return next(part for part in _text(CONFIGURATION).split("\n\n") if part.startswith("**JSON.**"))
+
+
+def test_the_json_object_has_the_keys_and_stop_reasons_the_reference_names(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("NANOCLAUDE_HOME", str(tmp_path))
+    assert main(["--output-format", "json"]) == EXIT_CODES["usage"]  # a failure is one object too
+    payload = json.loads(capsys.readouterr().out)
+    paragraph = _json_paragraph()
+    for key in (*payload, *payload["usage"]):
+        assert f"`{key}`" in paragraph, f"the reference does not name {key}"
+    assert payload["stop_reason"] == "error" and payload["exit_code"] == EXIT_CODES["usage"]
+    sentence = re.search(r"`stop_reason` is one of (.*?)\.", paragraph)
+    assert sentence is not None, "the reference does not list the stop reasons"
+    main_source = _text(SRC / "cli" / "main.py")
+    assert '"cut_off"' in main_source and '"error"' in main_source
+    emitted = {reason.value for reason in StopReason} | {"cut_off", "error"}
+    assert set(re.findall(r"`([a-z_]+)`", sentence.group(1))) == emitted
+
+
+def test_the_declined_line_the_reference_shows_is_the_one_ncc_prints():
+    request = PermissionRequest("Write", "/p/src/x.py", ("/p/src/x.py",), is_write=True)
+    line = declined_line(
+        "Write", request, rule="default.ask", root="/p", mode=PermissionMode.DEFAULT
+    )
+    assert f"`{DECLINED_PREFIX}{line}`" in _text(CONFIGURATION)
+
+
+def test_the_prices_the_reference_gives_are_the_price_books():
+    book = PriceBook.load()
+    haiku = book.price_for("anthropic", "claude-haiku-5-5")
+    assert haiku is not None and haiku.threshold_tokens is not None
+    assert haiku.above_threshold is not None
+    tiered = [model for (_, model), price in book.prices.items() if price.threshold_tokens]
+    assert tiered == ["claude-haiku-5-5"], (
+        f"{tiered} are priced by prompt length; the reference says one is"
+    )
+    text = _section(_text(CONFIGURATION), "Models")
+    for needle in (
+        f"{haiku.threshold_tokens:,} tokens",
+        f"${haiku.input_per_mtok:.2f}",
+        f"${haiku.output_per_mtok:.2f}",
+        f"${haiku.above_threshold.input_per_mtok:.2f}",
+        f"${haiku.above_threshold.output_per_mtok:.2f}",
+        f"dated {book.last_updated.isoformat()}",
+    ):
+        assert needle in text, f"the reference's Prices paragraph does not say {needle!r}"
+
+
+def test_the_byte_caps_of_the_instruction_files_are_the_ones_the_documents_give():
+    for document in (CONFIGURATION, ARCHITECTURE, SECURITY, DESIGN / "0013-thin-context.md"):
+        text = _text(document)
+        for cap in (MAX_INSTRUCTION_BYTES, MAX_INSTRUCTION_TOTAL_BYTES):
+            assert f"{cap:,} bytes" in text, f"{document.name} does not give the cap {cap:,}"
+
+
+def test_the_instruction_files_are_layered_and_the_total_is_shared_as_the_reference_says(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    home, repository = tmp_path / "home", tmp_path / "repository"
+    middle = repository / "services"
+    project = middle / "app"
+    (home / ".nanoclaude").mkdir(parents=True)
+    project.mkdir(parents=True)
+    subprocess.run(["git", "init", "-q"], cwd=repository, check=True)  # noqa: S607
+    for directory, name, size in (
+        (home / ".nanoclaude", "global", 30_000),
+        (repository, "top", 10_000),
+        (middle, "middle", 10_000),
+        (project, "root", 30_000),
+    ):
+        (directory / "NANO.md").write_text((f"{name}-file " + "x" * size)[:size])
+    policy = Policy(
+        sandbox=Sandbox((str(project),)),
+        rules=RuleSet.build(allow=["Read"]),
+        mode=PermissionMode.DEFAULT,
+        secret_paths=SECRET_PATH_PATTERNS,
+    )
+    loaded = load_instructions(
+        str(project), cwd=str(project), home=str(home), policy=policy, redactor=Redactor()
+    )
+    # The global file and the root's are always loaded, 60,000 of the 64,000 bytes. What is left
+    # goes to the file nearest the root first, which is cut to it; the file at the top of the
+    # repository finds nothing left, and is replaced by a line.
+    assert "[truncated at 4000 bytes]" in loaded
+    assert "not loaded: instructions are capped at 64000 bytes in total]" in loaded
+    assert "top-file" not in loaded
+    order = [loaded.index(f"{name}-file ") for name in ("global", "middle", "root")]
+    assert order == sorted(order), (
+        "the files are not in the prompt from the global one to the root's"
+    )
+    assert loaded.index("repository/NANO.md not loaded") < loaded.index("middle-file ")
+    for document in (CONFIGURATION, SECURITY):
+        assert "nearest" in _text(document), document.name
+
+
+def test_the_modes_the_reference_gives_for_what_ncc_keeps_are_the_ones_it_makes(tmp_path):
+    make_private_directories(tmp_path / "a" / "b")
+    create_private_file(tmp_path / "a" / "b" / "history")
+    assert mode_of(tmp_path / "a" / "b") == 0o700
+    assert mode_of(tmp_path / "a" / "b" / "history") == 0o600
+    text = _text(CONFIGURATION)
+    assert "mode 0700" in text and "0600" in text
+
+
+def test_a_rules_glob_is_also_matched_against_the_absolute_path_without_its_leading_slash(
+    tmp_path,
+):
+    """A known issue (docs/configuration.md and SECURITY.md say so, and how to avoid it)."""
+    root = Path(os.path.realpath(tmp_path))
+    top = root.parts[1]  # "tmp" on Linux, "private" on macOS: the first directory under /
+
+    def policy_with(*, allow: tuple[str, ...] = (), deny: tuple[str, ...] = ()) -> Policy:
+        return Policy(
+            sandbox=Sandbox((str(root),)),
+            rules=RuleSet.build(allow=list(allow), deny=list(deny)),
+            mode=PermissionMode.DEFAULT,
+            secret_paths=SECRET_PATH_PATTERNS,
+        )
+
+    denying = policy_with(deny=(f"Read({top}/**)",))
+    assert _decide(denying, "Read", "src/a.py", write=False).rule == "rule.deny", (
+        "a rule for a directory at the top of the file system no longer matches the files under "
+        "it; correct docs/configuration.md and SECURITY.md, which call that a known issue"
+    )
+    allowing = policy_with(allow=(f"Write({top}/**)",))
+    assert _decide(allowing, "Write", "src/a.py", write=True).rule == "rule.allow"
+    # What the documents advise instead: the absolute path of the project directory.
+    narrow = policy_with(allow=(f"Write({root}/out/**)",))
+    assert _decide(narrow, "Write", "out/a.py", write=True).rule == "rule.allow"
+    assert _decide(narrow, "Write", "src/a.py", write=True).rule == "default.ask"
+    for document in (CONFIGURATION, SECURITY):
+        text = _text(document)
+        assert "known issue" in text and "`Write(/home/you/app/tmp/**)`" in text, document.name
+
+
+def test_the_limits_the_reference_calls_reserved_are_read_by_nothing():
+    rows = _table_rows(_section(_text(CONFIGURATION), "Limits"))
+    reserved = {
+        row[0].strip("`"): row[2]
+        for row in rows
+        if row[0] in ("`bash_timeout_s`", "`output_cap_bytes`")
+    }
+    assert set(reserved) == {"bash_timeout_s", "output_cap_bytes"}
+    for key, meaning in reserved.items():
+        assert "Reserved" in meaning, f"the limits table does not call {key} reserved"
+
+
+# --------------------------------------------------------------------------
+# The known limits in SECURITY.md
+# --------------------------------------------------------------------------
+
+KNOWN_LIMITS = (
+    "**`Grep` and private keys.**",
+    "**Editing a key's first line.**",
+    "**Short and plain secrets.**",
+    "**Names.**",
+    "**Your instruction file.**",
+    "**Files you made.**",
+    "**A rule's glob and the leading slash.**",
+    "**Line numbers.**",
+)
+
+
+def test_security_states_each_of_its_known_limits():
+    text = _text(SECURITY)
+    missing = [limit for limit in KNOWN_LIMITS if limit not in text]
+    assert missing == [], f"SECURITY.md does not state {missing}"
+
+
+async def test_grep_modes_that_show_no_lines_say_whether_a_pattern_matches_inside_a_key(
+    ctx, tmp_repo
+):
+    """A known limit: nothing shows the block's text, and a match inside it is still a match."""
+    block, rows = pem(lines=3)
+    (tmp_repo / "deploy.sh").write_text("echo start\n" + "\n".join(block) + "\necho end\n")
+    probe = rows[0][:8]
+    shown: dict[str, str] = {}
+    for mode in ("content", "files", "count"):
+        outcome = await GrepTool().run(ctx, "t", {"pattern": probe, "output_mode": mode})
+        shown[mode] = outcome.content
+        assert "1 match(es)" in outcome.content and "deploy.sh" in outcome.content, (
+            f"{mode} mode no longer reports a match inside a key block; correct SECURITY.md, "
+            f"which says that it does. Grep said: {outcome.content}"
+        )
+        assert not any(row in outcome.content for row in rows), (
+            f"{mode} mode shows a row of a private key"
+        )
+    assert "[redacted:private-key]" in shown["content"]
+    none = await GrepTool().run(ctx, "t", {"pattern": "ZZZZZZZZ", "output_mode": "count"})
+    assert "No matches" in none.content
+
+
+async def test_an_approved_edit_of_a_begin_line_leaves_a_block_that_is_no_longer_masked(
+    ctx, tmp_repo
+):
+    """A known limit: a block is recognised from its BEGIN line, and the edit took that away."""
+    block, rows = pem(lines=3)
+    target = tmp_repo / "deploy.sh"
+    target.write_text("\n".join(block) + "\n")
+    outcome = await EditTool().run(
+        replace(ctx, read_state={str(target): stamp_of(str(target))}),
+        "t1",
+        {"path": "deploy.sh", "edits": [{"old_string": block[0], "new_string": "# a key"}]},
+    )
+    assert not outcome.is_error, outcome.content
+    assert rows[0] in outcome.content, (
+        "the diff of an edit to a BEGIN line no longer shows the rows; correct SECURITY.md"
+    )
+    read = await ReadTool().run(ctx, "t2", {"path": "deploy.sh"})
+    assert rows[0] in read.content
+
+
+def test_a_short_or_plain_value_in_an_assignment_is_not_redacted_quoted_or_not():
+    scrubber = Redactor()
+    # Built when the test runs: a literal of this shape is not allowed in this repository.
+    digest = base64.b64encode(hashlib.sha256(b"a sample").digest()).decode()
+    token = digest.replace("+", "x").replace("/", "y")
+    for line in (
+        'password = "hunter2"',
+        "password = hunter2",
+        f"api_key = {token[:15]}",  # one character short
+        'secret: "aaaaaaaaaaaaaaaaaaaa"',  # long enough, and plain
+    ):
+        assert scrubber.scrub(line) == (line, 0), (
+            f"{line!r} is now redacted; correct SECURITY.md and docs/design/0012, which say that "
+            "a short or plain value is not"
+        )
+    assert scrubber.scrub(f"API_KEY={token[:22]}")[0] == "API_KEY=[redacted:assigned-secret]"
+    assert redact.ENTROPY_FLOOR == 3.5
+    assert "16 characters" in _text(SECURITY) and "3.5 bits" in _text(SECURITY)
+
+
+def test_a_deny_rule_does_not_keep_the_global_instruction_file_out_but_does_the_projects(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
+    home, project = tmp_path / "home", tmp_path / "project"
+    (home / ".nanoclaude").mkdir(parents=True)
+    project.mkdir()
+    (home / ".nanoclaude" / "NANO.md").write_text("Always answer in rhyme.\n")
+    (project / "NANO.md").write_text("Use tabs.\n")
+    policy = Policy(
+        sandbox=Sandbox((str(project),)),
+        rules=RuleSet.build(allow=["Read"], deny=["Read(**/NANO.md)"]),
+        mode=PermissionMode.DEFAULT,
+        secret_paths=SECRET_PATH_PATTERNS,
+    )
+    loaded = load_instructions(
+        str(project), cwd=str(project), home=str(home), policy=policy, redactor=Redactor()
+    )
+    assert "Always answer in rhyme." in loaded and "Use tabs." not in loaded, (
+        "a deny rule now keeps the global instruction file out, or the project's does not stay "
+        "out; correct SECURITY.md and docs/configuration.md"
+    )
+
+
+def test_a_config_toml_written_by_hand_keeps_its_mode_when_ncc_opens_its_home(tmp_path):
+    state = tmp_path / ".nanoclaude"
+    state.mkdir()
+    config = state / "config.toml"
+    config.write_text("[models]\n")
+    config.chmod(0o644)
+    Store(state / "sessions.db").open()
+    assert (mode_of(state), mode_of(state / "sessions.db"), mode_of(config)) == (
+        0o700,
+        0o600,
+        0o644,
+    ), "ncc now changes a config.toml it did not create; correct SECURITY.md"
+
+
+async def test_read_numbers_a_line_where_str_splitlines_ends_it(ctx, tmp_repo):
+    (tmp_repo / "a.txt").write_bytes(b"one\x0ctwo\nthree\n")
+    outcome = await ReadTool().run(ctx, "t1", {"path": "a.txt"})
+    assert "1\tone\n2\ttwo\n3\tthree" in outcome.content, (
+        "Read no longer numbers lines as str.splitlines does; correct SECURITY.md and "
+        f"docs/architecture.md. It said: {outcome.content}"
+    )
+    for document in (SECURITY, ARCHITECTURE):
+        assert "str.splitlines" in _text(document), document.name
+
+
+# --------------------------------------------------------------------------
+# The design notes and the README
+# --------------------------------------------------------------------------
+
+
+def test_the_kinds_the_redaction_note_names_are_the_ones_the_scrubber_writes():
+    source = _text(SRC / "permissions" / "redact.py")
+    written = {label for label, _ in redact._SHAPES}
+    written |= set(re.findall(r"\[redacted:([a-z-]+)\]", source))
+    note = _text(DESIGN / "0012-redaction-before-transcript.md")
+    sentence = re.search(r"The kinds are named in the marker: (.*?)\.\s", note, re.DOTALL)
+    assert sentence is not None, "0012 does not list the kinds of credential it recognises"
+    documented = set(re.findall(r"`([a-z]+(?:-[a-z]+)*)`", sentence.group(1)))
+    assert documented == written, (
+        f"in the note and not the scrubber: {sorted(documented - written)}; "
+        f"in the scrubber and not the note: {sorted(written - documented)}"
+    )
+
+
+def test_the_attribution_note_and_the_guide_state_the_rule_and_not_how_commits_are_made():
+    for document in (DESIGN / "0016-attribution-policy.md", CONTRIBUTING):
+        text = " ".join(_text(document).lower().split())
+        for phrase in ("tools that write commit messages", "act of deleting"):
+            assert phrase not in text, f"{document.name} says {phrase!r}"
+
+
+def test_the_readme_says_what_containment_and_redaction_add():
+    text = _text(README)
+    for phrase in (
+        "`.git` or a `.nanoclaude` directory",
+        "private-key block",
+        "git rev-parse",
+        "Instruction files",
+        "names the rule that asked",
+        "`--root`",
+    ):
+        assert phrase in text, f"the README does not say {phrase!r}"
+
+
+def test_the_changelog_lists_what_the_two_fixes_added():
+    text = _text(CHANGELOG)
+    for phrase in (
+        "`sandbox.protected-path`",
+        "`exit_code`",
+        "`--mode`",
+        "`git rev-parse`",
+        "Claude Haiku 5.5",
+        "`shell` and `openai` extras",
+    ):
+        assert phrase in text, f"the changelog does not mention {phrase!r}"
 
 
 # --------------------------------------------------------------------------
