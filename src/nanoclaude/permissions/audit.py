@@ -10,7 +10,9 @@ cancelling) records its own outcome, so a missing one means a crash and nothing 
 The trail only grows. A decision is inserted, never replaced: ids are minted to be
 unique, so a second decision under the same (session, tool_use_id) is a bug somewhere
 else, and replacing the first row would hide the bug and the decision with it. The
-``IntegrityError`` is the report.
+``IntegrityError`` is the report. An outcome is set once: a second one, from whatever
+reported it twice, changes nothing. The database enforces both (see the triggers in
+``conversation/store.py``), so a statement that bypasses this class is refused too.
 
 Arguments pass through the redactor on the way in. The audit table is the one
 place a secret could survive the transcript scrubbing, because it stores what
@@ -66,7 +68,7 @@ class AuditLog:
     ) -> None:
         self.store.db.execute(
             "UPDATE tool_calls SET outcome = ?, duration_ms = ?, bytes_out = ?, error = ? "
-            "WHERE session_id = ? AND tool_use_id = ?",
+            "WHERE session_id = ? AND tool_use_id = ? AND outcome IS NULL",
             (outcome, duration_ms, bytes_out, error, session_id, tool_use_id),
         )
         self.store.db.commit()

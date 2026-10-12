@@ -106,6 +106,55 @@ async def test_links_that_lead_outside_do_not_use_up_the_result_limit(layout):
     assert "link" not in outcome.content
 
 
+def _count_realpath(monkeypatch: pytest.MonkeyPatch, under: str) -> list[str]:
+    """Patch ``os.path.realpath`` to record the paths under ``under`` it is asked about."""
+    real = os.path.realpath
+    asked: list[str] = []
+
+    def counting(path: str | os.PathLike[str], **kwargs: bool) -> str:
+        if str(path).startswith(under) and str(path) != under:
+            asked.append(str(path))
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(os.path, "realpath", counting)
+    return asked
+
+
+async def test_a_tree_with_no_links_costs_no_realpath_at_all(layout, monkeypatch):
+    """One ``realpath`` is a system call for every component of the path, and the walk does
+    not enter a directory link, so an entry that is not a link cannot lead outside."""
+    for directory in ("a", "a/b", "c"):
+        (layout.project / directory).mkdir(parents=True, exist_ok=True)
+        for i in range(5):
+            (layout.project / directory / f"f{i}.py").write_text("")
+    asked = _count_realpath(monkeypatch, str(layout.project))
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "**/*.py"})
+    assert "15 file(s)" in outcome.content, outcome.content
+    assert asked == []
+
+
+async def test_a_tree_with_one_link_costs_one_realpath_and_the_link_is_judged(layout, monkeypatch):
+    for i in range(10):
+        (layout.project / f"f{i}.py").write_text("")
+    (layout.outside / "private.py").write_text("")
+    (layout.project / "escape.py").symlink_to(layout.outside / "private.py")
+    asked = _count_realpath(monkeypatch, str(layout.project))
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "*.py"})
+    assert asked == [str(layout.project / "escape.py")]
+    assert "10 file(s)" in outcome.content and "escape.py" not in outcome.content
+
+
+async def test_a_link_to_a_file_inside_the_root_costs_one_realpath_and_is_listed(
+    layout, monkeypatch
+):
+    (layout.project / "real.py").write_text("")
+    (layout.project / "alias.py").symlink_to(layout.project / "real.py")
+    asked = _count_realpath(monkeypatch, str(layout.project))
+    outcome = await GlobTool().run(layout.ctx, "t1", {"pattern": "*.py"})
+    assert asked == [str(layout.project / "alias.py")]
+    assert "alias.py" in outcome.content and "real.py" in outcome.content
+
+
 def test_the_description_is_byte_identical_to_the_spec():
     """It is a prompt. Changing a word needs a design note, so pin the shape."""
     assert GlobTool().spec().description == EXPECTED_DESCRIPTION

@@ -1,10 +1,14 @@
+import re
 import shutil
 from dataclasses import replace
 from pathlib import Path
-from typing import Never
+from typing import Any, Never
 
 import pytest
 
+from nanoclaude.permissions.policy import PermissionRequest, PermissionResult
+from nanoclaude.permissions.policy import evaluate as real_evaluate
+from nanoclaude.permissions.redact import Redactor
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.tools.base import ToolArgumentError, ToolContext
 from nanoclaude.tools.grep import GrepTool
@@ -243,7 +247,7 @@ async def test_context_lines_never_come_from_a_secret_file(
 ):
     _maybe_force_python_fallback(monkeypatch, force_python_fallback)
     (tmp_repo / ".env").write_text(
-        "before\nDATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod\nafter\n"
+        "before\nDATABASE_URL=postgres://db.internal:5432/prod?password=hunter2\nafter\n"
     )
     outcome = await GrepTool().run(ctx, "t1", {"pattern": "DATABASE_URL", "-C": 1})
     assert not outcome.is_error
@@ -275,13 +279,16 @@ async def test_secret_files_are_dropped_from_matches_by_default(
 ):
     """Spec Sec.4's threat model: a broad search must not surface an un-ignored
     .env's contents just because the model never named the file directly. The
-    line below is deliberately not shaped like anything _SHAPES or _ASSIGNED
-    (permissions/redact.py) would catch on its own -- this is pinning the
+    line below is deliberately not shaped like anything _SHAPES, _ASSIGNED or
+    the URL rule (permissions/redact.py) would catch on its own -- a password
+    in a query string, not in the URL's userinfo -- this is pinning the
     file-level filter, not the content-level one, which is covered separately
     by test_secrets_in_matched_lines_are_redacted above.
     """
     _maybe_force_python_fallback(monkeypatch, force_python_fallback)
-    (tmp_repo / ".env").write_text("DATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod\n")
+    (tmp_repo / ".env").write_text(
+        "DATABASE_URL=postgres://db.internal:5432/prod?password=hunter2\n"
+    )
     outcome = await GrepTool().run(ctx, "t1", {"pattern": "DATABASE_URL"})
     assert not outcome.is_error
     assert ".env" not in outcome.content
@@ -293,7 +300,9 @@ async def test_allow_secrets_lets_secret_file_matches_through(
     ctx, tmp_repo, monkeypatch, force_python_fallback
 ):
     _maybe_force_python_fallback(monkeypatch, force_python_fallback)
-    (tmp_repo / ".env").write_text("DATABASE_URL=postgres://admin:hunter2@db.internal:5432/prod\n")
+    (tmp_repo / ".env").write_text(
+        "DATABASE_URL=postgres://db.internal:5432/prod?password=hunter2\n"
+    )
     allowed_ctx = replace(ctx, policy=replace(ctx.policy, allow_secrets=True))
     outcome = await GrepTool().run(allowed_ctx, "t1", {"pattern": "DATABASE_URL"})
     assert not outcome.is_error
@@ -335,7 +344,7 @@ async def test_a_link_inside_the_sandbox_to_a_credentials_file_surfaces_nothing(
     layout, monkeypatch, force_python_fallback
 ):
     _maybe_force_python_fallback(monkeypatch, force_python_fallback)
-    (layout.project / ".env").write_text("needle=postgres://admin:hunter2@db.internal/prod\n")
+    (layout.project / ".env").write_text("needle=postgres://db.internal/prod?password=hunter2\n")
     (layout.project / "notes.txt").symlink_to(layout.project / ".env")
     outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle", "-C": 1})
     assert "hunter2" not in outcome.content
@@ -392,6 +401,73 @@ async def test_a_link_named_like_a_credentials_file_is_dropped_by_its_name(layou
     assert ".env" not in outcome.content
 
 
+# ---- a file is judged by each spelling it has, and a file that resolves to itself has one
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_file_that_resolves_to_itself_is_judged_once(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    """The policy is asked about every spelling of a file, its own and what it resolves to, and
+    nearly every file a search walks resolves to itself: asking about it twice doubled the cost
+    of the walk and decided nothing."""
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    for directory in ("a", "a/b", "c"):
+        (tmp_repo / directory).mkdir(parents=True, exist_ok=True)
+        for i in range(5):
+            (tmp_repo / directory / f"f{i}.txt").write_text("needle\n")
+    asked: list[str] = []
+
+    def counting(request: PermissionRequest, *args: Any, **kwargs: Any) -> PermissionResult:
+        asked.append(request.subject)
+        return real_evaluate(request, *args, **kwargs)
+
+    monkeypatch.setattr("nanoclaude.permissions.policy.evaluate", counting)
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "output_mode": "count"})
+    assert "15 match(es)" in outcome.content, outcome.content
+    judged = [subject for subject in asked if subject.startswith(str(tmp_repo))]
+    assert len(judged) >= 15
+    assert len(judged) == len(set(judged))
+
+
+async def test_a_path_through_a_directory_link_is_judged_by_where_it_leads(layout, monkeypatch):
+    """A backend that follows links reports the file at the end of one by a path that is not
+    itself a link, and the verdict is for where that path leads, whatever the backend did: not
+    only a link is resolved, since a link can be anywhere along the way."""
+    (layout.outside / "private.txt").write_text("outside\n")
+    (layout.project / "vendor").symlink_to(layout.outside, target_is_directory=True)
+    (layout.project / "real").mkdir()
+    (layout.project / "real" / "ok.txt").write_text("fine\n")
+    (layout.project / "alias").symlink_to(layout.project / "real", target_is_directory=True)
+    _backend_that_reports(
+        monkeypatch,
+        layout.project / "vendor" / "private.txt",
+        layout.project / "alias" / "ok.txt",
+    )
+    outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle", "output_mode": "files"})
+    assert "private.txt" not in outcome.content, outcome.content
+    assert "alias/ok.txt" in outcome.content, outcome.content
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not on PATH")
+async def test_ripgrep_set_to_follow_links_cannot_bring_in_a_file_from_outside(
+    layout, monkeypatch, tmp_path
+):
+    """ripgrep reads a configuration file named by the environment, and a person may have
+    --follow in it: the file at the end of a directory link is then reported by a path that
+    is not a link."""
+    config = tmp_path / "ripgreprc"
+    config.write_text("--follow\n")
+    monkeypatch.setenv("RIPGREP_CONFIG_PATH", str(config))
+    (layout.outside / "private.txt").write_text("needle: the outside file\n")
+    (layout.project / "vendor").symlink_to(layout.outside, target_is_directory=True)
+    (layout.project / "ok.txt").write_text("needle: inside\n")
+    outcome = await GrepTool().run(layout.ctx, "t1", {"pattern": "needle"})
+    assert "the outside file" not in outcome.content, outcome.content
+    assert "private.txt" not in outcome.content, outcome.content
+    assert "ok.txt:1:needle: inside" in outcome.content, outcome.content
+
+
 def _deny_reading(ctx: ToolContext, *rules: str) -> ToolContext:
     return replace(ctx, policy=replace(ctx.policy, rules=RuleSet.build(deny=list(rules))))
 
@@ -417,6 +493,353 @@ async def test_a_read_deny_rule_also_keeps_grep_out_of_the_files_it_covers(
         assert "launch code" not in outcome.content, f"{mode}: {outcome.content}"
         assert "before" not in outcome.content, f"{mode}: {outcome.content}"
         assert "open.txt" in outcome.content, f"{mode}: {outcome.content}"
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+@pytest.mark.parametrize(
+    ("directory", "name"),
+    [("SECRETS", "notes.txt"), ("Secrets", "notes.txt")],
+)
+async def test_a_deny_rule_keeps_grep_out_of_a_file_whatever_the_case_of_its_path(
+    ctx, tmp_repo, monkeypatch, force_python_fallback, directory, name
+):
+    """The default macOS volume opens ``SECRETS/x`` as ``secrets/x``, so a rule that
+    names one is a rule about the other."""
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / directory).mkdir()
+    (tmp_repo / directory / name).write_text("needle: launch code 1234\n")
+    (tmp_repo / "open.txt").write_text("needle: public\n")
+    outcome = await GrepTool().run(
+        _deny_reading(ctx, "Read(secrets/**)"), "t1", {"pattern": "needle"}
+    )
+    assert "launch code" not in outcome.content, outcome.content
+    assert "open.txt" in outcome.content, outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_the_credentials_list_keeps_grep_out_of_an_uppercase_env_file(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / ".ENV").write_text("needle: not for the model\n")
+    (tmp_repo / "open.txt").write_text("needle: fine\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle"})
+    assert "not for the model" not in outcome.content, outcome.content
+    assert "open.txt" in outcome.content, outcome.content
+
+
+# ---- the limit counts what is shown: a refused file's matches never use it up
+
+
+def _many_matches_in_a_refused_file_and_some_in_an_open_one(tmp_repo: Path) -> None:
+    """The refused file sorts first by path, and has more matches than any limit below."""
+    (tmp_repo / "aaa").mkdir()
+    (tmp_repo / "aaa" / "notes.txt").write_text("needle refused\n" * 40)
+    (tmp_repo / "zzz.txt").write_text("".join(f"needle open {i}\n" for i in range(6)))
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+@pytest.mark.parametrize("limit", [1, 3, 5, 6])
+async def test_a_refused_files_matches_do_not_use_up_the_limit(
+    ctx, tmp_repo, monkeypatch, force_python_fallback, limit
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    _many_matches_in_a_refused_file_and_some_in_an_open_one(tmp_repo)
+    denying = _deny_reading(ctx, "Read(aaa/**)")
+    outcome = await GrepTool().run(denying, "t1", {"pattern": "needle", "head_limit": limit})
+    assert not outcome.is_error and "refused" not in outcome.content, outcome.content
+    assert f"{limit} match(es)" in outcome.content, outcome.content
+    assert outcome.content.count("zzz.txt:") == limit, outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_the_default_limit_counts_what_is_shown_too(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "aaa").mkdir()
+    (tmp_repo / "aaa" / "notes.txt").write_text("needle refused\n" * 250)
+    (tmp_repo / "zzz.txt").write_text("needle open\n" * 30)
+    denying = _deny_reading(ctx, "Read(aaa/**)")
+    outcome = await GrepTool().run(denying, "t1", {"pattern": "needle"})
+    assert "30 match(es)" in outcome.content, outcome.content[:80]
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_credentials_file_does_not_use_up_the_limit_either(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / ".env").write_text("needle refused\n" * 40)
+    (tmp_repo / "zzz.txt").write_text("needle open\n" * 6)
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "head_limit": 4})
+    assert "4 match(es)" in outcome.content and ".env" not in outcome.content, outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+@pytest.mark.parametrize("mode", ["files", "count"])
+async def test_the_limit_counts_what_is_shown_in_the_other_modes_too(
+    ctx, tmp_repo, monkeypatch, force_python_fallback, mode
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    _many_matches_in_a_refused_file_and_some_in_an_open_one(tmp_repo)
+    denying = _deny_reading(ctx, "Read(aaa/**)")
+    outcome = await GrepTool().run(
+        denying, "t1", {"pattern": "needle", "output_mode": mode, "head_limit": 3}
+    )
+    assert "3 match(es)" in outcome.content and "zzz.txt" in outcome.content, outcome.content
+    assert "aaa" not in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_the_limit_counts_matches_and_not_context_lines_after_refused_ones_are_dropped(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "aaa").mkdir()
+    (tmp_repo / "aaa" / "notes.txt").write_text("needle refused\nfiller\n" * 20)
+    spaced = "needle one\nf\nf\nf\nneedle two\nf\nf\nf\nneedle three\n"
+    (tmp_repo / "zzz.txt").write_text(spaced)
+    denying = _deny_reading(ctx, "Read(aaa/**)")
+    outcome = await GrepTool().run(denying, "t1", {"pattern": "needle", "head_limit": 2, "-C": 1})
+    assert "2 match(es)" in outcome.content, outcome.content
+    assert "needle one" in outcome.content and "needle two" in outcome.content
+    assert "needle three" not in outcome.content and "refused" not in outcome.content
+
+
+def _ripgrep_reports(monkeypatch: pytest.MonkeyPatch, *events: dict[str, object]) -> None:
+    import json
+    import subprocess
+    from types import SimpleNamespace
+
+    stdout = "\n".join(json.dumps(event) for event in events) + "\n"
+    monkeypatch.setattr("nanoclaude.tools.search.ripgrep_available", lambda: True)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
+    )
+
+
+def _bytes_of(raw: bytes) -> dict[str, str]:
+    import base64
+
+    return {"bytes": base64.b64encode(raw).decode()}
+
+
+def _hit(path: dict[str, str], line: object, number: int = 1) -> dict[str, object]:
+    return {"type": "match", "data": {"path": path, "lines": line, "line_number": number}}
+
+
+async def test_a_match_ripgrep_reports_with_its_path_as_bytes_is_judged_like_any_other(
+    ctx, tmp_repo, monkeypatch
+):
+    root = str(tmp_repo).encode()
+    (tmp_repo / "open.txt").write_text("needle: fine\n")
+    _ripgrep_reports(
+        monkeypatch,
+        _hit(_bytes_of(root + b"/.env"), {"text": "needle: not for the model\n"}),
+        _hit(_bytes_of(root + b"/secrets/notes.txt"), {"text": "needle: launch code\n"}),
+        _hit(_bytes_of(root + b"/open.txt"), {"text": "needle: fine\n"}),
+    )
+    denying = _deny_reading(ctx, "Read(secrets/**)")
+    outcome = await GrepTool().run(denying, "t1", {"pattern": "needle"})
+    assert "needle: fine" in outcome.content and "1 match(es)" in outcome.content
+    assert "not for the model" not in outcome.content and "launch code" not in outcome.content
+    assert ".env" not in outcome.content and "secrets" not in outcome.content
+
+
+async def test_a_refused_bytes_path_does_not_use_up_the_limit(ctx, tmp_repo, monkeypatch):
+    root = str(tmp_repo).encode()
+    _ripgrep_reports(
+        monkeypatch,
+        *[_hit(_bytes_of(root + b"/.env"), {"text": f"needle {n}\n"}, n) for n in range(1, 20)],
+        *[_hit(_bytes_of(root + b"/open.txt"), {"text": f"needle {n}\n"}, n) for n in (1, 2, 3)],
+    )
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "head_limit": 3})
+    assert "3 match(es)" in outcome.content and outcome.content.count("open.txt:") == 3
+
+
+async def test_a_name_that_is_not_utf8_is_shown_in_a_form_that_can_be_sent(
+    ctx, tmp_repo, monkeypatch
+):
+    raw = str(tmp_repo).encode() + b"/caf\xe9.txt"
+    _ripgrep_reports(monkeypatch, _hit(_bytes_of(raw), {"text": "needle here\n"}))
+    for mode in ("content", "files", "count"):
+        outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "output_mode": mode})
+        assert not outcome.is_error, outcome.content
+        assert "caf" in outcome.content and "\ufffd" in outcome.content, outcome.content
+        outcome.content.encode("utf-8")  # a lone surrogate would raise here
+
+
+async def test_a_name_that_is_not_utf8_is_judged_by_the_rule_that_names_its_directory(
+    ctx, tmp_repo, monkeypatch
+):
+    raw = str(tmp_repo).encode() + b"/secrets/caf\xe9.txt"
+    _ripgrep_reports(monkeypatch, _hit(_bytes_of(raw), {"text": "needle launch code\n"}))
+    outcome = await GrepTool().run(
+        _deny_reading(ctx, "Read(secrets/**)"), "t1", {"pattern": "needle"}
+    )
+    assert "launch code" not in outcome.content and "No matches" in outcome.content
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not on PATH")
+@pytest.mark.parametrize(
+    ("char", "shown"),
+    [
+        pytest.param("\u2028", "\u2028", id="u2028"),
+        pytest.param("\u2029", "\u2029", id="u2029"),
+        # A C1 control is taken out of what every tool returns, so the line shows without it.
+        pytest.param("\x85", "", id="u0085"),
+    ],
+)
+async def test_a_line_with_a_break_only_splitlines_knows_is_shown_not_a_crash(
+    ctx, tmp_repo, monkeypatch, char, shown
+):
+    """ripgrep writes these characters into its JSON as they are, and the call used to end in
+    a ``JSONDecodeError`` that nothing caught, as an internal error."""
+    (tmp_repo / "a.txt").write_text(
+        f"above{char}line\nneedle{char}here\nbelow{char}line\n", encoding="utf-8"
+    )
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle", "-C": 1})
+    assert not outcome.is_error, outcome.content
+    assert f"a.txt:2:needle{shown}here" in outcome.content, outcome.content
+    assert f"a.txt-1-above{shown}line" in outcome.content, outcome.content
+    assert f"a.txt-3-below{shown}line" in outcome.content, outcome.content
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="ripgrep not on PATH")
+async def test_a_line_that_is_not_utf8_is_shown_by_both_backends(ctx, tmp_repo, monkeypatch):
+    (tmp_repo / "latin.txt").write_bytes(b"caf\xe9 needle\n")
+    for force in (False, True):
+        _maybe_force_python_fallback(monkeypatch, force)
+        outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle"})
+        assert "latin.txt:1:caf\ufffd needle" in outcome.content, (force, outcome.content)
+
+
+# ---- Grep never shows a line of a private key block, a match or the context around one
+
+
+def _key_file(root: Path, name: str = "deploy.txt", *, before: int = 3, body: int = 6) -> list[str]:
+    from tests.keys import pem
+
+    block, rows = pem(lines=body)
+    head = [f"head {i}" for i in range(1, before + 1)]
+    (root / name).write_text("\n".join([*head, *block, "tail 1", "tail 2"]) + "\n")
+    return rows
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_search_for_a_piece_of_the_key_does_not_show_the_line_it_is_in(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    rows = _key_file(tmp_repo)
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": re.escape(rows[2][8:30])})
+    assert not outcome.is_error and "1 match(es)" in outcome.content, outcome.content
+    assert rows[2][8:30] not in outcome.content, outcome.content
+    assert "deploy.txt:7:[redacted:private-key]" in outcome.content, outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+@pytest.mark.parametrize("flag", ["-A", "-B", "-C"])
+async def test_context_lines_from_inside_a_key_are_masked_too(
+    ctx, tmp_repo, monkeypatch, force_python_fallback, flag
+):
+    """A match just outside the block, with context reaching into it."""
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    rows = _key_file(tmp_repo)
+    pattern = "head 3" if flag in ("-A", "-C") else "tail 1"
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": pattern, flag: 4})
+    assert not any(row in outcome.content for row in rows), outcome.content
+    assert "BEGIN" not in outcome.content and "END RSA" not in outcome.content, outcome.content
+    assert "[redacted:private-key]" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_match_on_the_begin_line_is_masked_and_one_after_the_end_is_not(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    _key_file(tmp_repo)
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "BEGIN RSA|tail"})
+    assert "BEGIN" not in outcome.content, outcome.content
+    assert "deploy.txt:4:[redacted:private-key]" in outcome.content
+    assert "deploy.txt:12:tail 1" in outcome.content and "deploy.txt:13:tail 2" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_file_with_no_key_in_it_is_searched_as_before(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    (tmp_repo / "plain.txt").write_text("alpha\nbeta\ngamma\n")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "beta", "-C": 1})
+    assert "plain.txt-1-alpha" in outcome.content and "plain.txt:2:beta" in outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_a_key_after_a_line_break_ripgrep_does_not_count_is_masked_on_both_backends(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    """The fallback numbers lines by ``str.splitlines`` and ripgrep by ``\\n``: a form feed
+    before the key shifts one by a line, and neither may be left showing a line of it."""
+    from tests.keys import pem
+
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    block, rows = pem(lines=4)
+    (tmp_repo / "odd.txt").write_text("a\x0cb\n" + "\n".join(block) + "\nz\n", newline="")
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": re.escape(rows[1][5:25]), "-C": 1})
+    assert not any(row in outcome.content for row in rows), outcome.content
+
+
+@pytest.mark.parametrize("force_python_fallback", FORCE_PYTHON_FALLBACK)
+async def test_with_redaction_switched_off_grep_shows_the_line(
+    ctx, tmp_repo, monkeypatch, force_python_fallback
+):
+    _maybe_force_python_fallback(monkeypatch, force_python_fallback)
+    rows = _key_file(tmp_repo)
+    plain = replace(ctx, redactor=Redactor(enabled=False))
+    outcome = await GrepTool().run(plain, "t1", {"pattern": re.escape(rows[2][8:30])})
+    assert rows[2][8:30] in outcome.content
+
+
+async def test_the_other_modes_do_not_read_the_files_for_keys(ctx, tmp_repo, monkeypatch):
+    """They show no lines, so there is nothing to mask and nothing to read."""
+
+    def must_not_run(*_args: object, **_kwargs: object) -> frozenset[int]:
+        raise AssertionError("a file was read for a mask in a mode that shows no lines")
+
+    monkeypatch.setattr("nanoclaude.tools.grep.masked_line_numbers", must_not_run)
+    rows = _key_file(tmp_repo)
+    for mode in ("files", "count"):
+        outcome = await GrepTool().run(
+            ctx, "t1", {"pattern": re.escape(rows[2][8:30]), "output_mode": mode}
+        )
+        assert not outcome.is_error and "deploy.txt" in outcome.content
+
+
+async def test_the_other_modes_show_no_lines_and_are_untouched(ctx, tmp_repo):
+    rows = _key_file(tmp_repo)
+    for mode in ("files", "count"):
+        outcome = await GrepTool().run(
+            ctx, "t1", {"pattern": re.escape(rows[2][8:30]), "output_mode": mode}
+        )
+        assert "deploy.txt" in outcome.content and rows[2][8:30] not in outcome.content
+
+
+async def test_a_file_that_cannot_be_read_for_the_mask_has_its_lines_masked_not_shown(
+    ctx, tmp_repo, monkeypatch
+):
+    """Fail closed: a file that was searched a moment ago and cannot be opened now."""
+    (tmp_repo / "gone.txt").write_text("needle one\n")
+    monkeypatch.setattr(
+        "nanoclaude.tools.grep.search",
+        lambda *_a, **_k: [Match(str(tmp_repo / "vanished.txt"), 1, "needle visible")],
+    )
+    outcome = await GrepTool().run(ctx, "t1", {"pattern": "needle"})
+    assert "needle visible" not in outcome.content
+    assert "vanished.txt:1:[redacted:private-key]" in outcome.content
 
 
 async def test_a_deny_rule_for_another_tool_does_not_hide_files_from_grep(ctx, tmp_repo):

@@ -367,6 +367,8 @@ class Session:
             self.root,
             cwd=self.root,
             home=self.home,
+            policy=self.policy,
+            redactor=self.redactor,
             tool_protocol=None if native else render_tools(specs),
             tools=[tool.name for tool in self.registry],
         )

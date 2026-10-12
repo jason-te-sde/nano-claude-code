@@ -24,7 +24,7 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 
 from nanoclaude.permissions.danger import DangerLevel, DangerVerdict
-from nanoclaude.permissions.rules import RuleSet, glob_matches_any
+from nanoclaude.permissions.rules import RuleSet, fold_spelling, glob_matches_any
 from nanoclaude.permissions.sandbox import Sandbox, is_within
 
 #: Tools that cannot change anything, and so never need confirming on their own.
@@ -41,26 +41,43 @@ ALLOWED_WITHOUT_ASKING = READ_ONLY_TOOLS | {"TodoWrite"}
 EDIT_TOOLS = frozenset({"Edit", "Write"})
 
 #: Directories whose files make git or ncc run something, or change how they behave: git
-#: runs what ``.git/config`` and ``.git/hooks`` name (the next ``git status`` the context
-#: assembly makes, or the next commit the person makes), and ncc reads its own
+#: runs what ``.git/config`` and ``.git/hooks`` name (a hook at the next commit the person
+#: makes, ``core.fsmonitor`` at the next ``git status`` they run), and ncc reads its own
 #: configuration, its capability cache and its session store from ``.nanoclaude``. A write
 #: to one is a way for a tool call to run code that no confirmation described, so it is
-#: refused whatever the mode. Names are compared without regard to case, since the
-#: filesystems people use most (macOS's default among them) treat ``.GIT`` as ``.git``;
-#: that errs towards refusing, which is the safe side for a refusal.
+#: refused whatever the mode. They are looked for in the part of a path inside a sandbox root
+#: (see :func:`protected_directory`). Names are compared whole, after ``fold_spelling``
+#: (rules.py) on both sides, since the filesystems people use most (macOS's default among
+#: them) treat ``.GIT`` as ``.git``; folding only adds spellings that are refused, which is
+#: the safe side for a refusal.
 PROTECTED_DIRECTORIES = (".git", ".nanoclaude")
 
 
-def protected_directory(path: str) -> str | None:
-    """The protected directory ``path`` is inside, or is, or None.
+def protected_directory(path: str, sandbox: Sandbox) -> str | None:
+    """The protected directory ``path`` is inside, or is, within a sandbox root, or None.
+
+    The names are looked for in the part of the path *inside* a root, not in the whole of
+    it: a project that lives under a directory called ``.git`` or ``.nanoclaude`` (a clone
+    kept in ``~/.nanoclaude/projects/app``, say) is not thereby a place nothing may be
+    written, while its own ``.git/`` is. A path is judged against every root that holds it,
+    and one of them seeing a protected name is enough, so that a root added inside another
+    (``--add-dir``) cannot be a way to write what the outer one protects.
 
     A ``.git`` that is a file (a worktree's or a submodule's pointer to its repository)
     counts: rewriting it points git somewhere else. Components are compared whole, so
     ``.github`` and ``.gitignore`` are nothing to do with it.
     """
-    for part in PurePosixPath(path).parts:
-        if part.casefold() in PROTECTED_DIRECTORIES:
-            return part.casefold()
+    # Both sides folded: a name that does not fold to itself (a capital, a sharp s) is looked
+    # for in the folded component, and not compared with its own spelling, which the folded
+    # component can never be equal to.
+    by_folded_name = {fold_spelling(name): name for name in PROTECTED_DIRECTORIES}
+    for root in sandbox.roots:
+        if not is_within(root, path):
+            continue
+        for part in PurePosixPath(path).relative_to(root).parts:
+            name = by_folded_name.get(fold_spelling(part))
+            if name is not None:
+                return name
     return None
 
 
@@ -256,7 +273,7 @@ def evaluate(
     # 2. secret.path
     if not policy.allow_secrets:
         for path in request.resolved_paths:
-            if glob_matches_any(policy.secret_paths, (path, policy.relative(path))):
+            if glob_matches_any(policy.secret_paths, (path, policy.relative(path)), fold=True):
                 return PermissionResult(
                     Decision.DENY,
                     "secret.path",
@@ -299,7 +316,7 @@ def evaluate(
     # 3b. sandbox.protected-path -- not in spec 17.4's table; see the module docstring.
     if request.is_write:
         for path in request.resolved_paths:
-            protected = protected_directory(path)
+            protected = protected_directory(path, policy.sandbox)
             if protected is not None:
                 return PermissionResult(
                     Decision.DENY,

@@ -36,7 +36,12 @@ from prompt_toolkit.input.typeahead import clear_typeahead
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from prompt_toolkit.output import Output
 
-from nanoclaude.private import create_private_file, make_private_directories
+from nanoclaude.private import (
+    create_private_file,
+    make_private_directories,
+    narrow_directory,
+    narrow_file,
+)
 
 #: The environment variable that picks vi keys: ``vi`` (or ``vim``), anything else is emacs.
 EDITING_MODE_VARIABLE = "NANOCLAUDE_EDITING_MODE"
@@ -301,6 +306,9 @@ def build_prompt_session(
         # made here, private, and it only ever appends to a file that is already there.
         make_private_directories(Path(history_path).parent)
         create_private_file(Path(history_path))
+        # A history an earlier version made with the default mode is as open as it was.
+        narrow_directory(Path(history_path).parent)
+        narrow_file(Path(history_path))
         history = FileHistory(history_path)
     else:
         history = InMemoryHistory()

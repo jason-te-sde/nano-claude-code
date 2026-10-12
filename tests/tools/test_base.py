@@ -1,3 +1,4 @@
+import os
 from collections.abc import Hashable
 from pathlib import Path
 
@@ -131,3 +132,14 @@ def test_tool_context_is_declared_unhashable(ctx):
 def test_optional_int_refuses_a_value_that_is_not_an_integer(value):
     with pytest.raises(ToolArgumentError, match="offset must be an integer, got"):
         optional_int({"offset": value}, "offset", 1, minimum=1)
+
+
+def test_a_name_with_bytes_that_are_not_text_is_displayed_in_a_form_that_can_be_sent(ctx, tmp_repo):
+    """A name the system decoded with lone surrogates cannot be encoded as UTF-8."""
+    shown = ctx.display(os.fsdecode(str(tmp_repo).encode() + b"/sub/caf\xe9.txt"))
+    assert shown == "sub/caf\ufffd.txt"
+    shown.encode("utf-8")
+
+
+def test_a_name_that_is_text_is_displayed_as_it_is(ctx, tmp_repo):
+    assert ctx.display(str(tmp_repo / "caf\u00e9.txt")) == "caf\u00e9.txt"

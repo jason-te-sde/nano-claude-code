@@ -11,11 +11,22 @@ paths the caller already cleared, so a broad search can surface a file the
 caller never named -- an un-ignored ``.env`` sitting next to code, say. That
 file is covered by the policy's refusal to read it, which the executor enforces
 before a call that *names* it, but a path discovered mid-walk never goes through
-that check. Matches are filtered against the same verdict here, after the
-backend returns, so it applies regardless of which backend ran: a credentials
-path, a path outside the sandbox, and any file a ``Read(...)`` deny rule covers.
-A path is judged by its own spelling and by what it resolves to, so a link
-cannot carry a file past the verdict that its target would not get.
+that check. So Grep asks the same verdict itself of every file a search comes
+upon: a credentials path, a path outside the sandbox, and any file a ``Read(...)``
+deny rule covers. The backends are given the verdict and apply it as they go,
+before ``head_limit`` is counted (a refused file's matches would otherwise use up
+a limit that the files that are shown should have filled, and the fallback does
+not so much as open it), and Grep applies it again to whatever a backend
+returns, so that it does not depend on the backend having done so. A path is
+judged by its own spelling and by what it resolves to, so a link cannot carry a
+file past the verdict that its target would not get.
+
+What is shown of the files that pass has the lines that are inside a private key
+block masked, matches and context alike, in ``content`` mode, the only one that
+shows lines. Whether a line is inside a block is a fact about the whole file (see
+``tools/keyblocks.py``), which no scrub of the lines shown can know, so it is worked
+out after the limit, for the files that have lines to show. What is left is then
+scrubbed like the output of every tool.
 """
 
 from __future__ import annotations
@@ -23,12 +34,14 @@ from __future__ import annotations
 import os
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from nanoclaude.permissions.policy import PermissionRequest, read_refusal
 from nanoclaude.providers.base import ToolSpec
 from nanoclaude.tools.base import ToolContext, ToolOutcome, failed, ok, optional_int, require_str
+from nanoclaude.tools.keyblocks import PRIVATE_KEY_MARKER, masked_line_numbers
 from nanoclaude.tools.search import Match, search
 
 DESCRIPTION = """Search file contents with a regular expression.
@@ -89,7 +102,11 @@ class GrepTool:
             re.compile(pattern)
         except re.error as exc:
             return failed(call_id, f"{pattern!r} is not a valid regular expression: {exc}")
+        readable = self._readability(ctx)
         try:
+            # The backends are told which paths to leave out, so that they leave them out
+            # before the limit is applied: a refused file with a great many matches must not
+            # use up a limit that the files that are shown would have filled.
             matches = search(
                 pattern,
                 root=root,
@@ -98,14 +115,20 @@ class GrepTool:
                 limit=limit,
                 before=before,
                 after=after,
+                keep=readable,
             )
         except RuntimeError as exc:
             return failed(call_id, f"search failed: {exc}")
 
-        matches = self._drop_unreadable(ctx, matches)
+        # And again here, on whatever a backend reported anyway: the verdict is not left to
+        # the backend having honoured the question.
+        matches = [m for m in matches if readable(m.path)]
 
         if not matches:
             return ok(call_id, f"No matches for {pattern}")
+
+        if mode == "content":
+            matches = self._mask_private_keys(ctx, matches)
 
         match_count = sum(1 for m in matches if not m.is_context)
         if mode == "files":
@@ -160,8 +183,31 @@ class GrepTool:
         return "\n".join(lines)
 
     @staticmethod
-    def _drop_unreadable(ctx: ToolContext, matches: list[Match]) -> list[Match]:
-        """Keep only matches in files the policy would let Read show the model.
+    def _mask_private_keys(ctx: ToolContext, matches: list[Match]) -> list[Match]:
+        """Replace the text of every shown line that is inside a private key block.
+
+        Matches and context lines alike. Whether a line is inside a block is a fact about the
+        whole file, which no scrub of the lines shown can know: a search for a piece of a key's
+        body shows a line of base64 that is not recognisable as anything. It is worked out only
+        for the files that have lines to show, after the limit has been applied, reading each
+        as a stream as far as the last line shown from it.
+        """
+        last: dict[str, int] = {}
+        for match in matches:
+            last[match.path] = max(last.get(match.path, 0), match.line_no)
+        masked = {
+            path: masked_line_numbers(ctx.redactor, path, upto=upto) for path, upto in last.items()
+        }
+        return [
+            replace(match, line=PRIVATE_KEY_MARKER)
+            if match.line_no in masked[match.path]
+            else match
+            for match in matches
+        ]
+
+    @staticmethod
+    def _readability(ctx: ToolContext) -> Callable[[str], bool]:
+        """Whether the policy would let Read show the model this file; a path is asked once.
 
         Requirement (added 2026-10-01, task-14-brief.md): a credentials-shaped file
         discovered while walking the tree must not have its contents surfaced, on
@@ -177,8 +223,15 @@ class GrepTool:
             if path not in verdicts:
                 # Both spellings, so that neither a link named like a harmless file to a
                 # credentials file, nor one named like a credentials file to a harmless
-                # one, gets past.
-                verdicts[path] = read_refusal(ctx.policy, path, os.path.realpath(path)) is None
+                # one, gets past. Nearly every file a search walks resolves to itself, has the
+                # one spelling, and is judged once: a second question with the same answer
+                # was half the cost of the walk. What is resolved is every path, not only
+                # a link: a backend may be led through a directory link (ripgrep is, when its
+                # configuration says --follow), and the file at the end of one is not itself
+                # a link, so asking only about links would let it past the sandbox.
+                resolved = os.path.realpath(path)
+                spellings = (path,) if resolved == path else (path, resolved)
+                verdicts[path] = read_refusal(ctx.policy, *spellings) is None
             return verdicts[path]
 
-        return [m for m in matches if readable(m.path)]
+        return readable
