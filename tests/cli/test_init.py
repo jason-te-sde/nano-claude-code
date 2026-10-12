@@ -53,6 +53,7 @@ from nanoclaude.cli.main import EXIT_CODES, main, nanoclaude_home
 from nanoclaude.config.load import ConfigError, load_config
 from nanoclaude.config.schema import ROLES, Config, PermissionsConfig
 from nanoclaude.conversation.transcript import Transcript, user_text
+from nanoclaude.permissions.rules import KNOWN_TOOLS
 from nanoclaude.providers.base import ModelRequest
 from nanoclaude.providers.capabilities import (
     CONSERVATIVE_DEFAULT,
@@ -61,6 +62,7 @@ from nanoclaude.providers.capabilities import (
 )
 from nanoclaude.providers.openai_compat import OpenAICompatClient
 from nanoclaude.testing.scripted import says
+from nanoclaude.tools.registry import default_registry
 from tests.cli.helpers import INTERRUPTED, colour_codes, plain_console, run_ncc
 
 
@@ -271,6 +273,22 @@ def test_the_generated_config_does_not_present_a_shell_tool_as_available():
     assert about_a_shell
     for sentence in about_a_shell:
         assert "reserved" in sentence and "does not have" in sentence, sentence
+
+
+def test_the_permissions_part_says_that_the_tools_it_names_and_this_version_lacks_are_reserved():
+    # The ask list is the program's own default and names Bash and Git, which a rule may name
+    # so that one written today keeps working. Neither is a tool in this version, and a person
+    # who reads the list and nothing more would take them for tools they have. What is reserved
+    # is what rules accept and the registry lacks, so the day a tool arrives this fails until
+    # the comment is changed.
+    reserved = set(KNOWN_TOOLS) - {tool.name for tool in default_registry()}
+    lines = render_config(PRESETS["anthropic"], "a", "m").splitlines()
+    part = lines[lines.index("[permissions]") + 1 :]
+    part = part[: part.index("")]
+    comment = " ".join(line.lstrip("# ") for line in part if line.startswith("#"))
+    assert "reserved" in comment and "does not have" in comment, comment
+    assert all(f"`{name}`" in comment for name in reserved), (reserved, comment)
+    assert not any(f"`{name}`" in comment for name in set(KNOWN_TOOLS) - reserved), comment
 
 
 def test_the_rendered_config_names_the_variable_and_never_holds_a_key():

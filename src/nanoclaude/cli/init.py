@@ -146,6 +146,7 @@ model       = {_toml_string(model)}
 # What ncc may do without asking, what it asks about, and what it never does.
 [permissions]
 allow = {_list(permissions.allow)}
+# `Bash` and `Git` are reserved for tools this version does not have.
 ask   = {_list(permissions.ask)}
 deny  = ["Read(**/.env*)"]
 
