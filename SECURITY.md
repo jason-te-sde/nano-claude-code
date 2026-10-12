@@ -164,10 +164,12 @@ your shell profile is as safe as that file.
 - **Your instruction file.** `~/.nanoclaude/NANO.md` is yours, and no `deny` rule, a
   project's included, applies to it unless the sandbox contains `~/.nanoclaude`. It is still
   scrubbed, cut at 32,000 bytes and skipped if it links out of `~/.nanoclaude`.
-- **Files you made.** `ncc` creates what it keeps under its home readable by you alone
-  (`sessions.db` and its write-ahead files, the history, the capability cache, and the
-  `config.toml` that `ncc init` writes) and narrows the same files if an earlier version left
-  them open. It does not change a `config.toml` you wrote by hand.
+- **Files `ncc` keeps private.** `ncc` creates the `.nanoclaude` directory, `sessions.db` and
+  its write-ahead files, the history and the capability cache readable by you alone, and
+  narrows them if an earlier version left them open. `ncc init` creates the `config.toml` it
+  writes private too. An existing `config.toml`, whoever wrote it, is never changed. It holds
+  no key (a model entry names the environment variable that holds its key, and an `api_key` in
+  a file is refused), so one left open to other users shows them your settings and no secret.
 - **A rule's glob and the leading slash.** A rule's glob is also matched against the absolute
   path without its leading slash, so a rule written for a directory of the project can match
   a directory at the top of the file system: `Read(private/**)` also refuses files under

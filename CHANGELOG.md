@@ -51,9 +51,10 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
 - Instruction files layered from the top level of the repository down to the project root, each
   contained in its boundary, checked as a `Read` of it would be, scrubbed and cut at 32,000 bytes,
   with 64,000 bytes for the chain, shared nearest the project root first.
-- What `ncc` keeps under its home made readable by you alone from the moment it exists, and an
-  older file narrowed when it is opened. `ncc` run in `/`, in a home directory or in a directory
-  that holds one is refused unless `--root` names it.
+- What `ncc` creates under its home made readable by you alone from the moment it exists, a
+  session store, history or capability cache that an older version left open narrowed when it
+  is opened, and a `config.toml` that is there never changed. `ncc` run in `/`, in a home
+  directory or in a directory that holds one is refused unless `--root` names it.
 - Configuration in two files, with the project's file treated as untrusted: it may add `deny`
   and `ask` rules and choose models, and may not add `allow` rules, name a `base_url` or an
   `api_key_env`, re-point one of your models or raise the turn, timeout and output limits.

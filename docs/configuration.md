@@ -18,7 +18,7 @@ Every TOML example in this document is loaded by the real configuration loader i
 
 `NANOCLAUDE_HOME` moves the home. Set it to a directory and `ncc` keeps `.nanoclaude` inside that directory instead of inside your home directory: the configuration, the session store, the history, the capability cache and the global `NANO.md` all move together. It may start with `~`.
 
-What `ncc` creates under `.nanoclaude` is readable by you alone from the moment it exists: the directory is mode 0700, and `sessions.db` with its write-ahead files, `history`, `capabilities.json` and the `config.toml` that `ncc init` writes are 0600. When it opens them, `ncc` narrows the same files if an earlier version left them open to others. A `config.toml` you wrote yourself keeps the mode you gave it.
+What `ncc` creates under `.nanoclaude` is readable by you alone from the moment it exists: the directory is mode 0700, and `sessions.db` with its write-ahead files, `history`, `capabilities.json` and the `config.toml` that `ncc init` writes are 0600. When it opens them, `ncc` narrows the directory, `sessions.db` and its write-ahead files, `history` and `capabilities.json` if an earlier version left them open to others. An existing `config.toml`, whoever wrote it, is never changed. It holds no key (a model entry names the environment variable that holds its key, and an `api_key` in a file is refused), so leaving it as it is exposes no secret.
 
 A key is never read from a file. A model entry names the environment variable that holds its key, and an `api_key` in a file is refused with a message saying so.
 
