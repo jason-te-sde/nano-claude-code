@@ -65,7 +65,7 @@ compact = "cheap"
 
 The idea is that reading a codebase to work out what to change is much of the tokens in a session and little of its difficulty, so `explore` is the role meant for a cheap or a local model while `main`, which writes the change, stays strong. A role you leave out follows `main`. `--model <alias>` replaces `main` for one run, and `--role <role>=<alias>` replaces one role.
 
-**Today two roles are used.** `main` answers the conversation, and `compact` writes the summary when a long conversation is compacted; that request carries the whole older history, so a cheap model there already saves money. `explore`, `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request yet: routing them is v0.3 scope, with sub-agents. Neither that premise nor what routing exploration to a cheap model would save, or cost in the quality of what comes back, has been measured. `/cost` shows what each role spent.
+**Today two roles are used.** `main` answers the conversation, and `compact` writes the summary when a long conversation is compacted; that request carries the whole older history, so a cheap model there already saves money. `explore`, `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request yet: routing them is v0.3 scope, with sub-agents. Neither that premise nor what routing exploration to a cheap model would save, or cost in the quality of what comes back, has been measured. `/cost` shows what each role spent. A session does check, when it starts, that the key of every role's model is set, those four included, and names the first role whose key is not.
 
 ## Safety
 
@@ -76,7 +76,9 @@ The idea is that reading a codebase to work out what to change is much of the to
 | `accept-edits` | `Edit` and `Write` apply without asking |
 | `bypass` | Nothing asks. Needs `--dangerously-skip-permissions`, and prints a warning |
 
-`bypass` skips the question and not the protections. The sandbox, the credentials rule, the dangerous-command rule and your own `deny` rules are checked first, in every mode, and nothing gets past them.
+`bypass` skips the question and not the protections. The sandbox, the rule for `.git` and `.nanoclaude` directories, the credentials rule, the dangerous-command rule and your own `deny` rules are checked first, in every mode, and nothing gets past them.
+
+With `-p` nothing can answer a question, so every call that would have asked is declined, and each is one line on stderr that names the rule that asked. A call the policy refuses outright gets no such line: the model receives the refusal, with its rule id, as the tool's result.
 
 | Tool | Runs without asking in `default` mode |
 | --- | --- |
@@ -91,11 +93,15 @@ The idea is that reading a codebase to work out what to change is much of the to
 
 | Defence | State |
 | --- | --- |
-| The sandbox: a path is judged by where it resolves to, and a write through a symlink that leaves the project is refused; `--add-dir` adds a root | Built |
-| Credentials: paths such as `.env`, `*.pem` and SSH keys are refused, and what looks like a key is scrubbed from what tools return, before it is stored | Built, with gaps listed in [`SECURITY.md`](SECURITY.md) |
-| Your own `deny`, `ask` and `allow` rules, with `deny` always winning | Built |
-| A record of every call, written before the call runs, in `~/.nanoclaude/sessions.db` | Built; nothing reads it back yet |
-| Classifying a shell command as dangerous | **Not measured yet.** The regex classifier is written and has known blind spots, each checked by a test, and there is no corpus of dangerous commands to say how many it misses (`tests/corpus/dangerous.jsonl` does not exist), so there is no figure. The syntax-tree classifier, an optional extra meant to be the authority, is not built, and nothing calls either until `Bash` exists. A command the regex classifier finds nothing in is not treated as cleared. |
+| The sandbox: a path is judged by where it resolves to, a write through a symlink that leaves the project is refused, and no search, listing or `@` mention follows a symlink out; `--add-dir` adds a root | Built |
+| Protected paths: a write into `.git` or a `.nanoclaude` directory is refused in every mode, since git and `ncc` run or obey what is kept there | Built |
+| Credentials: paths such as `.env`, `*.pem`, SSH keys and `.aws/` are refused, whatever their case, and a private-key block is masked whole wherever a file is shown; other keys and tokens are scrubbed from what tools return, before it is stored | Built, with gaps listed in [`SECURITY.md`](SECURITY.md) |
+| Your own `deny`, `ask` and `allow` rules, with `deny` always winning, and `deny` holding for `Grep`, `@` mentions and the project map as it does for `Read`. A rule that names a tool there is not is refused when the file loads | Built |
+| Instruction files: `NANO.md` and `CLAUDE.md` from the top of the repository down to the project root go into the prompt only if their real path stays inside the repository and a `Read` of them would be allowed, scrubbed and capped | Built |
+| A repository cannot make `ncc` run a program through git: git runs only as `git rev-parse`, which never reads the working tree | Built |
+| A record of every call, written before the call runs, in `~/.nanoclaude/sessions.db`; rows are only added, and an outcome is set once | Built; nothing reads it back yet |
+| What `ncc` keeps under `~/.nanoclaude` is readable by you alone, and `ncc` run in `/` or in a home directory is refused unless `--root` says it was meant | Built |
+| Classifying a shell command as dangerous | **Not measured yet.** The regex classifier is written and has known blind spots, each checked by a test, and there is no corpus of dangerous commands to say how many it misses (`tests/corpus/dangerous.jsonl` does not exist), so there is no figure. The syntax-tree classifier, meant to be the authority and to be installed as an optional extra, is not built, and nothing calls either until `Bash` exists. A command the regex classifier finds nothing in is not treated as cleared. |
 | Undoing an edit | Not built. A write is confirmed first, and `git` is how you undo one. |
 
 ## Configuration
