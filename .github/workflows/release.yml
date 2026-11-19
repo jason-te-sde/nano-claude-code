@@ -1,0 +1,58 @@
+# .github/workflows/release.yml
+#
+# Publishes a release to PyPI when a v* tag is pushed. It runs the CI suite on the tagged
+# commit, builds the sdist and the wheel once, checks them, and uploads them through PyPI's
+# trusted publishing: there is no API token anywhere, and only this workflow, in the `pypi`
+# environment, can publish. The one-time setup on PyPI and GitHub is in RELEASING.md.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with: { python-version: "3.13" }
+      - name: The tag names the version in pyproject.toml
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version $version in pyproject.toml"
+            exit 1
+          fi
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+      # The same wheel that will be uploaded, installed outside the checkout.
+      - name: The wheel installs and runs
+        run: |
+          python -m venv "$RUNNER_TEMP/release-check"
+          "$RUNNER_TEMP/release-check/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/release-check/bin/ncc" --version
+      - uses: actions/upload-artifact@v7
+        with: { name: dist, path: dist/, if-no-files-found: error }
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/p/nano-claude-code
+    permissions:
+      id-token: write   # trusted publishing; nothing else
+    steps:
+      - uses: actions/download-artifact@v8
+        with: { name: dist, path: dist/ }
+      - uses: pypa/gh-action-pypi-publish@v1.14.3
