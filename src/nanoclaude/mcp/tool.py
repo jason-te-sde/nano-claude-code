@@ -13,12 +13,18 @@ is left out with a warning, never registered quietly changed:
 * **Its description** has terminal controls removed (tab and newline are kept) before
   anything else, and is cut to 2,048 bytes on a character boundary, with a marker.
 * **Its input schema** is an object schema, at most 64 KiB serialized and 32 levels deep, with no
-  ``$ref`` that leaves the schema: a reference is never followed, and one that is not
-  local is refused outright.
+  ``$ref`` (or ``$dynamicRef``) that leaves the schema: a reference is never followed, and one
+  that is not local is refused outright. Every string in it is cleaned of terminal controls,
+  since the model reads all of them; a *key* with a control character in it is a reason to
+  drop the tool, because renaming a property would make the arguments the model writes not
+  the ones the server reads.
 * **Its fingerprint**, a hash of the two as the model is given them, is compared with the pin
-  from an earlier session (:mod:`nanoclaude.mcp.pins`). A tool whose definition is not what it was
-  is *changed* for the rest of the session: the policy asks before every call to it, in
-  every mode, and answering "always" renews the pin for the next session.
+  from an earlier session (:mod:`nanoclaude.mcp.pins`). Pins are kept under the registry
+  name, the one identity that a rule and a grant match, and not under the name the server
+  used: a definition changed between two spellings of one registry name is a changed tool.
+  A tool whose definition is not what it was is *changed* for the rest of the session: the
+  policy asks before every call to it, in every mode, and answering "always" renews the pin
+  for the next session.
 
 :func:`adapt_tools` does this for one server's tools, from a connected client, and is what a
 session calls at start; :func:`combine_tools` puts several servers' results together. A
@@ -35,8 +41,17 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from nanoclaude.config.schema import McpServerConfig
-from nanoclaude.mcp.client import CallResult, McpError, McpRequestError, RemoteTool
-from nanoclaude.mcp.pins import PinStore, PinStoreError, fingerprint
+from nanoclaude.mcp.client import (
+    CallResult,
+    McpConnectionError,
+    McpError,
+    McpProtocolError,
+    McpRequestError,
+    McpTimeoutError,
+    McpUnsupportedInteractionError,
+    RemoteTool,
+)
+from nanoclaude.mcp.pins import MAX_PINS_PER_SERVER, PinStore, PinStoreError, fingerprint
 from nanoclaude.mcp.result import result_text, wrap_result
 from nanoclaude.permissions.policy import PermissionRequest
 from nanoclaude.permissions.rules import is_mcp_tool_name
@@ -64,8 +79,9 @@ MAX_SCHEMA_DEPTH = 32
 #: The longest a registry name may be: the limit of the providers' tool names.
 MAX_REGISTRY_NAME_CHARS = 64
 
-#: The keys whose text in a schema is something the model reads as a description.
-_DESCRIPTIVE_KEYS = frozenset({"description", "title"})
+#: The keys of a schema that point at another schema. One whose value is not text beginning
+#: with ``#`` is a reference that leaves the schema.
+_REFERENCE_KEYS = frozenset({"$ref", "$dynamicRef", "$recursiveRef"})
 
 _NOT_A_NAME_CHARACTER = re.compile(r"[^A-Za-z0-9_]")
 
@@ -111,6 +127,11 @@ def clean_description(text: str) -> str:
     return kept + TRUNCATED if cut else kept
 
 
+def _is_unclean(text: str) -> bool:
+    """Whether ``text`` has a terminal control, an escape sequence or a lone surrogate in it."""
+    return without_lone_surrogates(sanitize(text)) != text
+
+
 def _shown(text: object) -> str:
     """A server's text as one short line for a warning: controls removed, cut, quoted."""
     line = " ".join(without_lone_surrogates(sanitize(str(text))).split())
@@ -132,10 +153,11 @@ def schema_problem(schema: object) -> str | None:
 
     It must be an object whose ``type`` is ``"object"``, at most :data:`MAX_SCHEMA_DEPTH`
     levels deep (a list is a level, as an object is), at most :data:`MAX_SCHEMA_BYTES`
-    serialized, and hold no ``$ref`` whose value is not text beginning with ``#``: the
-    specification forbids a client to fetch what a reference names, and a reference that
-    cannot be local has no use here. The answer is a clause that starts with "its input
-    schema", for a warning.
+    serialized, hold no ``$ref`` (nor ``$dynamicRef``, nor ``$recursiveRef``) whose value is
+    not text beginning with ``#``, and no key with a terminal control in it. The specification
+    forbids a client to fetch what a reference names, and a reference that cannot be local has
+    no use here; a key cannot be cleaned, since renaming it would change the arguments. The
+    answer is a clause that starts with "its input schema", for a warning.
 
     The walk keeps its own stack and does not recurse, so that a schema nested a thousand
     levels deep is a problem to report and not a crash.
@@ -153,9 +175,16 @@ def schema_problem(schema: object) -> str | None:
             return f"its input schema is nested more than {MAX_SCHEMA_DEPTH} levels deep"
         if isinstance(node, dict):
             for key, value in node.items():
-                if key == "$ref" and not (isinstance(value, str) and value.startswith("#")):
+                if _is_unclean(key):
                     return (
-                        f"its input schema has a $ref that does not point inside the schema "
+                        "its input schema has a key with a control character in it "
+                        f"({_shown(key)}), which cannot be cleaned without renaming it"
+                    )
+                if key in _REFERENCE_KEYS and not (
+                    isinstance(value, str) and value.startswith("#")
+                ):
+                    return (
+                        f"its input schema has a {key} that does not point inside the schema "
                         f"({_shown(value)}), and only references that begin with # are allowed"
                     )
                 stack.append((value, depth + 1))
@@ -172,28 +201,22 @@ def schema_problem(schema: object) -> str | None:
 
 
 def clean_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
-    """A copy of ``schema`` that is fit to give the model: the text of each ``description``
-    and ``title`` has controls removed, and no string anywhere holds a lone surrogate.
+    """A copy of ``schema`` that is fit to give the model: every string value in it, whatever
+    its key (``description``, ``enum``, ``default``, ``examples``, ``pattern``, ``$comment``,
+    an extension's), has terminal controls and ANSI sequences removed and each lone
+    surrogate replaced; tab and newline stay.
 
-    Only for a schema that :func:`schema_problem` passed, whose depth bounds the recursion.
-    A property that is called ``description`` is a schema and not a string, and is left to
-    the recursion.
+    Only for a schema that :func:`schema_problem` passed, whose depth bounds the recursion and
+    whose keys are therefore clean already: a key is not rewritten.
     """
 
     def clean(node: Any) -> Any:
         if isinstance(node, dict):
-            return {
-                without_lone_surrogates(key): (
-                    without_lone_surrogates(sanitize(value))
-                    if key in _DESCRIPTIVE_KEYS and isinstance(value, str)
-                    else clean(value)
-                )
-                for key, value in node.items()
-            }
+            return {key: clean(value) for key, value in node.items()}
         if isinstance(node, list):
             return [clean(item) for item in node]
         if isinstance(node, str):
-            return without_lone_surrogates(node)
+            return without_lone_surrogates(sanitize(node))
         return node
 
     cleaned: dict[str, Any] = clean(schema)
@@ -201,6 +224,26 @@ def clean_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
 
 
 # ---- the tool
+
+
+def _failure_in_words_of_ours(error: McpError, seconds: int) -> str:
+    """What went wrong with a call, for the model, in text that no server chose.
+
+    An exception of the client can hold what the server sent (a result type, the versions it
+    named, a line it wrote), and the model would read it with no wrapper and no cap. So the
+    model is told the kind of failure and nothing of the exception's own message; the one
+    thing a server says on purpose, the message of its own error answer, does not come here:
+    it is wrapped and capped like a result.
+    """
+    if isinstance(error, McpTimeoutError):
+        return f"the server did not answer within {seconds} seconds"
+    if isinstance(error, McpUnsupportedInteractionError):
+        return "the server asked for an interaction (input from the person) that is not supported"
+    if isinstance(error, McpConnectionError):
+        return "the connection to the server is closed or broken"
+    if isinstance(error, McpProtocolError):
+        return "the server did not follow the protocol"
+    return "the call could not be made"
 
 
 class McpTool:
@@ -234,6 +277,9 @@ class McpTool:
         self._pins = pins
         self._cap = output_cap
         self.name = registry_name(server.name, remote_name)
+        #: The tool as the registry names it, without the ``mcp__<server>__``: its key in the
+        #: pins, and the ``tool`` of the wrapper a result is put in.
+        self.short_name = self.name.removeprefix(f"mcp__{server.name}__")
         self.fingerprint = fingerprint(description, schema)
         #: Fixed when the tool is built, for the whole session: renewing the pin by an answer of
         #: "always" is for the next session, and does not make this one any less changed.
@@ -273,7 +319,7 @@ class McpTool:
         """
         if not self.changed:
             return
-        self._pins.record(self._server.name, self._remote_name, self.fingerprint)
+        self._pins.record(self._server.name, self.short_name, self.fingerprint)
         try:
             self._pins.save()
         except (OSError, PinStoreError):
@@ -282,7 +328,7 @@ class McpTool:
     async def run(
         self, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
     ) -> ToolOutcome:
-        server, tool = self._server.name, self.name.removeprefix(f"mcp__{self._server.name}__")
+        server, tool = self._server.name, self.short_name
         try:
             result = await self._client.call_tool(
                 self._remote_name, arguments, timeout=float(self._server.timeout)
@@ -295,8 +341,11 @@ class McpTool:
                 f"The MCP server {server} answered {self.name} with an error:\n{wrapped}",
             )
         except McpError as exc:
-            text, _ = ctx.redactor.scrub(sanitize(f"{self.name} failed: {exc}"))
-            return failed(call_id, text)
+            return failed(
+                call_id,
+                f"{self.name} failed: {_failure_in_words_of_ours(exc, self._server.timeout)}. "
+                "Do not repeat the call unchanged; tell the user what failed.",
+            )
         wrapped = wrap_result(
             server, tool, result_text(result), cap=self._cap, redactor=ctx.redactor
         )
@@ -349,6 +398,7 @@ async def adapt_tools(
             "underscore; none of them is registered"
         )
     accepted: list[McpTool] = []
+    unpinned = 0
     for tool in remote:
         registered = registry_name(name, tool.name)
         if registered in collisions:
@@ -358,7 +408,8 @@ async def adapt_tools(
             warnings.append(f"MCP server '{name}': tool {_shown(tool.name)} is dropped: {reason}")
             continue
         description = clean_description(tool.description or "")
-        pinned = pins.get(name, tool.name)
+        key = registered.removeprefix(f"mcp__{name}__")
+        pinned = pins.get(name, key)
         built = McpTool(
             client,
             server=server,
@@ -369,9 +420,15 @@ async def adapt_tools(
             output_cap=output_cap,
             pinned=pinned,
         )
-        if pinned is None:
-            pins.record(name, tool.name, built.fingerprint)
+        if pinned is None and not pins.record(name, key, built.fingerprint):
+            unpinned += 1
         accepted.append(built)
+    if unpinned:
+        warnings.append(
+            f"MCP server '{name}': {unpinned} of its tools are not pinned, because "
+            f"{MAX_PINS_PER_SERVER} are pinned for it already, so a change to one of them will "
+            f"not be noticed; remove pins of tools it no longer has from {pins.path}"
+        )
     try:
         pins.save()
     except (OSError, PinStoreError) as exc:

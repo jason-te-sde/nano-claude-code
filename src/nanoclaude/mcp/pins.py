@@ -10,30 +10,51 @@ its pin is marked changed, and a changed tool asks before every call (rule ``mcp
 
 The pins are ``{server: {tool: fingerprint}}`` in one file under ncc's home, ``mcp-pins.json``,
 which is private from the moment it exists and is replaced as a whole, so that a write that is
-interrupted leaves the old file. Tools are keyed by the name the server uses, not by the
-name in the registry. A pin is never removed: a tool that goes away and comes back different
-is a changed tool.
+interrupted leaves the old file. A tool is keyed by its registry name without the
+``mcp__<server>__`` (its server being the level above), which is what a rule and a grant match,
+and not by the name the server used: two spellings that come to one registry name are one tool
+to the permissions and so one pin. A pin is never removed: a tool that goes away and comes
+back different is a changed tool, and for that reason a server has at most
+:data:`MAX_PINS_PER_SERVER` of them: past that a new tool is not pinned, and the person is told.
 
 Two sessions can be open at once, each learning a different server. :meth:`PinStore.save`
 therefore reads the file again and puts only its own new pins into what it finds, so that one
-does not erase what the other wrote; two writes at the same instant can still lose one, and
-what is lost is a pin, which makes a tool "first seen" again and not "changed".
+does not erase what the other wrote, and it does the reading, the merging and the writing
+under an exclusive advisory lock (``flock``) on a private file beside the pins, so that two
+saves at the same instant take turns instead of each putting back what it read. A lock that is
+not got in :data:`LOCK_WAIT_SECONDS` is a :class:`PinStoreError`, and the lock is let go with the
+file it is held on, whatever happens to the process.
 """
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
-from collections.abc import Mapping
+import os
+import time
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
-from nanoclaude.private import write_private
+from nanoclaude.private import create_private_file, make_private_directories, write_private
 
 #: The pins' file, inside the directory ncc keeps its state in.
 PINS_FILENAME = "mcp-pins.json"
 
 _STATE_DIRNAME = ".nanoclaude"
+
+#: The most tools one server may have pinned. A server that names its tools differently every
+#: time it starts would otherwise add to the file for as long as it was used.
+MAX_PINS_PER_SERVER = 4096
+
+#: The lock's file is the pins' own name with this after it, in the same private directory.
+LOCK_SUFFIX = ".lock"
+
+#: How long a save waits for another's lock before it gives up, and how often it looks.
+LOCK_WAIT_SECONDS = 5.0
+_LOCK_POLL_SECONDS = 0.01
 
 
 class PinStoreError(Exception):
@@ -61,6 +82,38 @@ def fingerprint(description: str, schema: Mapping[str, Any]) -> str:
         ensure_ascii=True,
     )
     return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+@contextlib.contextmanager
+def _exclusive(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on the file beside ``path`` that is made for it.
+
+    The lock is on a file of its own, never on the pins, which are replaced by a new file
+    each time and would leave a lock on the old one; the lock file is private, is made if it
+    is not there, and is left in place, since removing it would let two processes hold
+    "the" lock on two different files. Closing the descriptor lets go of the lock, which is
+    also what happens if the process dies.
+    """
+    lock = path.with_name(path.name + LOCK_SUFFIX)
+    make_private_directories(lock.parent)
+    create_private_file(lock)
+    descriptor = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise PinStoreError(
+                        f"could not take the lock {lock} in {LOCK_WAIT_SECONDS:g} seconds "
+                        "— another ncc session is saving pins; try again"
+                    ) from None
+                time.sleep(_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def _read(path: Path) -> dict[str, dict[str, str]]:
@@ -135,25 +188,37 @@ class PinStore:
         """The fingerprint pinned for ``tool`` of ``server``, or None if it was never seen."""
         return self._pins.get(server, {}).get(tool)
 
-    def record(self, server: str, tool: str, pinned: str) -> None:
-        """Pin ``tool`` of ``server`` to the fingerprint ``pinned``, replacing what was pinned."""
-        self._pins.setdefault(server, {})[tool] = pinned
+    def record(self, server: str, tool: str, pinned: str) -> bool:
+        """Pin ``tool`` of ``server`` to the fingerprint ``pinned``, replacing what was pinned.
+
+        Returns False, and records nothing, when ``tool`` is new and ``server`` has
+        :data:`MAX_PINS_PER_SERVER` pins already: a pin that is there can always be renewed.
+        """
+        tools = self._pins.setdefault(server, {})
+        if tool not in tools and len(tools) >= MAX_PINS_PER_SERVER:
+            return False
+        tools[tool] = pinned
         self._unsaved[(server, tool)] = pinned
+        return True
 
     def save(self) -> None:
         """Write what was recorded into the file, keeping every pin that is there.
 
-        Does nothing when nothing was recorded. The file is read again first, so that a pin
-        another process saved is kept, and if it can no longer be read it is not replaced
-        (:class:`PinStoreError`): it is somebody's, and the person is told. A write that
-        fails raises ``OSError`` and leaves the old file whole.
+        Does nothing when nothing was recorded. Under the lock, the file is read again first,
+        so that a pin another process saved is kept, and if it can no longer be read it is not
+        replaced (:class:`PinStoreError`): it is somebody's, and the person is told. A lock that
+        is not got is the same error. A write that fails raises ``OSError`` and leaves the old
+        file whole.
         """
         if not self._unsaved:
             return
-        on_disk = _read(self._path)
-        for (server, tool), pinned in self._unsaved.items():
-            on_disk.setdefault(server, {})[tool] = pinned
-        text = json.dumps(on_disk, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
-        write_private(self._path, text, replace=True)
+        with _exclusive(self._path):
+            on_disk = _read(self._path)
+            for (server, tool), pinned in self._unsaved.items():
+                tools = on_disk.setdefault(server, {})
+                if tool in tools or len(tools) < MAX_PINS_PER_SERVER:
+                    tools[tool] = pinned
+            text = json.dumps(on_disk, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+            write_private(self._path, text, replace=True)
         self._pins = on_disk
         self._unsaved = {}

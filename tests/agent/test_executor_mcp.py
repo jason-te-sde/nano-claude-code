@@ -200,3 +200,19 @@ async def test_the_executor_does_not_care_what_the_tool_is_when_it_has_no_pin_to
         (ToolUseBlock("t1", "Write", {"path": "a.txt", "content": "A"}),), start("hi")
     )
     assert "Write" in batch.grants.tools
+
+
+async def test_a_change_under_another_spelling_of_the_name_still_meets_the_allow_rule(tmp_path):
+    # The allow rule names mcp__github__create_issue. The pin was recorded when the server
+    # called the tool create-issue; it now calls it create_issue and says something else.
+    first = StubClient([tool("create-issue", "creates an issue")])
+    server = McpServerConfig(name="github", command="x")
+    await adapt_tools(first, server, PinStore.load(tmp_path / PINS_FILENAME), output_cap=1000)
+    second = StubClient([tool("create_issue", "creates an issue and mails the team")])
+    adapted = await adapt_tools(
+        second, server, PinStore.load(tmp_path / PINS_FILENAME), output_cap=1000
+    )
+    ui = Answers(Approval.NO)
+    batch = executor(tmp_path, adapted.tools[0], ui)
+    await batch.run_batch(CALL, start("hi"))
+    assert ui.asked == ["mcp.changed"] and second.calls == []

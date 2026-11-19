@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from nanoclaude.config.schema import McpServerConfig
-from nanoclaude.mcp.pins import PINS_FILENAME, PinStore, fingerprint
+from nanoclaude.mcp.pins import MAX_PINS_PER_SERVER, PINS_FILENAME, PinStore, fingerprint
 from nanoclaude.mcp.tool import (
     MAX_DESCRIPTION_BYTES,
     MAX_REGISTRY_NAME_CHARS,
@@ -371,28 +371,110 @@ async def test_a_tool_that_fails_the_schema_check_is_dropped_with_a_warning_nami
     assert "$ref" in joined and "more than 32 levels" in joined and "70" in joined
 
 
-def test_the_cleaned_schema_has_the_descriptions_in_it_cleaned_and_nothing_else_changed():
+DIRTY = "a\x1b[2Jb\x00c\x07d\x9be"
+CLEAN = "abcde"
+
+
+def test_every_string_value_in_the_cleaned_schema_is_cleaned_not_only_the_descriptions():
+    # The model reads all of them: an enum's values, a default, the examples, a pattern, a
+    # comment, an extension's text.
     schema: dict[str, Any] = {
         "type": "object",
+        "description": DIRTY,
+        "title": DIRTY,
+        "$comment": DIRTY,
+        "x-hint": DIRTY,
         "properties": {
-            "a": {"type": "string", "description": "A\x1b[2Jb\x00c", "title": "T\x07"},
-            "enum": {"enum": ["keep\x00this"]},
+            "a": {
+                "type": "string",
+                "enum": [DIRTY, "plain", 3],
+                "default": DIRTY,
+                "const": DIRTY,
+                "examples": [DIRTY, [DIRTY]],
+                "pattern": DIRTY,
+                "format": DIRTY,
+                "x-nested": {"x-deep": [{"x-text": DIRTY}]},
+            }
         },
         "required": ["a"],
     }
     cleaned = clean_schema(schema)
-    assert cleaned["properties"]["a"] == {"type": "string", "description": "Abc", "title": "T"}
-    assert cleaned["properties"]["enum"] == {"enum": ["keep\x00this"]}
+    assert cleaned["description"] == cleaned["title"] == cleaned["$comment"] == CLEAN
+    assert cleaned["x-hint"] == CLEAN
+    prop = cleaned["properties"]["a"]
+    assert prop["enum"] == [CLEAN, "plain", 3]
+    assert prop["default"] == prop["const"] == prop["pattern"] == prop["format"] == CLEAN
+    assert prop["examples"] == [CLEAN, [CLEAN]]
+    assert prop["x-nested"] == {"x-deep": [{"x-text": CLEAN}]}
     assert cleaned["required"] == ["a"]
-    assert schema["properties"]["a"]["description"] == "A\x1b[2Jb\x00c", "the input is not changed"
+    assert schema["properties"]["a"]["default"] == DIRTY, "the input is not changed"
+
+
+def test_tabs_and_newlines_in_a_schemas_text_are_kept():
+    schema: dict[str, Any] = {"type": "object", "description": "one\ntwo\tthree"}
+    assert clean_schema(schema) == schema
 
 
 def test_the_cleaned_schema_has_no_lone_surrogate_anywhere_so_a_request_can_be_written():
-    schema = {
+    schema: dict[str, Any] = {
         "type": "object",
-        "properties": {"k\ud800": {"enum": ["v\udfff"], "default": "d\ud800"}},
+        "properties": {"k": {"enum": ["v\udfff"], "default": "d\ud800", "x-a": ["\ud800"]}},
     }
     json.dumps(clean_schema(schema), ensure_ascii=False).encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["a\x00b", "a\x1b[2Jb", "a\x07", "a\x9bb", "a\x7fb", "a\rb", "a\ud800b", "\x1b]0;t\x07x"],
+    ids=repr,
+)
+def test_a_key_with_a_control_character_in_it_is_a_schema_problem_wherever_it_is(key):
+    # Renaming a property would make the arguments the model writes not the ones the server
+    # reads, so such a schema is refused, not cleaned.
+    top: dict[str, Any] = {"type": "object", key: 1}
+    in_a_property = {"type": "object", "properties": {key: {"type": "string"}}}
+    deep = {"type": "object", "anyOf": [{"properties": {"a": {"properties": {key: {}}}}}]}
+    in_required = {"type": "object", "properties": {"a": {"type": "string", key: {"x": 1}}}}
+    for schema in (top, in_a_property, deep, in_required):
+        problem = schema_problem(schema)
+        assert problem is not None and "key" in problem, (key, schema)
+        assert "\x1b" not in problem and "\x00" not in problem and "\x07" not in problem
+
+
+def test_a_key_with_a_tab_or_a_newline_in_it_is_not_a_problem_because_those_are_kept():
+    assert schema_problem({"type": "object", "properties": {"a\tb": {}, "c\nd": {}}}) is None
+
+
+@pytest.mark.parametrize("name", ["$dynamicRef", "$recursiveRef"])
+@pytest.mark.parametrize(
+    "ref", ["https://example.com/s.json", "file:///etc/passwd", "other", "", 5]
+)
+def test_the_other_references_are_refused_like_ref_when_they_leave_the_schema(name, ref):
+    schema = {"type": "object", "properties": {"a": {name: ref}}}
+    problem = schema_problem(schema)
+    assert problem is not None and name in problem, (name, ref)
+
+
+@pytest.mark.parametrize("name", ["$dynamicRef", "$recursiveRef"])
+def test_the_other_references_are_allowed_when_they_stay_inside_the_schema(name):
+    assert schema_problem({"type": "object", "properties": {"a": {name: "#meta"}}}) is None
+    assert schema_problem({"type": "object", "properties": {"a": {name: "#"}}}) is None
+
+
+async def test_a_tool_with_a_control_character_in_a_property_name_is_dropped_with_a_warning(
+    tmp_path,
+):
+    adapted = await adapt(
+        tmp_path,
+        tool("good"),
+        tool("bad", schema={"type": "object", "properties": {"a\x1b[2Jb": {"type": "string"}}}),
+        tool("dyn", schema={"type": "object", "properties": {"a": {"$dynamicRef": "http://x/y"}}}),
+    )
+    assert names(adapted) == ["mcp__github__good"]
+    assert len(adapted.warnings) == 2
+    assert "'bad'" in adapted.warnings[0] and "key" in adapted.warnings[0]
+    assert "'dyn'" in adapted.warnings[1] and "$dynamicRef" in adapted.warnings[1]
+    assert all("\x1b" not in w for w in adapted.warnings)
 
 
 def test_numbers_booleans_and_nulls_in_a_schema_are_left_as_they_are():
@@ -479,9 +561,33 @@ async def test_the_pin_is_made_of_the_description_and_schema_the_model_is_given(
     assert pinned(tmp_path)["github"]["echo"] == fingerprint("Says it", OBJECT)
 
 
-async def test_the_pin_is_keyed_by_the_name_the_server_uses(tmp_path):
+async def test_the_pin_is_keyed_by_the_registry_name_that_rules_and_grants_use(tmp_path):
+    # Under the server, the tool as the registry names it: mcp__github__create_issue.
     await adapt(tmp_path, tool("create-issue"))
-    assert list(pinned(tmp_path)["github"]) == ["create-issue"]
+    assert list(pinned(tmp_path)["github"]) == ["create_issue"]
+
+
+async def test_a_definition_that_changes_under_another_spelling_of_the_name_is_changed(tmp_path):
+    # An allow rule or a grant for mcp__github__create_issue covers both spellings, so the
+    # pin has to as well: a definition changed between them cannot be a new tool.
+    await adapt(tmp_path, tool("create-issue", "creates an issue"))
+    again = await adapt(tmp_path, tool("create_issue", "creates an issue and mails the team"))
+    assert [t.name for t in again.tools] == ["mcp__github__create_issue"]
+    assert again.tools[0].changed is True
+
+
+async def test_the_same_definition_under_another_spelling_of_the_name_is_not_changed(tmp_path):
+    await adapt(tmp_path, tool("create-issue", "creates an issue"))
+    again = await adapt(tmp_path, tool("create.issue", "creates an issue"))
+    assert again.tools[0].changed is False
+
+
+async def test_a_renewed_pin_is_kept_under_the_registry_name_too(tmp_path):
+    await adapt(tmp_path, tool("create-issue", "one"))
+    (changed,) = (await adapt(tmp_path, tool("create.issue", "two"))).tools
+    changed.on_grant()
+    assert list(pinned(tmp_path)["github"]) == ["create_issue"]
+    assert pinned(tmp_path)["github"]["create_issue"] == fingerprint("two", OBJECT)
 
 
 async def test_a_tool_whose_definition_is_what_it_was_is_not_changed_in_the_next_session(tmp_path):
@@ -627,3 +733,31 @@ async def test_two_servers_whose_tools_come_to_one_registry_name_lose_both_tools
 
 def test_combining_nothing_is_nothing():
     assert combine_tools([]) == AdaptedTools((), ())
+
+
+async def test_tools_past_the_pin_limit_are_registered_unpinned_and_the_warning_says_how_many(
+    tmp_path,
+):
+    store = PinStore(
+        tmp_path / PINS_FILENAME,
+        {"github": {f"old_{n}": "a" * 64 for n in range(MAX_PINS_PER_SERVER)}},
+    )
+    adapted = await adapt(tmp_path, tool("new_a"), tool("new_b"), tool("new_c"), pins=store)
+    assert names(adapted) == ["mcp__github__new_a", "mcp__github__new_b", "mcp__github__new_c"]
+    assert not any(t.changed for t in adapted.tools)
+    (warning,) = adapted.warnings
+    assert "3 of its tools" in warning and str(MAX_PINS_PER_SERVER) in warning
+    assert "github" in warning and str(tmp_path / PINS_FILENAME) in warning
+    assert store.get("github", "new_a") is None
+    assert not (tmp_path / PINS_FILENAME).exists(), "nothing was new enough to write"
+
+
+async def test_a_tool_that_is_pinned_already_is_still_checked_when_the_server_is_at_the_limit(
+    tmp_path,
+):
+    pins = {f"old_{n}": "a" * 64 for n in range(MAX_PINS_PER_SERVER - 1)}
+    pins["known"] = fingerprint("one", OBJECT)
+    store = PinStore(tmp_path / PINS_FILENAME, {"github": pins})
+    adapted = await adapt(tmp_path, tool("known", "two"), pins=store)
+    assert adapted.tools[0].changed is True
+    assert adapted.warnings == ()

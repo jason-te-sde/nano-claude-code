@@ -201,9 +201,8 @@ def test_the_cut_is_between_characters_and_counts_the_bytes_of_the_text_as_it_is
     overhead = len(f"{OPEN}\n\n{CLOSE}")
     wrapped = wrap("€" * 100, cap=overhead + 10)  # three bytes each
     assert wrapped.count("€") == 3
-    assert "[output cut: 291 bytes beyond the 9-byte limit]" in wrapped.replace(
-        "10-byte", "9-byte"
-    ) or ("[output cut: 290 bytes beyond the 10-byte limit]" in wrapped)
+    # 300 bytes in all; the 10 left after the wrapper hold three whole characters, 9 bytes.
+    assert "[output cut: 291 bytes beyond the 10-byte limit]" in wrapped
 
 
 def test_a_cap_too_small_for_the_wrapper_still_gives_a_whole_wrapper_and_the_note():

@@ -909,6 +909,14 @@ def test_the_documents_count_the_hard_denials_as_the_checks_before_mcp_changed_a
     assert "The seventh is `mcp.changed`" in note
 
 
+def test_the_reference_says_that_a_rule_may_name_an_mcp_tool_exactly_and_not_by_wildcard():
+    text = _section(_text(CONFIGURATION), "Permissions")
+    assert "`mcp__<server>__<tool>`" in text and "(`mcp__github__*`)" in text
+    assert RuleSet.build(allow=["mcp__github__create_issue"]).allow, "the exact name is accepted"
+    with pytest.raises(ValueError, match="wildcard"):
+        RuleSet.build(allow=["mcp__github__*"])
+
+
 def _decide(policy: Policy, tool: str, relative: str, *, write: bool) -> PermissionResult:
     path = f"{policy.sandbox.roots[0]}/{relative}"
     return evaluate(PermissionRequest(tool, path, (path,), is_write=write), policy)

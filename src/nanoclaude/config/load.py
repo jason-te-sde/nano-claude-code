@@ -363,16 +363,43 @@ _MCP_NAME = re.compile(MCP_SERVER_NAME)
 _UNBUILT_TRANSPORTS = ("sse", "http")
 
 
+def _no_nul(text: str, where: str, path: Path) -> str:
+    """``text``, which is to go into a process's arguments or environment, where a NUL ends the
+    string: the system call refuses it, long after the file was loaded."""
+    if "\0" in text:
+        raise ConfigError(
+            f"{where} in {path} has a NUL character in it — remove it: a program, an argument "
+            "and an environment variable cannot hold one"
+        )
+    return text
+
+
 def _mcp_command(value: object, where: str, path: Path) -> str:
     text = _string(value, where, path)
     if not text.strip():
         raise ConfigError(f"{where} in {path} is empty — name the program that starts the server")
-    return text
+    return _no_nul(text, where, path)
+
+
+def _mcp_args(value: object, where: str, path: Path) -> tuple[str, ...]:
+    items = _strings(value, where, path)
+    for index, item in enumerate(items):
+        _no_nul(item, f"{where}[{index}]", path)
+    return items
 
 
 def _mcp_env(value: object, where: str, path: Path) -> dict[str, str]:
     table = _table(value, where, path)
-    return {key: _string(item, f"{where}.{key}", path) for key, item in table.items()}
+    for key in table:
+        if not key or "=" in key or "\0" in key:
+            raise ConfigError(
+                f"{where} in {path} has the name {key!r}, which is not a name an environment "
+                "variable can have — a name is not empty and holds no = and no NUL"
+            )
+    return {
+        key: _no_nul(_string(item, f"{where}.{key}", path), f"{where}.{key}", path)
+        for key, item in table.items()
+    }
 
 
 def _mcp_transport(value: object, where: str, path: Path) -> str:
@@ -403,7 +430,7 @@ def _mcp_timeout(value: object, where: str, path: Path) -> int:
 _MCP_FIELDS: dict[str, Checker] = {
     "transport": _mcp_transport,
     "command": _mcp_command,
-    "args": _strings,
+    "args": _mcp_args,
     "env": _mcp_env,
     "enabled": _boolean,
     "timeout": _mcp_timeout,

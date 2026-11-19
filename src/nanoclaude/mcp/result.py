@@ -9,19 +9,19 @@ safe to hand over, in a fixed order that each step depends on:
    to talk to the model: an image or audio block by its type and the size of what its data
    decodes to, a resource by its URI, with no text of the resource. With no text block, the
    result's ``structuredContent`` is given as JSON. Nothing is ever fetched or opened.
-2. **Cleaned and scrubbed**, before anything is added. Terminal controls are removed first, so
-   that no later step sees a different text from the one the model will, and then credentials
-   are scrubbed, so that the cut below cannot leave half of one.
-3. **Wrapped** in ``<mcp-result server="..." tool="...">`` and ``</mcp-result>``, which says
-   where the server's words begin and end. Every ``</mcp-result`` in the content, in any case,
-   is written ``<\\/mcp-result`` first, so that nothing a server sends can end the wrapper
-   early. This is done on the cleaned text: a tag with a control character in the middle is
-   the tag once the control is gone.
-4. **Held to the output cap.** The cut is made on the content, to what is left of the cap
-   after the wrapper, so that the closing tag is always there; the note that says how many
-   bytes were cut is written before it. A cap smaller than the wrapper leaves the wrapper
-   whole and the content empty.
-5. **Cleaned and scrubbed once more**, as every tool's result is, over the whole.
+2. **Cleaned and scrubbed**, before anything is added. Terminal controls are removed first,
+   so that no later step sees a different text from the one the model will, and then
+   credentials are scrubbed, so that the cut below cannot leave half of one. The wrapper and
+   the note are ours and are not run through it.
+3. **Closing tags made safe.** Every ``</mcp-result`` in the content, in any case, is written
+   ``<\\/mcp-result``, so that nothing a server sends can end the wrapper early. This is done
+   on the cleaned text: a tag with a control character in the middle is the tag once the
+   control is gone.
+4. **Held to the output cap, and wrapped** in ``<mcp-result server="..." tool="...">`` and
+   ``</mcp-result>``, which say where the server's words begin and end. The cut is made on the
+   content, to what is left of the cap after the wrapper, so that the closing tag is always
+   there; the note that says how many bytes were cut is written before it. A cap smaller than
+   the wrapper leaves the wrapper whole and the content empty.
 
 The attributes of the wrapper are the server's configured name and the tool's registry name,
 which are made of ASCII letters, digits and underscores and cannot carry a quotation mark.
@@ -117,7 +117,7 @@ def _written_safe(text: str) -> str:
 
 
 def wrap_result(server: str, tool: str, content: str, *, cap: int, redactor: Redactor) -> str:
-    """``content`` as the model is given it: see the module docstring, steps 2 to 5.
+    """``content`` as the model is given it: see the module docstring, steps 2 to 4.
 
     ``server`` and ``tool`` are the attributes of the wrapper; ``cap`` is
     the session's output-cap limit, in bytes.
@@ -126,4 +126,4 @@ def wrap_result(server: str, tool: str, content: str, *, cap: int, redactor: Red
     closing = "\n</mcp-result>"
     room = max(cap - len((opening + closing).encode("utf-8")), 0)
     body = cap_bytes(_written_safe(_clean(without_lone_surrogates(content), redactor)), room)
-    return _clean(opening + body + closing, redactor)
+    return opening + body + closing

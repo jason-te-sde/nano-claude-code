@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -124,11 +125,15 @@ class McpTimeoutError(McpError):
 
 class McpUnsupportedInteractionError(McpError):
     """The server answered with something other than a complete result, which would need a
-    kind of interaction (input from the user, a task to poll) this client does not have."""
+    kind of interaction (input from the user, a task to poll) this client does not have.
+
+    ``result_type`` is what the server said, and is kept as it came. It is not in the
+    message, which is printed: a server wrote it, and nothing here needs it.
+    """
 
     def __init__(self, method: str, result_type: object) -> None:
         super().__init__(
-            f"the server's result for {method} is {result_type!r}, not 'complete': "
+            f"the server's result for {method} is not 'complete': "
             "the interaction it asks for is not supported"
         )
         self.result_type = result_type
@@ -159,6 +164,25 @@ class CallResult:
     is_error: bool = False
 
     __hash__ = None  # type: ignore[assignment]
+
+
+#: A protocol version as the specification writes one. A version that a server names is shown
+#: in an error only when it looks like this: the rest is text the server chose, and an error
+#: is something a person reads.
+_VERSION_SHAPE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+#: The most versions an error lists.
+_VERSIONS_SHOWN = 8
+
+
+def _versions_shown(named: object) -> str:
+    """The dates in ``named``, a list a server sent, as a line for an error."""
+    dates = (
+        [v for v in named if isinstance(v, str) and _VERSION_SHAPE.fullmatch(v)]
+        if isinstance(named, list)
+        else []
+    )
+    return ", ".join(dates[:_VERSIONS_SHOWN]) or "none that is a date"
 
 
 def _client_info() -> dict[str, str]:
@@ -294,7 +318,7 @@ class McpClient:
             if version in offered and version not in tried:
                 return version
         raise McpVersionError(
-            f"the server speaks protocol versions {offered}; this client speaks "
+            f"the server speaks protocol versions ({_versions_shown(offered)}); this client speaks "
             f"{list(self._modern_versions)} (and {list(LEGACY_VERSIONS)} to legacy servers)"
         )
 
@@ -311,8 +335,8 @@ class McpClient:
         version = _object(result, "initialize").get("protocolVersion")
         if version not in LEGACY_VERSIONS:
             raise McpVersionError(
-                f"the server's reply to initialize names protocol version {version!r}; "
-                f"this client speaks {list(LEGACY_VERSIONS)}"
+                "the server's reply to initialize names protocol version "
+                f"({_versions_shown([version])}); this client speaks {list(LEGACY_VERSIONS)}"
             )
         await self._send(Notification("notifications/initialized"))
         self._era, self._protocol_version = "legacy", version

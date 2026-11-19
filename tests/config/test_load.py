@@ -2173,3 +2173,40 @@ def test_a_servers_env_is_not_in_its_repr_because_that_is_where_its_credentials_
     assert config.mcp["s"].env == {"TOKEN": "hunter2-not-a-real-one"}
     assert "hunter2" not in repr(config.mcp["s"])
     assert "hunter2" not in repr(config)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param('command = "a\\u0000b"\n', "mcp.s.command in", id="NUL in the command"),
+        pytest.param(
+            'command = "x"\nargs = ["ok", "a\\u0000b"]\n', "mcp.s.args[1] in", id="NUL in an arg"
+        ),
+        pytest.param(
+            'command = "x"\nenv = { "" = "v" }\n', "mcp.s.env in", id="an env key that is empty"
+        ),
+        pytest.param(
+            'command = "x"\nenv = { "A=B" = "v" }\n', "mcp.s.env in", id="an env key with ="
+        ),
+        pytest.param(
+            'command = "x"\nenv = { "A\\u0000B" = "v" }\n', "mcp.s.env in", id="NUL in an env key"
+        ),
+        pytest.param(
+            'command = "x"\nenv = { A = "v\\u0000" }\n', "mcp.s.env.A in", id="NUL in an env value"
+        ),
+    ],
+)
+def test_what_a_process_could_not_be_started_with_is_refused_when_the_file_is_loaded(
+    tmp_path, body, expected
+):
+    # exec would refuse each of these when the server was started, which is after the
+    # session began and with a message about the system call and not about the file.
+    message = refusal(tmp_path, BASE + "[mcp.s]\n" + body)
+    assert expected in message, message
+    assert str(home_file(tmp_path)) in message
+    assert "\0" not in message
+
+
+def test_an_env_key_that_is_an_ordinary_name_and_a_value_with_an_equals_sign_are_accepted(tmp_path):
+    text = BASE + '[mcp.s]\ncommand = "x"\nenv = { A_B1 = "k=v=w", "with-dash" = "" }\n'
+    assert load(tmp_path, text).mcp["s"].env == {"A_B1": "k=v=w", "with-dash": ""}

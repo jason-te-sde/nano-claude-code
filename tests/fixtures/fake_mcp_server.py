@@ -88,6 +88,8 @@ DEFAULTS: Config = {
     # reading of stdin, so that nothing the client writes is ever taken).
     "call": "echo",
     "call_content": [],
+    # The message of the JSON-RPC error that `call` = error answers with.
+    "error_message": "the tool exploded",
     "call_structured": None,
     "call_is_error": False,
     "flood_requests": 20_000,
@@ -554,7 +556,7 @@ class Server:
         time.sleep(settings["call_delay"])
         params = request.get("params") or {}
         if what == "error":
-            self.fail(request, -32000, "the tool exploded", {"detail": "fake"})
+            self.fail(request, -32000, settings["error_message"], {"detail": "fake"})
         elif what == "is-error":
             self.reply(request, {"content": [{"type": "text", "text": "boom"}], "isError": True})
         elif what == "content":
