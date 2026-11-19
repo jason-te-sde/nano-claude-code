@@ -6,7 +6,9 @@ from typing import Any
 
 import pytest
 
+from nanoclaude.mcp.client import McpClient
 from nanoclaude.mcp.transport import StdioTransport
+from tests.mcp.helpers import fake_server
 
 
 @pytest.fixture
@@ -36,3 +38,32 @@ async def make_transport(
     yield make
     for transport in made:
         await transport.close()
+
+
+@pytest.fixture
+def transports() -> dict[McpClient, StdioTransport]:
+    """The transport of each client ``make_client`` built, for a test that needs its pid."""
+    return {}
+
+
+@pytest.fixture
+async def make_client(
+    make_transport: Callable[..., StdioTransport],
+    transports: dict[McpClient, StdioTransport],
+) -> AsyncIterator[Callable[..., McpClient]]:
+    """Build a client for the fake server in ``mode``, and close every one at the end."""
+    made: list[McpClient] = []
+
+    def make(
+        mode: str, *settings: str, transport_options: dict[str, Any] | None = None, **options: Any
+    ) -> McpClient:
+        command, args = fake_server(mode, *settings)
+        transport = make_transport(command, args, **(transport_options or {}))
+        client = McpClient(transport, **options)
+        transports[client] = transport
+        made.append(client)
+        return client
+
+    yield make
+    for client in made:
+        await client.close()
