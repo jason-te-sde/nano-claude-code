@@ -247,6 +247,7 @@ class Session:
             # A sub-agent cannot start one: its own executor has nothing to run it with.
             spawn=self._spawn if self.parent_call_id is None else None,
             parent_call_id=self.parent_call_id,
+            may_ask=self.parent_call_id is None,
         )
 
     def _take_up_stored_session(self) -> None:

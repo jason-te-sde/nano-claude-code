@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, NoReturn
@@ -49,12 +49,21 @@ from nanoclaude.permissions.policy import (
 )
 from nanoclaude.permissions.rules import RuleSet
 from nanoclaude.permissions.sandbox import WiderSandboxError
-from nanoclaude.providers.base import ModelError, ModelReply, ModelRequest, StopKind, Usage
+from nanoclaude.providers.base import (
+    ModelError,
+    ModelReply,
+    ModelRequest,
+    StopKind,
+    ToolSpec,
+    Usage,
+)
 from nanoclaude.providers.capabilities import Capabilities
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.subagents import EXPLORE_PROMPT, SUBAGENTS, SubAgent, SubAgentCall
 from nanoclaude.testing.scripted import calls, says
 from nanoclaude.testing.session import ScriptedClient, ScriptedSession, build_session
+from nanoclaude.tools.base import ToolContext, ToolOutcome, ok
+from nanoclaude.tools.registry import ToolRegistry
 from nanoclaude.tools.task import TaskTool
 from nanoclaude.tools.write import WriteTool
 from tests.keys import pem
@@ -278,6 +287,42 @@ async def test_the_sub_agent_has_read_glob_and_grep_and_nothing_else(tmp_path):
     assert [tool.name for tool in build_registry(SUBAGENTS["explore"])] == ["Read", "Glob", "Grep"]
 
 
+class Probe:
+    """A read-only tool that only the parent has. Nothing in a sub-agent's persona names it."""
+
+    name = "Probe"
+    read_only = True
+
+    def spec(self) -> ToolSpec:
+        return ToolSpec("Probe", "A tool the parent was given.", {"type": "object"})
+
+    def permission_request(
+        self, _ctx: ToolContext, _arguments: Mapping[str, Any]
+    ) -> PermissionRequest:
+        return PermissionRequest("Probe", "probe")
+
+    async def run(
+        self, _ctx: ToolContext, call_id: str, _arguments: Mapping[str, Any]
+    ) -> ToolOutcome:
+        return ok(call_id, "probed")
+
+
+async def test_the_sub_agents_tools_are_the_ones_its_persona_names_and_not_the_parents_less_some(
+    tmp_path,
+):
+    """A tool added to the parent is not in the sub-agent. A registry made by taking Task and the
+    write tools out of the parent's would hold ``Probe``: this one is made from a list of names."""
+    session = build(tmp_path, [calls("Probe", {}, call_id="sub_1"), says("ok")])
+    session.registry = ToolRegistry([*session.registry, Probe()])
+    await session.run("find it")
+
+    assert "Probe" in tool_names(session.model.requests[0]), "the parent was not given it"
+    assert session.explore_model is not None
+    assert tool_names(session.explore_model.requests[0]) == {"Read", "Glob", "Grep"}
+    (result,) = explore_results(session)
+    assert result.is_error and "tool.unknown" in result.content, result
+
+
 async def test_a_sub_agent_that_asks_for_task_is_told_that_there_is_no_such_tool(tmp_path):
     session = build(
         tmp_path,
@@ -460,7 +505,11 @@ async def test_a_question_inside_a_sub_agent_is_declined_and_the_person_is_never
     assert ui.confirmed == [], "the person was asked about a call the sub-agent made"
     assert not (tmp_path / "new.txt").exists(), "a declined write was written"
     (declined,) = explore_results(session)
-    assert declined.is_error and "declined" in declined.content, declined
+    assert declined.is_error
+    assert "Write needs the person's confirmation, and a sub-agent may not ask for it." in (
+        declined.content
+    ), declined
+    assert "declined" not in declined.content, "nobody was asked, and nobody said no"
     assert not result.is_error
 
 
@@ -513,7 +562,7 @@ async def test_a_sub_agent_that_is_given_the_task_tool_still_cannot_start_anothe
     [
         (PermissionMode.ACCEPT_EDITS, True, ""),
         (PermissionMode.PLAN, False, "mode.plan-read-only"),
-        (PermissionMode.DEFAULT, False, "declined"),
+        (PermissionMode.DEFAULT, False, "may not ask"),
     ],
 )
 async def test_a_sub_agent_is_judged_in_the_parents_permission_mode(
@@ -611,7 +660,10 @@ def test_the_gate_counts_the_estimates_it_lets_through_and_refuses_the_one_that_
 
 
 class Hangs(ScriptedClient):
-    """Answers from its script, and when that is spent never answers."""
+    """Answers from its script, and when that is spent never answers, and notes it if it is
+    cancelled while it waits."""
+
+    cancelled = False
 
     async def complete(
         self, request: ModelRequest, *, on_text: Callable[[str], None] | None = None
@@ -619,7 +671,11 @@ class Hangs(ScriptedClient):
         if self._script:
             return await super().complete(request, on_text=on_text)
         self.requests.append(request)
-        await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
         raise AssertionError("unreachable")
 
 
@@ -645,6 +701,11 @@ async def test_a_sub_agent_whose_model_never_answers_is_stopped_at_the_wall_cloc
         result.content
     )
     assert len(hanging.requests) == 2
+    # The request that never answered was cancelled, and not left running behind the result: a
+    # limit that stopped waiting for it and let it go on would pass everything above.
+    assert hanging.cancelled, "the request in flight was not cancelled"
+    left = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+    assert left == [], f"tasks left running after the sub-agent was stopped: {left}"
 
 
 async def test_a_timeout_of_the_providers_own_is_not_taken_for_the_wall_clock_limit(tmp_path):
@@ -898,7 +959,8 @@ async def test_a_task_call_that_the_person_declines_never_starts_the_sub_agent(t
     await session.run("find it")
 
     assert ui.confirmed == ["Task"]
-    assert tool_result_for(session).is_error
+    result = tool_result_for(session)
+    assert result.is_error and result.content.startswith("The user declined to run Task.")
     assert session.explore_model is not None and session.explore_model.requests == []
 
 
