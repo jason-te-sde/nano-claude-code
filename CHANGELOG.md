@@ -10,6 +10,9 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
 
 ### Added
 
+- A release workflow that publishes a `v*` tag to PyPI through trusted publishing, after the CI
+  suite passes on the tagged commit and the built wheel installs and runs. `RELEASING.md` has the
+  one-time setup and the steps; nothing has been published.
 - The agent loop as a state machine with no I/O, a session that wires it to the model, the tools
   and the store, and a two-phase executor that decides every call of a turn before it runs any.
 - The tools `Read`, `Edit` (a batch of exact replacements that applies whole or not at all),
