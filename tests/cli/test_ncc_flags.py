@@ -407,8 +407,9 @@ def test_the_default_mode_is_not_bypass_and_no_flag_leaves_it_so(
 
 
 BYPASS_WARNING = (
-    "warning: permission prompts are off \u2014 tool calls run without asking. The sandbox, "
-    "credentials files, dangerous commands and your deny rules are still enforced\n"
+    "warning: permission prompts are off \u2014 tool calls run without asking, except a call to "
+    "an MCP tool whose definition has changed. The sandbox, credentials files, dangerous "
+    "commands and your deny rules are still enforced\n"
 )
 ALLOW_SECRETS_WARNING = (
     "warning: --allow-secrets is on \u2014 credentials files can be read, and what is read "

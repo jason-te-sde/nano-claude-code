@@ -64,6 +64,7 @@ from nanoclaude.config.load import CONFIG_DIRNAME, ConfigError, expand_root, loa
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.budget import ContextTooSmallError
 from nanoclaude.conversation.store import Store, same_directory
+from nanoclaude.mcp.servers import McpServers, start_servers
 from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import PermissionMode, Policy
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
@@ -635,8 +636,9 @@ def _warn_about_switches(args: argparse.Namespace, err: Console) -> None:
     if args.dangerously_skip_permissions:
         _warn(
             err,
-            "permission prompts are off — tool calls run without asking. The sandbox, "
-            "credentials files, dangerous commands and your deny rules are still enforced",
+            "permission prompts are off — tool calls run without asking, except a call to an "
+            "MCP tool whose definition has changed. The sandbox, credentials files, dangerous "
+            "commands and your deny rules are still enforced",
         )
     if args.allow_secrets:
         _warn(
@@ -750,13 +752,21 @@ def _abandon_stdout() -> None:
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
-def _build_session(
+async def _build_session(
     args: argparse.Namespace,
     settings: _Settings,
     home: Path,
     console: Console | None,
     err: Console,
 ) -> Session:
+    """The session the flags and the configuration ask for, with its MCP servers started.
+
+    The servers are started last, once nothing else can refuse the session: they take up to
+    fifteen seconds, and a session that cannot run for want of a key is better told so at once.
+    A server that fails is one warning on ``err`` and the session goes on without its tools.
+    Whatever fails after they are started ends them again, with the store, since no session
+    exists to do it.
+    """
     config = load_config(home=str(home), project=settings.root, env=dict(os.environ))
     if args.model is not None:
         config = replace(config, roles=replace(config.roles, main=args.model))
@@ -778,6 +788,7 @@ def _build_session(
     )
     state_dir = home / CONFIG_DIRNAME
     store = Store(state_dir / "sessions.db")
+    servers: McpServers | None = None
     try:
         _open(store)
         # The store has narrowed the directory and its own files. The capability cache is
@@ -786,15 +797,21 @@ def _build_session(
         narrow_file(state_dir / CACHE_FILENAME)
         session_id, resume = _which_session(args, store, settings.root)
         router = Router(config, CapabilityCache(state_dir / CACHE_FILENAME))
+        # The session checks this first thing, before it writes a row. Here it is checked
+        # before a server is started that would only be ended again.
+        router.check_credentials()
         todo = TodoState()
         # One redactor for what the tools return and for what the audit records: with
         # --allow-secrets a credentials file is read, and the redactor must let it through.
         redactor = Redactor(enabled=not args.allow_secrets)
+        servers = await start_servers(config, root=settings.root, home=home)
+        for line in servers.warnings:
+            _warn(err, line)
         return Session(
             root=settings.root,
             config=config,
             router=router,
-            registry=default_registry(todo),
+            registry=default_registry(todo, servers.tools),
             policy=policy,
             ui=_ui(console, err, settings, router),
             store=store,
@@ -804,10 +821,13 @@ def _build_session(
             todo_state=todo,
             redactor=redactor,
             home=str(home),
+            mcp=servers,
         )
     except BaseException:
-        # No session exists to close the store, and nobody else has it.
+        # No session exists to close the store or the servers, and nobody else has them.
         store.close()
+        if servers is not None:
+            await servers.aclose()
         raise
 
 
@@ -877,7 +897,7 @@ def _which_session(args: argparse.Namespace, store: Store, root: str) -> tuple[s
 async def _run_interactive(
     args: argparse.Namespace, settings: _Settings, home: Path, console: Console
 ) -> int:
-    session = _build_session(args, settings, home, console, _stderr_console(args.no_color))
+    session = await _build_session(args, settings, home, console, _stderr_console(args.no_color))
     try:
         return await run_repl(session, console, str(home / CONFIG_DIRNAME / "history"))
     finally:
@@ -887,7 +907,7 @@ async def _run_interactive(
 async def _run_headless(
     args: argparse.Namespace, settings: _Settings, home: Path, err: Console, run: _Run
 ) -> _Outcome:
-    session = _build_session(args, settings, home, None, err)
+    session = await _build_session(args, settings, home, None, err)
     # Kept where main can see it: a run that fails still has what it spent to report.
     run.session = session
     try:

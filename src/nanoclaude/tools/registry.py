@@ -55,7 +55,11 @@ class ToolRegistry:
         return tuple(self._tools[name].spec() for name in sorted(self._tools))
 
 
-def default_registry(todo_state: TodoState | None = None) -> ToolRegistry:
+def default_registry(
+    todo_state: TodoState | None = None, extra: Sequence[Tool] = ()
+) -> ToolRegistry:
+    """The seven tools every session has, and ``extra`` beside them: the tools that MCP servers
+    brought, when the session has any. A name held twice is refused, as in any registry."""
     from nanoclaude.tools.edit import EditTool
     from nanoclaude.tools.glob import GlobTool
     from nanoclaude.tools.grep import GrepTool
@@ -76,5 +80,6 @@ def default_registry(todo_state: TodoState | None = None) -> ToolRegistry:
             # swap in a fresh one the day TodoState gains a __len__.
             TodoWriteTool(todo_state if todo_state is not None else TodoState()),
             TaskTool(),
+            *extra,
         ]
     )
