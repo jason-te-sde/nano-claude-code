@@ -381,13 +381,20 @@ class StdioTransport:
         Nothing else does it when a pipe is still open at the other end: a descendant that left
         the group holds stdout and stderr, and a stdout that nobody reads is paused with its
         buffer full. ``Process`` has no ``close()``, so this reaches for its transport; closing
-        that closes the pipes, and kills the child if it were still running, which by now it is
-        not. The pipe transports close their descriptors in callbacks this schedules, so the
-        loop is given two turns to run them.
+        that closes the pipes, and kills the leader if the steps before could not end it. A
+        leader killed here is waited for, because the loop learns that a child has gone from a
+        thread that waits on it, and a ``Popen`` whose exit the loop never heard of is a
+        ResourceWarning when it is collected. The pipe transports close their descriptors in
+        callbacks that closing scheduled, so the loop is then given two turns to run them.
         """
         transport = getattr(process, "_transport", None)
         if transport is not None:
             transport.close()
+        deadline = time.monotonic() + _KILL_WAIT_SECONDS
+        while process.returncode is None:
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_POLL_SECONDS)
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 

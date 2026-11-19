@@ -8,6 +8,7 @@ import errno
 import os
 import signal
 import time
+from typing import Any, cast
 
 import pytest
 
@@ -663,6 +664,16 @@ def test_a_group_the_system_will_not_let_us_look_at_is_taken_to_be_there(monkeyp
     assert StdioTransport._group_alive(12345) is True
 
 
+async def test_close_does_not_wait_for_ever_for_a_leader_that_will_not_be_reaped(monkeypatch):
+    monkeypatch.setattr(transport_module, "_KILL_WAIT_SECONDS", 0.05)
+
+    class Unreapable:
+        returncode = None
+
+    process = cast(Any, Unreapable())
+    await asyncio.wait_for(StdioTransport._close_pipes(process), timeout=5)
+
+
 async def test_a_group_the_system_will_not_let_us_signal_does_not_stop_close(
     make_transport, monkeypatch
 ):
@@ -684,6 +695,10 @@ async def test_a_group_the_system_will_not_let_us_signal_does_not_stop_close(
         with monkeypatch.context() as patched:
             patched.setattr(os, "killpg", refuse)
             await asyncio.wait_for(transport.close(), timeout=10)
+        # Nothing could signal the group, so the last step killed the leader, and close() did
+        # not return before the loop knew it had gone: a Popen that never hears of its child's
+        # exit is a ResourceWarning when it is collected, which is how this was first found.
+        assert transport.returncode == -signal.SIGKILL, transport.returncode
     finally:
         if transport.pid is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
