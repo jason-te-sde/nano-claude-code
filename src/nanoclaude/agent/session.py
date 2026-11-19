@@ -20,6 +20,10 @@ above this module has to repair one:
 * the store holds the transcript the model is shown. Compaction and ``/clear``
   replace a transcript rather than extend it, so what was stored is compared
   with what is in memory each time and rewritten when they stop agreeing.
+
+A sub-agent is one of these too: the session a ``Task`` call starts is an ordinary
+:class:`Session` whose model comes from another role, with a registry of its own and no
+store (``agent/subagent.py``). The loop has no branch for it.
 """
 
 from __future__ import annotations
@@ -27,7 +31,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -37,7 +41,7 @@ from nanoclaude.agent.executor import Executor
 from nanoclaude.agent.loop import Done, LoopState, StopReason
 from nanoclaude.agent.router import Router
 from nanoclaude.agent.ui import UI, AutoDecline
-from nanoclaude.config.schema import ROLES, Config
+from nanoclaude.config.schema import ROLES, Config, check_role
 from nanoclaude.context.assemble import assemble
 from nanoclaude.context.mentions import expand_mentions
 from nanoclaude.conversation.budget import Budget, HeuristicCounter
@@ -66,6 +70,7 @@ from nanoclaude.providers.base import (
 from nanoclaude.providers.capabilities import Capabilities
 from nanoclaude.providers.retry import RetryPolicy, with_retry
 from nanoclaude.providers.texttools import MAX_PARSE_RETRIES, parse_reply, render_tools
+from nanoclaude.subagents import SubAgentCall, SubAgentResult
 from nanoclaude.tools.base import ToolOutcome
 from nanoclaude.tools.registry import ToolRegistry
 from nanoclaude.tools.todo import TodoState
@@ -178,6 +183,25 @@ class Session:
     #: session in a test cannot pick up the instructions of whoever runs it.
     home: str = field(default_factory=lambda: str(Path.home()))
     resume: bool = False
+    # What makes a session a sub-agent's, as plain parameters. A session a person talks to
+    # leaves all of them as they are.
+    #: The role whose model answers the conversation.
+    role: str = "main"
+    #: A system prompt of its own, in place of the assembled one: no project instructions and
+    #: no project map. The working directory and, for a model without native tool calling, the
+    #: tool protocol are added to it.
+    system_prompt: str | None = None
+    #: Whether ``@`` in a prompt names a file to inline. Off for a session whose prompts are
+    #: written by a model and not typed by a person.
+    mentions: bool = True
+    #: Called with the estimated input tokens of each request to the conversation's model, just
+    #: before it is sent; what it raises stops the run. How a sub-agent is held to its limits.
+    gate: Callable[[int], None] | None = None
+    #: The ``Task`` call that started this session, which marks each call it makes in the audit.
+    parent_call_id: str | None = None
+    #: The audit turn all of this session's calls are recorded under, when it is not counting
+    #: its own: a sub-agent's belong to the turn of the call that started it.
+    audit_turn: int | None = None
     state: LoopState = field(init=False)
     executor: Executor = field(init=False)
     # The messages the store holds for this session, as of the last _persist().
@@ -203,6 +227,7 @@ class Session:
         # First, before a row is written for a session that cannot start: every role's model
         # must have its key (spec 17.9's missing-key line, naming the role and the variable).
         self.router.check_credentials()
+        check_role(self.role)
         self.state = LoopState(Transcript(), turn=0, max_turns=self.config.limits.max_turns)
         if self.resume:
             self._take_up_stored_session()
@@ -219,6 +244,9 @@ class Session:
             audit=self.audit,
             session_id=self.session_id,
             redactor=self.redactor,
+            # A sub-agent cannot start one: its own executor has nothing to run it with.
+            spawn=self._spawn if self.parent_call_id is None else None,
+            parent_call_id=self.parent_call_id,
         )
 
     def _take_up_stored_session(self) -> None:
@@ -284,6 +312,8 @@ class Session:
         return await self._drive()
 
     def _expand(self, prompt: str) -> str:
+        if not self.mentions:
+            return prompt
         text, _ = expand_mentions(
             prompt,
             root=self.root,
@@ -297,17 +327,17 @@ class Session:
         failures = 0  # replies in a row that held tool calls we could not parse, and no usable one
         while True:
             self._persist()
-            capabilities = await self.router.capabilities_for("main")
+            capabilities = await self.router.capabilities_for(self.role)
             system, specs = self._prompt(capabilities)
             await self._maybe_compact(capabilities, system, specs)
 
             try:
-                raw = await self._ask_main(capabilities, system, specs)
+                raw = await self._ask(capabilities, system, specs)
             except ModelError as error:
                 if error.partial is None:
                     raise
                 raise self._keep_cut_off(error.partial, error) from error
-            self.router.record("main", raw.usage, *self._adapter_and_model("main"))
+            self.router.record(self.role, raw.usage, *self._adapter_and_model(self.role))
             reply: ModelReply = raw
             complaints: tuple[str, ...] = ()
             if not capabilities.native_tools:
@@ -338,7 +368,7 @@ class Session:
                 if spent and outcome.reason is StopReason.COMPLETED:
                     # A reply cut off by the output limit keeps its own reason: that
                     # is not a verdict on the model.
-                    model = self._adapter_and_model("main")[1]
+                    model = self._adapter_and_model(self.role)[1]
                     outcome = replace(
                         outcome,
                         text=_unsuitable(model, spent),
@@ -347,10 +377,13 @@ class Session:
                 self._finish()
                 return outcome
 
-            audit_turn = self._audit_turn_base + self.state.turn
-            # Claimed as the batch starts, not when it ends: one that is interrupted has
-            # already audited its calls under this number.
-            self._next_audit_turn = audit_turn + 1
+            if self.audit_turn is not None:
+                audit_turn = self.audit_turn
+            else:
+                audit_turn = self._audit_turn_base + self.state.turn
+                # Claimed as the batch starts, not when it ends: one that is interrupted has
+                # already audited its calls under this number.
+                self._next_audit_turn = audit_turn + 1
             results = await self.executor.run_batch(outcome.calls, self.state, turn=audit_turn)
             self.state = loop.observe(self.state, results)
 
@@ -363,6 +396,11 @@ class Session:
         """
         specs = self.registry.specs()
         native = capabilities.native_tools
+        if self.system_prompt is not None:
+            parts = [self.system_prompt, f"The working directory is {self.root}."]
+            if not native:
+                parts.append(render_tools(specs))
+            return "\n\n".join(parts), specs if native else ()
         context = assemble(
             self.root,
             cwd=self.root,
@@ -377,7 +415,7 @@ class Session:
     def _request(
         self, capabilities: Capabilities, system: str, specs: tuple[ToolSpec, ...]
     ) -> ModelRequest:
-        """The next request for the main model, from the conversation as it is now."""
+        """The next request for the conversation's model, from the conversation as it is now."""
         return ModelRequest(
             system=system,
             transcript=self.state.transcript,
@@ -385,25 +423,34 @@ class Session:
             max_output_tokens=capabilities.max_output,
         )
 
-    async def _ask_main(
+    async def _send(
+        self, capabilities: Capabilities, system: str, specs: tuple[ToolSpec, ...], *, stream: bool
+    ) -> ModelReply:
+        """One request to the conversation's model, after the gate has seen it."""
+        request = self._request(capabilities, system, specs)
+        if self.gate is not None:
+            # Estimated the way compaction estimates, so that a limit counts what the budget does.
+            budget = self._budget(capabilities)
+            self.gate(budget.used(request.transcript, system, _tools_text(specs)))
+        return await self._complete(self.role, request, stream=stream)
+
+    async def _ask(
         self, capabilities: Capabilities, system: str, specs: tuple[ToolSpec, ...]
     ) -> ModelReply:
-        """Ask the main model, answering a context overflow the way spec 7.4 says to.
+        """Ask the conversation's model, answering a context overflow the way spec 7.4 says to.
 
         When the provider reports that the conversation does not fit its window the
         session compacts it once, fully, and asks again once. A second overflow, or a
         conversation with nothing older than its recent turns to compact, ends the
-        attempt: asking again could only fail the same way. This is the main request
-        only. The summary is a request to a model with a window of its own, and an
-        overflow there is that model's error and not something to retry.
+        attempt: asking again could only fail the same way. This is the request to the
+        conversation's model only. The summary is a request to a model with a window of its
+        own, and an overflow there is that model's error and not something to retry.
         """
         # A native model's text is shown as it arrives. A text-protocol reply is not: it
         # carries tool markup, and is parsed once the whole of it is here.
         stream = capabilities.native_tools
         try:
-            return await self._complete(
-                "main", self._request(capabilities, system, specs), stream=stream
-            )
+            return await self._send(capabilities, system, specs, stream=stream)
         except ModelError as error:
             if not error.context_overflow:
                 raise
@@ -411,9 +458,7 @@ class Session:
         if not await self._compact_fully(capabilities):
             raise self._does_not_fit(overflow, self._nothing_to_compact(capabilities)) from overflow
         try:
-            return await self._complete(
-                "main", self._request(capabilities, system, specs), stream=stream
-            )
+            return await self._send(capabilities, system, specs, stream=stream)
         except ModelError as error:
             if error.context_overflow:
                 raise self._does_not_fit(error, "even after compacting it") from error
@@ -433,7 +478,7 @@ class Session:
         is not the conversation's size at all: a ``context_window`` set above what the
         server really has, which compaction never catches because the budget believes it.
         """
-        model = self._adapter_and_model("main")[1]
+        model = self._adapter_and_model(self.role)[1]
         return ModelError(
             f"the conversation does not fit the context window of {model} {why_not} "
             "\u2014 use a model with a larger window (--model), start over with /clear, or, "
@@ -507,7 +552,7 @@ class Session:
         Returns the error to raise. The UI is given what is kept, as for any reply, so that
         one that did not show it as it arrived (a text-protocol reply is not streamed) can.
         """
-        self.router.record("main", partial.usage, *self._adapter_and_model("main"))
+        self.router.record(self.role, partial.usage, *self._adapter_and_model(self.role))
         self.state = replace(self.state, usage=self.state.usage + partial.usage)
         arrived = "".join(b.text for b in partial.blocks if isinstance(b, TextBlock))
         text = _LEADING_BLANK_LINES.sub("", arrived).rstrip()
@@ -572,7 +617,7 @@ class Session:
         self._mend()
         # The summary may never arrive, and the store holds what the model is shown.
         self._persist()
-        capabilities = await self.router.capabilities_for("main")
+        capabilities = await self.router.capabilities_for(self.role)
         return await self._compact_fully(capabilities, instructions)
 
     async def _compact_fully(
@@ -678,6 +723,17 @@ class Session:
     def _next_call_id(self) -> str:
         return new_call_id("tt")
 
+    async def _spawn(self, call: SubAgentCall) -> SubAgentResult:
+        """Run the sub-agent a ``Task`` call asks for, in a session of its own.
+
+        Imported here because ``agent/subagent.py`` builds a :class:`Session`. The call runs
+        inside a batch, which claimed its audit turn before it began (see :meth:`_drive`), so
+        the turn the sub-agent's calls are recorded under is the one just before the next.
+        """
+        from nanoclaude.agent.subagent import run_subagent
+
+        return await run_subagent(self, call, audit_turn=self._next_audit_turn - 1)
+
     def _persist(self) -> None:
         if self.store is None:
             return
@@ -723,7 +779,7 @@ class Session:
         overrides), and counting the prompt a request carries as well as the
         conversation, so the figure is the one the thresholds act on.
         """
-        capabilities = await self.router.capabilities_for("main")
+        capabilities = await self.router.capabilities_for(self.role)
         system, specs = self._prompt(capabilities)
         budget = self._budget(capabilities)
         used = budget.used(self.state.transcript, system, _tools_text(specs))

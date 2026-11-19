@@ -757,30 +757,47 @@ _ROLE_CALLS = {"client_for", "capabilities_for", "record", "_complete", "_adapte
 
 
 def _roles_the_source_asks_for() -> set[str]:
-    """Every role named as a literal in a call to the router, anywhere under src."""
+    """Every role named as a literal anywhere under src: as the first argument of a call to the
+    router or the session, as the ``role=`` a sub-agent or a session is made with, and as the
+    role a session starts with."""
     src = Path(router_module.__file__).resolve().parents[1]
     named: set[str] = set()
     for path in src.rglob("*.py"):
         for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
-                continue
-            if node.func.attr in _ROLE_CALLS and node.args:
-                first = node.args[0]
-                if isinstance(first, ast.Constant) and first.value in ROLES:
-                    named.add(first.value)
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Attribute) and node.func.attr in _ROLE_CALLS:
+                    first = node.args[0] if node.args else None
+                    if isinstance(first, ast.Constant) and first.value in ROLES:
+                        named.add(first.value)
+                for keyword in node.keywords:
+                    value = keyword.value
+                    if (
+                        keyword.arg == "role"
+                        and isinstance(value, ast.Constant)
+                        and value.value in ROLES
+                    ):
+                        named.add(value.value)
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and getattr(node.target, "id", "") == "role"
+                and isinstance(node.value, ast.Constant)
+                and node.value.value in ROLES
+            ):
+                named.add(node.value.value)
     return named
 
 
-def test_only_the_main_and_compact_roles_are_routed_in_this_version():
-    # The generated config and this module's docstring both say so. When sub-agents give
-    # `explore` a caller this fails, and the two places that say otherwise are due a rewrite.
-    assert _roles_the_source_asks_for() == {"main", "compact"}
+def test_only_the_main_explore_and_compact_roles_are_routed_in_this_version():
+    # The generated config and this module's docstring both say so. When something gives
+    # `plan`, `verify` or `title` a caller this fails, and the places that say otherwise are due
+    # a rewrite.
+    assert _roles_the_source_asks_for() == {"main", "explore", "compact"}
 
 
 def test_the_router_does_not_promise_the_saving_it_cannot_yet_deliver():
     doc = router_module.__doc__ or ""
     assert "largest saving" not in doc
-    assert "v0.3" in doc and "main" in doc and "compact" in doc
+    assert "v0.3" in doc and "main" in doc and "explore" in doc and "compact" in doc
 
 
 # --------------------------------------------------------------------------
@@ -817,9 +834,9 @@ def test_a_role_whose_model_has_no_key_is_named_with_the_variable_and_nothing_is
 
 
 @pytest.mark.parametrize("role", ["explore", "plan", "verify", "title"])
-def test_every_role_is_checked_and_not_only_the_two_that_are_routed_in_this_version(make, role):
+def test_every_role_is_checked_and_not_only_the_ones_that_are_routed(make, role):
     # A role nothing asks for yet is still a line in the configuration that says which key
-    # it needs, and it is better told now than when sub-agents begin to use it.
+    # it needs, and it is better told now than when something begins to use it.
     with pytest.raises(CredentialsError, match=f"role '{role}' uses model 'cheap'"):
         make(keyed_config(**{role: "cheap"})).check_credentials()
 

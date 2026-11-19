@@ -60,6 +60,7 @@ def default_registry(todo_state: TodoState | None = None) -> ToolRegistry:
     from nanoclaude.tools.glob import GlobTool
     from nanoclaude.tools.grep import GrepTool
     from nanoclaude.tools.read import ReadTool
+    from nanoclaude.tools.task import TaskTool
     from nanoclaude.tools.todo import TodoState, TodoWriteTool
     from nanoclaude.tools.write import WriteTool
 
@@ -74,5 +75,6 @@ def default_registry(todo_state: TodoState | None = None) -> ToolRegistry:
             # TodoState and must get that same object back. `or` would silently
             # swap in a fresh one the day TodoState gains a __len__.
             TodoWriteTool(todo_state if todo_state is not None else TodoState()),
+            TaskTool(),
         ]
     )

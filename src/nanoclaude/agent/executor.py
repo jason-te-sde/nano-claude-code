@@ -68,6 +68,7 @@ from nanoclaude.permissions.policy import (
     evaluate,
 )
 from nanoclaude.permissions.redact import Redactor
+from nanoclaude.subagents import Spawner
 from nanoclaude.tools.base import (
     Tool,
     ToolArgumentError,
@@ -152,6 +153,12 @@ class Executor:
     session_id: str = "session"
     grants: Grants = field(default_factory=Grants)
     redactor: Redactor = field(default_factory=Redactor)
+    #: What runs the sub-agent that a ``Task`` call asks for. None for an executor that has no
+    #: sub-agents to run: a sub-agent's own, which is why it cannot start another.
+    spawn: Spawner | None = None
+    #: The ``Task`` call that these calls are a sub-agent's, when they are: the audit marks each
+    #: row with it.
+    parent_call_id: str | None = None
 
     def context(self, state: LoopState) -> ToolContext:
         return ToolContext(
@@ -160,6 +167,7 @@ class Executor:
             redactor=self.redactor,
             read_state=state.read_state,
             root=self.policy.sandbox.roots[0],
+            spawn=self.spawn,
         )
 
     async def run_batch(
@@ -460,6 +468,7 @@ class Executor:
             arguments=call.arguments,
             decision=result.decision,
             rule=result.rule,
+            parent_call_id=self.parent_call_id,
         )
         # After the insert, so that a call whose decision was not stored is not owed an
         # outcome for a row that is not there.

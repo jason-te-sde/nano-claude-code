@@ -124,3 +124,20 @@ def test_a_session_built_here_keeps_its_state_and_home_inside_the_directory_it_w
     assert session.store.path.parent == tmp_repo / ".nanoclaude"
     # Global instructions are looked for here, never in the real home directory.
     assert session.home == str(tmp_repo / ".nanoclaude" / "home")
+
+
+async def test_the_explore_role_has_a_model_of_its_own_only_when_it_is_given_a_script(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    one_model = build_session(tmp_path / "a", [says("main")])
+    assert one_model.explore_model is None
+    assert await one_model.router.client_for("explore") is one_model.model
+
+    two_models = build_session(
+        tmp_path / "b", [says("main")], explore_script=[says("explore")], explore_model="m-explore"
+    )
+    assert two_models.explore_model is not None
+    assert await two_models.router.client_for("explore") is two_models.explore_model
+    assert await two_models.router.client_for("main") is two_models.model
+    assert await two_models.router.client_for("compact") is two_models.model
+    assert two_models.router.config.models["e"].model == "m-explore"

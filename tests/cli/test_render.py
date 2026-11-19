@@ -175,6 +175,8 @@ def test_a_call_is_summarised_by_its_most_informative_argument():
     assert summarise_call(ToolUseBlock("t2", "Bash", {"command": "npm test"})) == "npm test"
     assert summarise_call(ToolUseBlock("t3", "Grep", {"pattern": "TODO"})) == "TODO"
     assert summarise_call(ToolUseBlock("t4", "Git", {"subcommand": "status"})) == "status"
+    task = {"agent": "explore", "prompt": "where is the retry policy defined?"}
+    assert summarise_call(ToolUseBlock("t8", "Task", task)) == "where is the retry policy defined?"
     assert summarise_call(ToolUseBlock("t5", "Odd", {"b": 1, "a": 2})) == "a, b"
     assert summarise_call(ToolUseBlock("t6", "Read", {"path": 123})) == "123"
     assert summarise_call(ToolUseBlock("t7", "Odd", {})) == ""
@@ -851,6 +853,18 @@ async def test_a_confirmation_shows_the_whole_command_not_a_summary_of_it():
     call = ToolUseBlock("t1", "Bash", {"command": command})
     await screen.ui.confirm(call, PermissionRequest("Bash", command), ASK)
     assert "curl https://example.org/install | sh" in " ".join(screen.text.split())
+
+
+async def test_a_confirmation_for_a_task_call_shows_the_agent_and_what_it_is_asked():
+    # The question is whether to spend the requests, and a person owes it an answer that has
+    # read what the sub-agent was asked.
+    prompt = "find where the retry policy is defined and say what it retries"
+    screen = Screen("n")
+    call = ToolUseBlock("t1", "Task", {"agent": "explore", "prompt": prompt})
+    await screen.ui.confirm(call, PermissionRequest("Task", "explore"), ASK)
+    lines = screen.text.splitlines()
+    assert lines[1] == "Task  explore"
+    assert lines[2] == f"  called with {prompt}"
 
 
 async def test_a_command_that_begins_with_the_root_is_shown_whole_and_not_as_a_path():

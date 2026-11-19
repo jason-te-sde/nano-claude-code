@@ -86,7 +86,7 @@ def test_specs_are_sorted_by_name_regardless_of_registration_order():
     assert [spec.name for spec in registry.specs()] == ["Alpha", "Read", "Zeta"]
 
 
-def test_default_registry_includes_read_write_edit_glob_grep_and_todowrite():
+def test_default_registry_includes_read_write_edit_glob_grep_todowrite_and_task():
     registry = default_registry()
     assert "Read" in registry
     assert "Write" in registry
@@ -94,7 +94,8 @@ def test_default_registry_includes_read_write_edit_glob_grep_and_todowrite():
     assert "Glob" in registry
     assert "Grep" in registry
     assert "TodoWrite" in registry
-    assert len(registry) == 6
+    assert "Task" in registry
+    assert len(registry) == 7
 
 
 async def test_default_registry_wires_a_given_todo_state_into_todowrite(ctx):

@@ -104,6 +104,7 @@ DESIGN_NOTES = (
     "0014-openai-compat-first-class.md",
     "0015-bypass-does-not-disable-the-sandbox.md",
     "0016-attribution-policy.md",
+    "0017-sub-agents.md",
 )
 
 REQUIRED_SECTIONS = ("## Why", "## Costs", "## Rejected alternatives")
@@ -569,27 +570,52 @@ def _source() -> dict[str, str]:
     }
 
 
-def test_nothing_reads_the_shell_limits_yet():
-    readers = {
-        name
-        for name, text in _source().items()
-        if re.search(r"\b(?:bash_timeout_s|output_cap_bytes)\b", text)
-    }
-    assert readers == {"config/schema.py", "config/load.py", "cli/init.py"}, (
-        f"{sorted(readers)} read bash_timeout_s or output_cap_bytes; "
+def test_nothing_reads_the_shell_timeout_yet_and_only_the_sub_agent_reads_the_output_cap():
+    def readers(key: str) -> set[str]:
+        return {name for name, text in _source().items() if re.search(rf"\b{key}\b", text)}
+
+    assert readers("bash_timeout_s") == {"config/schema.py", "config/load.py", "cli/init.py"}, (
+        f"{sorted(readers('bash_timeout_s'))} read bash_timeout_s; "
         "docs/configuration.md says that nothing does yet"
+    )
+    assert readers("output_cap_bytes") == {
+        "config/schema.py",
+        "config/load.py",
+        "agent/subagent.py",
+    }, (
+        f"{sorted(readers('output_cap_bytes'))} read output_cap_bytes; docs/configuration.md "
+        "says that the sub-agent's answer is what it caps and that command output is reserved"
     )
 
 
-def test_only_the_main_and_compact_roles_are_sent_requests():
+def test_only_the_main_explore_and_compact_roles_are_sent_requests():
+    """The roles a request can be sent to are the ones named in a call to the router or the
+    session, the one a sub-agent is made with, and the one a session starts with."""
     used = set()
     for text in _source().values():
         used |= set(re.findall(r'router\.(?:client_for|capabilities_for)\(\s*"(\w+)"', text))
         used |= set(re.findall(r'self\._complete\(\s*"(\w+)"', text))
-    assert used == {"main", "compact"}, (
-        f"requests are sent to the roles {sorted(used)}; docs/configuration.md and "
-        "docs/design/0005-role-model-routing.md say that only main and compact are"
+        used |= set(re.findall(r'\brole="(\w+)"', text))
+        used |= set(re.findall(r'\brole: str = "(\w+)"', text))
+    assert used == {"main", "explore", "compact"}, (
+        f"requests are sent to the roles {sorted(used)}; README.md, docs/configuration.md and "
+        "docs/design/0005-role-model-routing.md say that only main, explore and compact are"
     )
+
+
+def test_the_documents_say_that_three_roles_are_sent_requests_and_which_they_are():
+    for document in (README, CONFIGURATION):
+        text = " ".join(_text(document).split())
+        assert "three roles" in text, f"{document.name} does not say how many roles are used"
+        assert "two roles are" not in text, f"{document.name} still says two roles are used"
+        assert "`plan`, `verify` and `title` are accepted and checked" in text, document.name
+        for role in ("main", "explore", "compact"):
+            assert f"`{role}`" in text, f"{document.name} does not name the {role} role"
+    readme = " ".join(_text(README).split())
+    assert "**Today three roles are used.**" in readme
+    assert "answers the `explore` sub-agent, which the `Task` tool starts" in readme
+    note = " ".join(_text(DESIGN / "0005-role-model-routing.md").split())
+    assert "Three roles are consulted." in note and "answers the sub-agent" in note
 
 
 def test_nothing_acts_on_the_capability_fields_the_notes_say_are_not_consulted():
@@ -1242,16 +1268,19 @@ def test_a_rules_glob_is_also_matched_against_the_absolute_path_without_its_lead
         assert "a project that repeats the path below its root" in text, document.name
 
 
-def test_the_limits_table_calls_the_shell_limits_reserved():
+def test_the_limits_table_calls_the_shell_limits_reserved_and_says_what_the_cap_is_for_now():
     rows = _table_rows(_section(_text(CONFIGURATION), "Limits"))
-    reserved = {
+    meanings = {
         row[0].strip("`"): row[2]
         for row in rows
         if row[0] in ("`bash_timeout_s`", "`output_cap_bytes`")
     }
-    assert set(reserved) == {"bash_timeout_s", "output_cap_bytes"}
-    for key, meaning in reserved.items():
+    assert set(meanings) == {"bash_timeout_s", "output_cap_bytes"}
+    for key, meaning in meanings.items():
         assert "Reserved" in meaning, f"the limits table does not call {key} reserved"
+    assert "sub-agent" in meanings["output_cap_bytes"], (
+        "the limits table does not say that the sub-agent's answer is what output_cap_bytes caps"
+    )
 
 
 # --------------------------------------------------------------------------

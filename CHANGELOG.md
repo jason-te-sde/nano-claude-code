@@ -17,6 +17,14 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
   and the store, and a two-phase executor that decides every call of a turn before it runs any.
 - The tools `Read`, `Edit` (a batch of exact replacements that applies whole or not at all),
   `Write`, `Glob`, `Grep` and `TodoWrite`.
+- The `Task` tool and one built-in sub-agent, `explore`, so that the `explore` role is sent
+  requests. The sub-agent is a session nested in the caller's, with `Read`, `Glob` and `Grep`
+  only, the caller's sandbox, mode, rules and session grants, and no way to ask the person
+  anything. It stops at 30 model calls, an estimated 200,000 input tokens or ten minutes, and
+  what it returns is its final text, cut to `output_cap_bytes`, as one tool result. Its cost is
+  a line of its own in `/cost`, and its calls are in the audit record under a new column,
+  `parent_call_id`, which a database from before it gets when it is opened. `/agents` lists the
+  sub-agents. `Task` asks by default.
 - Four permission modes (`default`, `plan`, `accept-edits`, `bypass`), `allow`, `ask` and `deny`
   rules, a sandbox that follows symlinks, and a fixed order of checks whose rule ids are recorded
   with every decision. `--dangerously-skip-permissions` skips the questions and not the sandbox,
@@ -34,7 +42,7 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
 - A price book that prices by prompt length. Claude Haiku 5.5 costs $0.10 per million input
   tokens and $0.50 per million output tokens for a call whose prompt is up to 100,000 tokens, and
   $0.50 and $2.50 above that. A price row that lacks a price is refused, by name.
-- Roles, with `main` and `compact` sent requests so far, `--model` and `--role`, and a check when
+- Roles, with `main`, `explore` and `compact` sent requests so far, `--model` and `--role`, and a check when
   a session starts that the key of every role's model is set, which names the first role that
   lacks one.
 - Compaction (old tool results shrunk at 70% of the room, older history summarised at 85%), and
@@ -61,11 +69,12 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
 - Configuration in two files, with the project's file treated as untrusted: it may add `deny`
   and `ask` rules and choose models, and may not add `allow` rules, name a `base_url` or an
   `api_key_env`, re-point one of your models or raise the turn, timeout and output limits.
-  `bash_timeout_s`, `output_cap_bytes` and the `Bash` and `Git` entries in the rule lists are
-  reserved for tools this version does not have, and the configuration `ncc init` writes says so.
+  `bash_timeout_s` and the `Bash` and `Git` entries in the rule lists are reserved for tools this
+  version does not have, and the configuration `ncc init` writes says so. `output_cap_bytes` caps
+  a sub-agent's answer, and is reserved as well for the output of a command.
 - The `ncc` command: an interactive REPL with history, completion, vi keys on request and
-  `/help`, `/clear`, `/compact`, `/status`, `/cost`, `/model`, `/mode`, `/tools`, `/resume`,
-  `/export`, `/init` and `/exit`; `-p` for one prompt with text or JSON output and the exit codes
+  `/help`, `/clear`, `/compact`, `/status`, `/cost`, `/model`, `/mode`, `/tools`, `/agents`,
+  `/resume`, `/export`, `/init` and `/exit`; `-p` for one prompt with text or JSON output and the exit codes
   0, 1, 2, 3, 4, 130 and 141; and `ncc init`, which writes the configuration and then checks the
   key.
 - Under `-p`, a line on stderr for each call that was declined because nobody could be asked,
@@ -100,7 +109,7 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
   assignments, a rule's glob that is also matched against the absolute path without its leading
   slash (a known issue, to be fixed), and a line number that `Read` and `Grep` can count
   differently.
-- The roles `explore`, `plan`, `verify` and `title` are accepted and no request is sent to them; routing them is v0.3 scope, with sub-agents.
+- The roles `plan`, `verify` and `title` are accepted and no request is sent to them; routing them waits for the sub-agents and commands that would use them.
 - Models that are not in the capability table, other than local ones that can be probed, use the
   text protocol until `native_tools` is set; the REPL says so when it starts.
 - Every provider cassette in the tests is hand-written; none was recorded from a real server.
