@@ -74,8 +74,12 @@ DEFAULTS: Config = {
     # Every result and error is written twice.
     "duplicate_replies": False,
     # `tools/call`: echo, never (no answer), error (a JSON-RPC error), is-error (a result
-    # with isError) or big (an answer of exactly `line_size` bytes).
+    # with isError), big (an answer of exactly `line_size` bytes) or flood (`flood_requests`
+    # requests of the server's own, then the answer, then, if `flood_then_stop_reading`, no more
+    # reading of stdin, so that nothing the client writes is ever taken).
     "call": "echo",
+    "flood_requests": 20_000,
+    "flood_then_stop_reading": True,
     "line_size": MAX_LINE_BYTES + 1,
     "call_delay": 0.0,
     # Leave as soon as the handshake is done, or before reading a byte.
@@ -85,7 +89,8 @@ DEFAULTS: Config = {
     "server_requests": [],
     "server_notifications": False,
     # What SIGTERM does (default, ignore, or log-exit), what the end of stdin does (exit or
-    # linger), and whether a helper process is left in the group (none or child).
+    # linger), and whether a helper process is started (none; child, in the server's group; or
+    # escaped, which leaves the group and keeps the server's pipes open for up to 25 s).
     "on_term": "default",
     "on_stdin_eof": "exit",
     "helper": "none",
@@ -106,6 +111,7 @@ MODES: dict[str, Config] = {
     "unsupported-version": {"supported": ["2099-01-01"]},
     "silent-discover": {**_LEGACY, "discover": "silent"},
     "slow": {**_MODERN, "call": "never"},
+    "request-flood": {**_MODERN, "call": "flood"},
     "crash": {**_MODERN, "exit_after_handshake": True},
     "crash-on-start": {"exit_on_start": True},
     "oversized-line": {**_MODERN, "call": "big"},
@@ -121,6 +127,9 @@ MODES: dict[str, Config] = {
     "rpc-error": {**_MODERN, "call": "error"},
     # Ends at the end of stdin, and leaves a helper behind that nothing but SIGKILL stops.
     "orphan-helper": {**_MODERN, "on_term": "ignore", "helper": "child"},
+    # Ends at the end of stdin, and leaves a helper that is no longer in its group and holds
+    # its pipes.
+    "escaped-helper": {**_MODERN, "helper": "escaped"},
     # Does not end at the end of stdin, and says when SIGTERM arrives.
     "ignore-stdin-eof": {**_MODERN, "on_term": "log-exit", "on_stdin_eof": "linger"},
     # Ignores the end of stdin and SIGTERM, and has a helper that does too.
@@ -160,6 +169,7 @@ class Server:
         self.settings = settings
         #: The version the client named, once a modern handshake has been answered.
         self.modern_version: str | None = None
+        self.stopped_reading = False
         self.handlers: dict[str, Callable[[dict[str, Any]], None]] = {
             "server/discover": self.on_discover,
             "initialize": self.on_initialize,
@@ -207,8 +217,8 @@ class Server:
             raise SystemExit(3)
         if settings["on_term"] != "default":
             signal.signal(signal.SIGTERM, self.on_sigterm)
-        if settings["helper"] == "child":
-            self.leave_helper()
+        if settings["helper"] != "none":
+            self.leave_helper(escape=settings["helper"] == "escaped")
 
     def on_sigterm(self, _signum: int, _frame: object) -> None:
         if self.settings["on_term"] == "ignore":
@@ -218,20 +228,28 @@ class Server:
         os._exit(0)
 
     @staticmethod
-    def leave_helper() -> None:
+    def leave_helper(*, escape: bool) -> None:
         pid = os.fork()
         if pid == 0:
-            # The helper stays in the server's process group, ignores what would end it, and
-            # keeps the inherited pipes open, as a worker a real server spawned would.
+            # The helper ignores what would end it and keeps the inherited pipes open, as a
+            # worker a real server spawned would. One that escapes also leaves the server's
+            # process group, so that nothing sent to the group reaches it, and it stops by
+            # itself after 25 s so that a test that dies leaves nothing behind for long.
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
-            while True:
-                time.sleep(1)
+            if escape:
+                os.setsid()
+            for _ in range(125):
+                time.sleep(0.2)
+            os._exit(0)
         log("HELPER", pid)
 
     def run(self) -> None:
         self.start()
         for raw in iter(sys.stdin.buffer.readline, b""):
             self.handle(raw)
+            if self.stopped_reading:
+                while True:  # never read stdin again; only a signal ends this
+                    time.sleep(0.05)
         event("stdin-eof")
         while self.settings["on_stdin_eof"] == "linger":
             time.sleep(0.05)
@@ -386,6 +404,11 @@ class Server:
             self.reply(request, {"content": [{"type": "text", "text": "boom"}], "isError": True})
         elif what == "big":
             self.write_exact(request, settings["line_size"])
+        elif what == "flood":
+            for number in range(settings["flood_requests"]):
+                self.send({"id": f"srv-{number}", "method": "ping"})
+            self.reply(request, {"content": [{"type": "text", "text": "after the flood"}]})
+            self.stopped_reading = settings["flood_then_stop_reading"]
         else:
             arguments = params.get("arguments")
             result = {

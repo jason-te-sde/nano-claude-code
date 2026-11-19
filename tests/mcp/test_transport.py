@@ -3,12 +3,15 @@
 its stderr, and that closing it leaves nothing behind."""
 
 import asyncio
+import contextlib
+import errno
 import os
 import signal
 import time
 
 import pytest
 
+import nanoclaude.mcp.transport as transport_module
 from nanoclaude.mcp.jsonrpc import MAX_LINE_BYTES, LineTooLongError
 from nanoclaude.mcp.transport import (
     ENV_ALLOWLIST,
@@ -25,7 +28,8 @@ from tests.mcp.helpers import (
     eventually,
     fake_server,
     group_is_gone,
-    logged_helper_pid,
+    helper_pid,
+    kill_helpers,
     open_descriptors,
     process_is_gone,
     python_child,
@@ -466,7 +470,7 @@ async def test_a_server_that_ignores_both_is_killed_and_so_is_everything_it_star
     transport = make_transport(command, args, stdin_grace=0.3, term_grace=0.3)
     await transport.start()
     await when_ready(transport)
-    pgid, helper = transport.pid, logged_helper_pid(log_path)
+    pgid, helper = transport.pid, await helper_pid(log_path)
     assert pgid is not None and not group_is_gone(pgid)
     began = time.monotonic()
     await transport.close()
@@ -483,7 +487,7 @@ async def test_a_helper_left_behind_by_a_server_that_exited_is_ended_too(make_tr
     transport = make_transport(command, args, stdin_grace=0.2, term_grace=0.2)
     await transport.start()
     await when_ready(transport)
-    pgid, helper = transport.pid, logged_helper_pid(log_path)
+    pgid, helper = transport.pid, await helper_pid(log_path)
     assert pgid is not None
     await transport.close()
     assert transport.returncode == 0, "the server itself was signalled"
@@ -505,3 +509,182 @@ async def test_a_close_that_is_cancelled_still_ends_the_server(make_transport, l
         await closing
     assert await eventually(lambda: group_is_gone(pgid))
     assert group_is_gone(pgid), "cancelling close left the server running"
+
+
+# --------------------------------------------------------------------------
+# Closing when something holds a pipe open
+# --------------------------------------------------------------------------
+
+_FLOOD_STDOUT = (
+    "import sys\n"
+    "line = b'x' * 65_535 + b'\\n'\n"
+    "while True:\n"
+    "    sys.stdout.buffer.write(line)\n"
+    "    sys.stdout.buffer.flush()\n"
+)
+
+
+async def test_closing_leaves_nothing_open_after_a_flood_nobody_read_paused_stdout(
+    make_transport,
+):
+    before = open_descriptors()
+    command, args = python_child(_FLOOD_STDOUT)
+    transport = make_transport(command, args, stdin_grace=0.2, term_grace=2.0)
+    await transport.start()
+    process = transport._process
+    assert process is not None and process.stdout is not None
+    # Nobody reads, so the stream fills to twice its limit and asyncio stops reading the pipe,
+    # which is then never at its end: the state in which waiting for the process never ends.
+    assert await eventually(lambda: process.stdout._paused, within=20)
+    began = time.monotonic()
+    await asyncio.wait_for(transport.close(), timeout=10)
+    # SIGTERM ends it at once. A close that waited for asyncio to say the process was over
+    # would wait out the whole of the two seconds it gives SIGTERM, for a pipe that never ends.
+    assert time.monotonic() - began < 1.5, f"close took {time.monotonic() - began:.1f}s"
+    assert transport.returncode == -signal.SIGTERM, transport.returncode
+    assert await eventually(lambda: open_descriptors() == before), (before, open_descriptors())
+
+
+async def test_closing_leaves_nothing_open_when_a_child_that_left_the_group_holds_the_pipes(
+    make_transport, log_path
+):
+    before = open_descriptors()
+    command, args = fake_server("escaped-helper")
+    transport = make_transport(command, args, stdin_grace=1.5, term_grace=1.5, drain_grace=0.2)
+    await transport.start()
+    await when_ready(transport)
+    helper = await helper_pid(log_path)
+    try:
+        began = time.monotonic()
+        await asyncio.wait_for(transport.close(), timeout=10)
+        # The server leaves at the end of its stdin and nothing else is in its group; a close
+        # that waited on asyncio's own wait would wait out the whole of the first period.
+        assert time.monotonic() - began < 1.2, f"close took {time.monotonic() - began:.1f}s"
+        assert transport.returncode == 0
+        assert not process_is_gone(helper), "the helper did not outlive the server, as it should"
+        assert await eventually(lambda: open_descriptors() == before), (before, open_descriptors())
+    finally:
+        kill_helpers(log_path)
+
+
+# --------------------------------------------------------------------------
+# The log is never written through a link
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("target_exists", [True, False], ids=["a-file", "nothing"])
+async def test_the_log_is_never_written_through_a_link(
+    make_transport, log_path, tmp_path, target_exists
+):
+    target = tmp_path / "somebody-elses-file"
+    if target_exists:
+        target.write_text("precious\n")
+    log_path.parent.mkdir(parents=True)
+    log_path.symlink_to(target)
+    command, args = python_child(_WRITE_TO_STDERR, "diagnostics\n")
+    transport = make_transport(command, args)
+    await transport.start()
+    assert await drain(transport) == [b"out"], "the server did not run"
+    await transport.close()
+    assert log_path.is_symlink()
+    if target_exists:
+        assert target.read_text() == "precious\n", "the log was written through the link"
+    else:
+        assert not target.exists(), "the link's target was made and written"
+
+
+# --------------------------------------------------------------------------
+# What close() does once, and what it does not do twice
+# --------------------------------------------------------------------------
+
+
+async def test_a_second_close_does_not_look_at_the_group_again(make_transport, monkeypatch):
+    transport = make_transport("/bin/cat")
+    await transport.start()
+    await transport.close()
+    looked: list[tuple[int, int]] = []
+    real = os.killpg
+
+    def killpg(pgid: int, sig: int) -> None:
+        looked.append((pgid, sig))
+        real(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    await transport.close()
+    # The group id is the server's pid, which by now may be anybody's: not even the look
+    # that sends no signal is safe.
+    assert looked == []
+
+
+async def test_nothing_is_signalled_once_the_group_is_known_to_be_gone(make_transport, monkeypatch):
+    transport = make_transport("/bin/cat")
+    await transport.start()
+    await transport.close()
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    transport._signal_group(signal.SIGKILL)
+    assert sent == []
+
+
+async def test_what_the_server_wrote_to_stderr_before_it_went_is_in_the_log_when_close_returns(
+    make_transport, log_path, monkeypatch
+):
+    # A log that is slow to write, in small pieces, so that the server is gone, and close()
+    # has seen it go, while most of what it wrote is still waiting to be put in the log.
+    real_append = CappedLog.append
+
+    def slow_append(self: CappedLog, data: bytes) -> None:
+        time.sleep(0.0002)
+        real_append(self, data)
+
+    monkeypatch.setattr(CappedLog, "append", slow_append)
+    monkeypatch.setattr(transport_module, "_STDERR_CHUNK", 512)
+    source = (
+        "import sys\n"
+        "line = b'e' * 1023 + b'\\n'\n"
+        "for _ in range(1024):\n"
+        "    sys.stderr.buffer.write(line)\n"
+        "sys.stderr.buffer.write(b'THE-LAST-LINE\\n')\n"
+    )
+    command, args = python_child(source)
+    transport = make_transport(command, args, drain_grace=30.0)
+    await transport.start()
+    await transport.close()  # without having read a line of stdout
+    data = log_path.read_bytes()
+    assert data.endswith(b"THE-LAST-LINE\n"), f"the log ends {data[-40:]!r}"
+    assert len(data) <= STDERR_LOG_CAP
+
+
+def test_a_group_the_system_will_not_let_us_look_at_is_taken_to_be_there(monkeypatch):
+    def refuse(pgid: int, sig: int) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "killpg", refuse)
+    assert StdioTransport._group_alive(12345) is True
+
+
+async def test_a_group_the_system_will_not_let_us_signal_does_not_stop_close(
+    make_transport, monkeypatch
+):
+    # macOS says "not permitted", and not "no such process", of a group whose only members
+    # are zombies, and the end of a close must not depend on which.
+    monkeypatch.setattr(transport_module, "_KILL_WAIT_SECONDS", 0.1)
+    command, args = fake_server("ignore-stdin-eof")
+    transport = make_transport(command, args, stdin_grace=0.1, term_grace=0.1, drain_grace=0.1)
+    await transport.start()
+    await when_ready(transport)
+    real = os.killpg
+
+    def refuse(pgid: int, sig: int) -> None:
+        if sig:
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+        real(pgid, sig)
+
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(os, "killpg", refuse)
+            await asyncio.wait_for(transport.close(), timeout=10)
+    finally:
+        if transport.pid is not None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(transport.pid, signal.SIGKILL)

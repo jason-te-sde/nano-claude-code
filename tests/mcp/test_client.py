@@ -4,6 +4,7 @@ what it asks in each, and what it does when the server misbehaves."""
 
 import asyncio
 import dataclasses
+import time
 from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any, TypeVar
@@ -33,6 +34,7 @@ from nanoclaude.mcp.transport import TransportError
 from tests.mcp.helpers import (
     eventually,
     group_is_gone,
+    kill_helpers,
     received,
     received_methods,
 )
@@ -352,8 +354,12 @@ async def test_a_server_that_never_stops_paginating_is_cut_off_after_twenty_requ
 ):
     client = make_client("paginated", "pages=1000", "per_page=1")
     await client.start()
-    with pytest.raises(McpProtocolError, match=r"20 pages"):
+    with pytest.raises(McpProtocolError) as caught:
         await bounded(client.list_tools())
+    assert str(caught.value) == (
+        "the server offered 20 tools and still has more pages after 20 pages, "
+        "past the limit of 20 pages"
+    )
     await client.close()
     assert len(requests(log_path, "tools/list")) == MAX_TOOL_PAGES
 
@@ -366,15 +372,22 @@ async def test_five_hundred_and_twelve_tools_are_read_and_a_five_hundred_and_thi
     assert len(await ok.list_tools()) == 512
     too_many = make_client("paginated", "pages=1", "per_page=513")
     await too_many.start()
-    with pytest.raises(McpProtocolError, match="512 tools"):
+    with pytest.raises(McpProtocolError) as caught:
         await too_many.list_tools()
+    assert str(caught.value) == (
+        "the server offered 513 tools over 1 page(s), past the limit of 512 tools"
+    )
 
 
 async def test_the_tool_limit_counts_across_pages_and_stops_the_requests(make_client, log_path):
     client = make_client("paginated", "pages=50", "per_page=200")
     await client.start()
-    with pytest.raises(McpProtocolError, match="512 tools"):
+    with pytest.raises(McpProtocolError) as caught:
         await bounded(client.list_tools())
+    # Six hundred is what the third page brought it to, and the server had more to give.
+    assert str(caught.value) == (
+        "the server offered at least 600 tools over 3 page(s), past the limit of 512 tools"
+    )
     await client.close()
     assert len(requests(log_path, "tools/list")) == 3, "paging went on after the limit was passed"
 
@@ -686,6 +699,56 @@ async def test_a_line_over_four_mebibytes_fails_the_server_and_ends_its_process(
     assert await eventually(lambda: group_is_gone(pid), within=10)
     with pytest.raises(McpProtocolError):
         await client.list_tools()
+
+
+async def test_a_hundred_requests_from_the_server_are_each_answered(make_client, log_path):
+    client = make_client("request-flood", "flood_requests=100", "flood_then_stop_reading=false")
+    await client.start()
+    result = await bounded(client.call_tool("echo", {}, timeout=20))
+    await client.close()
+    assert result.content == [{"type": "text", "text": "after the flood"}]
+    answers = [m for m in received(log_path) if str(m.get("id", "")).startswith("srv-")]
+    assert [m["id"] for m in answers] == [f"srv-{n}" for n in range(100)]
+    assert all(m["result"] == {} for m in answers)
+
+
+async def test_a_server_that_floods_requests_and_reads_no_answer_fails_the_client(
+    make_client, transports
+):
+    # Twenty thousand requests, and then the answer to the call, from a server that has
+    # stopped reading its input. The answers fill the pipe; a reader that waited for it to
+    # empty would never get as far as the answer to the call, which would wait out its own
+    # minute. This one gives up on the server, and says why.
+    client = make_client("request-flood", transport_options={"stdin_grace": 0.2, "term_grace": 0.5})
+    await client.start()
+    with pytest.raises(McpConnectionError, match="not reading its input"):
+        await bounded(client.call_tool("echo", {}, timeout=60), 20)
+    assert isinstance(client.failure, McpConnectionError)
+    pid = transports[client].pid
+    assert pid is not None and await eventually(lambda: group_is_gone(pid), within=10)
+
+
+async def test_a_server_that_exits_is_noticed_even_if_a_child_keeps_its_output_open(
+    make_client, log_path
+):
+    client = make_client(
+        "escaped-helper", "exit_after_handshake=true", transport_options={"drain_grace": 0.2}
+    )
+    try:
+        await bounded(client.start())
+        # The server has exited, and a child that left its group holds stdout and stdin open,
+        # so nothing ends the stream. A client that waited for the stream would wait the
+        # whole of the thirty seconds a request is given.
+        began = time.monotonic()
+        with pytest.raises(McpConnectionError, match="exited or crashed"):
+            await bounded(client.list_tools(), 10)
+        assert time.monotonic() - began < 5
+        assert isinstance(client.failure, McpConnectionError)
+        with pytest.raises(McpConnectionError):
+            await bounded(client.call_tool("echo", {}, timeout=30), 5)
+    finally:
+        await client.close()
+        kill_helpers(log_path)
 
 
 # --------------------------------------------------------------------------

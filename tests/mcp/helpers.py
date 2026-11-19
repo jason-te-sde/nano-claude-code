@@ -2,8 +2,10 @@
 """What the MCP tests share: how to start the fake server, and how to read what it logged."""
 
 import asyncio
+import contextlib
 import json
 import os
+import signal
 import sys
 import time
 from collections.abc import Callable
@@ -57,6 +59,30 @@ def logged_helper_pid(log: Path) -> int:
         if text.startswith("HELPER "):
             return int(text.split()[1])
     raise AssertionError(f"the fake server logged no helper:\n{log.read_text(encoding='utf-8')}")
+
+
+async def helper_pid(log: Path) -> int:
+    """The id the fake server logged for its helper, once the log holds it.
+
+    The log is written by the transport as stderr arrives, which is not at the same moment as
+    anything the server wrote to stdout.
+    """
+
+    def logged() -> bool:
+        return log.exists() and "HELPER " in log.read_text(encoding="utf-8")
+
+    assert await eventually(logged), "the fake server logged no helper"
+    return logged_helper_pid(log)
+
+
+def kill_helpers(log: Path) -> None:
+    """End every helper the fake server logged: one that left the group is nobody else's to end."""
+    if not log.exists():
+        return
+    for text in log.read_text(encoding="utf-8").splitlines():
+        if text.startswith("HELPER "):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(int(text.split()[1]), signal.SIGKILL)
 
 
 def group_is_gone(pgid: int) -> bool:

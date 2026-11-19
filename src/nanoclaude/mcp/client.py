@@ -17,11 +17,17 @@ legacy, so the fallback is the main path and not the exception:
 **What a client does not do.** It declares no capabilities, so a server has no business
 asking it for anything: a request from the server is answered ``-32601``, except ``ping``;
 its notifications are ignored; a result that is not ``complete`` is an error on that call.
+The answers are written by a task of their own, from a queue of at most
+:data:`MAX_PENDING_REPLIES`: the reader of the server's output never waits for a pipe that
+the server is not emptying, which would stop it reading the answers to our own requests. A
+server that sends requests faster than it takes the replies has failed the client.
 A server's tool list is read when asked for and is not watched. No tool is named, described
 or wrapped here: :class:`RemoteTool` and :class:`CallResult` hold what the server sent, and
 turning that into something safe to show a model is the adapter's job.
 
-**Failing for good.** A line over 4 MiB, or a server that has gone, fails the client: every
+**Failing for good.** A line over 4 MiB, a server that has gone (its output closed, or its
+process exited whoever else holds the pipe) and a server that is not reading its input fail
+the client: every
 request that is waiting and every later one raises the same error, and the process is ended.
 Anything less (a line that is not JSON, a reply to nothing, a result of the wrong shape)
 costs only that line or that call.
@@ -68,6 +74,10 @@ REQUEST_TIMEOUT_SECONDS = 30.0
 #: The most pages of ``tools/list`` followed, and the most tools taken from them.
 MAX_TOOL_PAGES = 20
 MAX_TOOLS = 512
+
+#: The most answers to the server's own requests that may be waiting to be written. A server
+#: that is reading its input empties this as fast as it fills; one that is not has failed.
+MAX_PENDING_REPLIES = 64
 
 #: How long to wait for a cancellation to be written before giving up on it.
 _CANCEL_SEND_SECONDS = 2.0
@@ -190,6 +200,8 @@ class McpClient:
         self._ids = RequestIds()
         self._pending: dict[RequestId, asyncio.Future[Response | ErrorResponse]] = {}
         self._reader: asyncio.Task[None] | None = None
+        self._replies: asyncio.Queue[Response | ErrorResponse] = asyncio.Queue(MAX_PENDING_REPLIES)
+        self._reply_writer: asyncio.Task[None] | None = None
         self._started = False
         self._closed = False
         self._failure: McpError | None = None
@@ -237,6 +249,7 @@ class McpClient:
             except TransportError as exc:
                 raise McpConnectionError(str(exc)) from exc
             self._reader = asyncio.create_task(self._read_loop(), name="mcp-reader")
+            self._reply_writer = asyncio.create_task(self._write_replies(), name="mcp-replies")
             if not await self._discover():
                 await self._initialize()
         except BaseException as exc:
@@ -311,7 +324,7 @@ class McpClient:
         self._require_started()
         tools: list[RemoteTool] = []
         cursor: str | None = None
-        for _ in range(MAX_TOOL_PAGES):
+        for page_number in range(1, MAX_TOOL_PAGES + 1):
             params: dict[str, Any] = {} if cursor is None else {"cursor": cursor}
             result = await self._request(
                 "tools/list", self._with_meta(params), self._request_timeout
@@ -322,18 +335,27 @@ class McpClient:
                 raise McpProtocolError(
                     f"tools/list: 'tools' must be a list, not {type(entries).__name__}"
                 )
-            for entry in entries:
-                tools.append(self._remote_tool(entry, len(tools)))
-                if len(tools) > MAX_TOOLS:
-                    raise McpProtocolError(f"the server lists more than {MAX_TOOLS} tools")
+            offered = len(tools) + len(entries)
             cursor = page.get("nextCursor")
+            if offered > MAX_TOOLS:
+                # More pages may follow, so what was seen is a floor and not the total.
+                at_least = "at least " if cursor is not None else ""
+                raise McpProtocolError(
+                    f"the server offered {at_least}{offered} tools over {page_number} page(s), "
+                    f"past the limit of {MAX_TOOLS} tools"
+                )
+            first = len(tools)
+            tools.extend(self._remote_tool(entry, first + n) for n, entry in enumerate(entries))
             if cursor is None:
                 return tools
             if not isinstance(cursor, str):
                 raise McpProtocolError(
                     f"tools/list: nextCursor must be a string, not {type(cursor).__name__}"
                 )
-        raise McpProtocolError(f"the server lists more than {MAX_TOOL_PAGES} pages of tools")
+        raise McpProtocolError(
+            f"the server offered {len(tools)} tools and still has more pages after "
+            f"{MAX_TOOL_PAGES} pages, past the limit of {MAX_TOOL_PAGES} pages"
+        )
 
     @staticmethod
     def _remote_tool(entry: object, position: int) -> RemoteTool:
@@ -472,18 +494,31 @@ class McpClient:
             # Otherwise it answers nothing we are waiting for (a call that timed out, an id
             # nobody sent): ignored.
         elif isinstance(message, Request):
-            await self._refuse_or_ping(message)
+            try:
+                self._replies.put_nowait(self._answer_to(message))
+            except asyncio.QueueFull:
+                await self._fail(
+                    McpConnectionError(
+                        f"the server is not reading its input: {MAX_PENDING_REPLIES} answers to "
+                        "its own requests are waiting to be written, and it keeps sending more"
+                    )
+                )
         # A notification is ignored: this client acts on none of them.
 
-    async def _refuse_or_ping(self, request: Request) -> None:
-        reply: Response | ErrorResponse
+    @staticmethod
+    def _answer_to(request: Request) -> Response | ErrorResponse:
         if request.method == "ping":
-            reply = Response(request.id, {})
-        else:
-            error = RpcError(METHOD_NOT_FOUND, f"Method not found: {request.method}")
-            reply = ErrorResponse(request.id, error)
-        with contextlib.suppress(McpError):  # the server may be going; its reader says so
-            await self._send(reply)
+            return Response(request.id, {})
+        return ErrorResponse(
+            request.id, RpcError(METHOD_NOT_FOUND, f"Method not found: {request.method}")
+        )
+
+    async def _write_replies(self) -> None:
+        """Write the answers to the server's requests, one at a time, as the pipe takes them."""
+        while True:
+            reply = await self._replies.get()
+            with contextlib.suppress(McpError):  # the server may be going; its reader says so
+                await self._send(reply)
 
     async def _fail(self, error: McpError) -> None:
         """Fail the client for good: wake what is waiting with ``error``, and end the server."""
@@ -499,10 +534,12 @@ class McpClient:
     async def close(self) -> None:
         """End the server and everything waiting on it. Safe to call more than once."""
         self._closed = True
-        reader, self._reader = self._reader, None
-        if reader is not None:
-            reader.cancel()
-            await asyncio.wait({reader})
+        tasks = {task for task in (self._reader, self._reply_writer) if task is not None}
+        self._reader = self._reply_writer = None
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.wait(tasks)
         gone = self._failure or McpError("the client is closed")
         for future in self._pending.values():
             if not future.done():
