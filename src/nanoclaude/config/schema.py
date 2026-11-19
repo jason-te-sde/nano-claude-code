@@ -15,6 +15,18 @@ ROLES = ("main", "explore", "plan", "verify", "compact", "title")
 THEMES = ("auto", "light", "dark")
 DIFF_STYLES = ("unified",)
 
+#: A server's name in ``[mcp.<name>]``. No hyphen: the name is part of the registry name
+#: ``mcp__<server>__<tool>``, which the text tool protocol writes as an identifier.
+MCP_SERVER_NAME = r"[a-z0-9][a-z0-9_]{0,23}"
+
+#: The transports a server may name. Streamable HTTP is not built, and when it is, it is
+#: ``"http"``.
+MCP_TRANSPORTS = ("stdio",)
+
+#: The seconds a server's ``timeout`` may be, and what it is when the server does not say.
+MCP_TIMEOUT_RANGE = (1, 600)
+MCP_DEFAULT_TIMEOUT = 30
+
 #: The variable a model's key is read from when its config does not name one.
 #: Empty means the adapter needs no key.
 DEFAULT_KEY_ENV: Mapping[str, str] = MappingProxyType(
@@ -91,12 +103,36 @@ class UiConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class McpServerConfig:
+    """One ``[mcp.<name>]``: a program ncc starts, speaks to over stdio and takes tools from.
+
+    ``timeout`` is the seconds that one request to the server may take. ``env`` is added to
+    the few variables a server is given from ncc's own environment, and is the one way a
+    credential reaches it.
+    """
+
+    name: str
+    command: str
+    args: tuple[str, ...] = ()
+    # Never shown by repr, as Config.env is not: this is where a server's credentials go.
+    env: dict[str, str] = field(default_factory=dict, repr=False)
+    transport: str = "stdio"
+    enabled: bool = True
+    timeout: int = MCP_DEFAULT_TIMEOUT
+
+    # Declared unhashable rather than left to the default: env is a dict. See Config.
+    __hash__ = None  # type: ignore[assignment]
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     models: dict[str, ModelConfig]
     roles: RolesConfig
     limits: LimitsConfig = field(default_factory=LimitsConfig)
     permissions: PermissionsConfig = field(default_factory=PermissionsConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    #: The MCP servers of the person's own file, by name, in the order the file gives them.
+    mcp: dict[str, McpServerConfig] = field(default_factory=dict)
     # Never shown by repr: this holds API keys, and a repr ends up in logs, in
     # assertion output and in exception messages.
     env: dict[str, str] = field(default_factory=dict, repr=False)

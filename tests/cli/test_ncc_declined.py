@@ -98,6 +98,37 @@ def test_anything_else_is_to_be_allowed_by_a_rule_and_not_by_a_mode_that_would_n
     assert "accept-edits" not in again and 'add "Write" to allow' in again
 
 
+def test_a_changed_mcp_tool_is_not_told_to_be_allowed_by_a_rule_which_would_not_help():
+    # mcp.changed asks whatever the rules say, so the advice to allow the tool would send a
+    # script to a change that does nothing.
+    request = PermissionRequest("mcp__github__create_issue", "server github", is_write=True)
+    line = declined_line(
+        "mcp__github__create_issue",
+        request,
+        rule="mcp.changed",
+        root="/p",
+        mode=PermissionMode.DEFAULT,
+    )
+    assert line.startswith("declined (mcp.changed) mcp__github__create_issue server github — ")
+    assert "allow" not in line
+    assert "interactive" in line
+
+
+def test_an_mcp_tool_that_nothing_allowed_is_told_to_be_allowed_by_name_as_any_tool_is():
+    request = PermissionRequest("mcp__github__create_issue", "server github", is_write=True)
+    line = declined_line(
+        "mcp__github__create_issue",
+        request,
+        rule="default.ask",
+        root="/p",
+        mode=PermissionMode.DEFAULT,
+    )
+    assert line.endswith(
+        'add "mcp__github__create_issue" to allow under [permissions] in your config to let -p '
+        "run it"
+    )
+
+
 def test_a_path_outside_the_root_and_a_command_are_shown_as_they_are():
     outside = PermissionRequest("Write", "/etc/x", ("/etc/x",), is_write=True)
     assert declined_line(

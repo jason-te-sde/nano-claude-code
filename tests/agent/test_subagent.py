@@ -26,7 +26,6 @@ from nanoclaude.agent.subagent import (
     RunGate,
     SubAgentLimits,
     build_registry,
-    cap_bytes,
     run_subagent,
 )
 from nanoclaude.agent.ui import Approval, AutoApprove
@@ -62,7 +61,7 @@ from nanoclaude.providers.texttools import MAX_PARSE_RETRIES
 from nanoclaude.subagents import EXPLORE_PROMPT, SUBAGENTS, SubAgent, SubAgentCall
 from nanoclaude.testing.scripted import calls, says
 from nanoclaude.testing.session import ScriptedClient, ScriptedSession, build_session
-from nanoclaude.tools.base import ToolContext, ToolOutcome, ok
+from nanoclaude.tools.base import ToolContext, ToolOutcome, cap_bytes, ok
 from nanoclaude.tools.registry import ToolRegistry
 from nanoclaude.tools.task import TaskTool
 from nanoclaude.tools.write import WriteTool

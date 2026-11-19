@@ -70,6 +70,7 @@ from nanoclaude.permissions.policy import (
 from nanoclaude.permissions.redact import Redactor
 from nanoclaude.subagents import Spawner
 from nanoclaude.tools.base import (
+    GrantAware,
     Tool,
     ToolArgumentError,
     ToolContext,
@@ -312,6 +313,8 @@ class Executor:
                 )
             elif approval is Approval.ALWAYS:
                 self.grants = self.grants.with_tool(plan.call.name)
+                if plan.tool is not None and isinstance(plan.tool, GrantAware):
+                    plan.tool.on_grant()
 
         # Request order is preserved across tool classes, not just within one:
         # a write must finish before whatever the model asked for next can

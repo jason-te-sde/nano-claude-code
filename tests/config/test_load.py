@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -21,6 +22,7 @@ from nanoclaude.config.schema import (
     THEMES,
     Config,
     LimitsConfig,
+    McpServerConfig,
     ModelConfig,
     PermissionsConfig,
     RolesConfig,
@@ -711,7 +713,7 @@ def test_a_file_that_is_not_utf8_is_reported_as_that(tmp_path):
     assert f"the config file {home_file(tmp_path)} is not valid UTF-8 text" in message
 
 
-@pytest.mark.parametrize("section", ["hooks", "mcp", "verify", "tools", "limit"])
+@pytest.mark.parametrize("section", ["hooks", "verify", "tools", "limit"])
 def test_a_section_this_version_does_not_read_is_refused_rather_than_ignored(tmp_path, section):
     # A hooks section that is silently ignored is a guard that never runs, and a
     # typo in a section name is a setting that never applies. Either way the
@@ -1970,3 +1972,204 @@ def test_the_project_config_is_the_roots_own_and_is_not_looked_for_further_up(tm
     config = load_config(home=str(tmp_path / "home"), project=str(app), env={})
     assert config.limits.max_turns == LimitsConfig().max_turns
     assert load_config(home=str(tmp_path / "home"), project=str(top), env={}).limits.max_turns == 3
+
+
+# --------------------------------------------------------------------------
+# [mcp.<name>]: servers that are started with the person's authority
+# --------------------------------------------------------------------------
+
+GITHUB = """
+[mcp.github]
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN_ENV = "x" }
+enabled = true
+timeout = 45
+"""
+
+
+def test_a_server_in_the_home_file_is_loaded_with_every_field_typed(tmp_path):
+    config = load(tmp_path, BASE + GITHUB)
+    assert config.mcp == {
+        "github": McpServerConfig(
+            name="github",
+            command="npx",
+            args=("-y", "@modelcontextprotocol/server-github"),
+            env={"GITHUB_TOKEN_ENV": "x"},
+            transport="stdio",
+            enabled=True,
+            timeout=45,
+        )
+    }
+
+
+def test_a_server_that_names_only_its_command_gets_the_defaults(tmp_path):
+    server = load(tmp_path, BASE + '[mcp.fs]\ncommand = "fs-server"\n').mcp["fs"]
+    assert (server.args, server.env, server.transport, server.enabled, server.timeout) == (
+        (),
+        {},
+        "stdio",
+        True,
+        30,
+    )
+
+
+def test_a_config_with_no_mcp_section_has_no_servers(tmp_path):
+    assert load(tmp_path, BASE).mcp == {}
+
+
+def test_servers_keep_the_order_the_file_gives(tmp_path):
+    text = BASE + '[mcp.b]\ncommand = "x"\n[mcp.a]\ncommand = "x"\n'
+    assert list(load(tmp_path, text).mcp) == ["b", "a"]
+
+
+@pytest.mark.parametrize(
+    "project_text",
+    [
+        '[mcp.evil]\ncommand = "sh"\nargs = ["-c", "id"]\n',
+        '[mcp]\nevil = { command = "sh" }\n',
+        "[mcp]\n",
+        'mcp.evil.command = "sh"\n',
+    ],
+    ids=["table", "inline table", "empty table", "dotted key"],
+)
+def test_a_project_file_cannot_define_a_server_because_it_would_run_a_command(
+    tmp_path, project_text
+):
+    message = refusal(tmp_path, BASE, project_text)
+    assert f"mcp in {project_file(tmp_path)} is not allowed in a project config" in message
+    assert str(home_file(tmp_path)) in message
+    assert "command" in message
+
+
+def test_a_project_file_cannot_define_a_server_even_with_no_home_file(tmp_path):
+    message = refusal(tmp_path, None, BASE + GITHUB)
+    assert f"mcp in {project_file(tmp_path)} is not allowed in a project config" in message
+
+
+def test_a_server_in_the_home_file_survives_a_project_file_that_does_not_mention_mcp(tmp_path):
+    config = load(tmp_path, BASE + GITHUB, "[limits]\nmax_turns = 3\n")
+    assert list(config.mcp) == ["github"]
+
+
+@pytest.mark.parametrize("name", ["a", "0", "a_b", "9lives", "a" * 24, "gh_2", "a__b"])
+def test_a_server_name_of_lower_case_letters_digits_and_underscores_is_accepted(tmp_path, name):
+    config = load(tmp_path, BASE + f'[mcp.{name}]\ncommand = "x"\n')
+    assert list(config.mcp) == [name]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", "GitHub", "git-hub", "_a", "a" * 25, "a b", "a.b", "caf\u00e9", "a\n", "-a"],
+    ids=repr,
+)
+def test_a_server_name_outside_the_pattern_is_refused_and_the_pattern_is_given(tmp_path, name):
+    text = BASE + f'[mcp.{json.dumps(name)}]\ncommand = "x"\n'
+    message = refusal(tmp_path, text)
+    assert "server name" in message
+    assert "[a-z0-9][a-z0-9_]{0,23}" in message
+    assert str(home_file(tmp_path)) in message
+
+
+MCP_FIELD_MISTAKES = [
+    pytest.param("x = 1\n", "unknown key 'x' in [mcp.s]", id="unknown key"),
+    pytest.param('command = "x"\nurl = "http://h"\n', "unknown key 'url'", id="url"),
+    pytest.param("", "mcp.s.command in", id="no command"),
+    pytest.param('command = ""\n', "mcp.s.command in", id="empty command"),
+    pytest.param('command = " "\n', "mcp.s.command in", id="blank command"),
+    pytest.param("command = 3\n", "mcp.s.command in", id="command not a string"),
+    pytest.param('command = "x"\nargs = "a b"\n', "mcp.s.args in", id="args a string"),
+    pytest.param('command = "x"\nargs = ["a", 2]\n', "mcp.s.args[1] in", id="args item"),
+    pytest.param('command = "x"\nenv = ["A=1"]\n', "mcp.s.env in", id="env a list"),
+    pytest.param('command = "x"\nenv = { A = 1 }\n', "mcp.s.env.A in", id="env value"),
+    pytest.param('command = "x"\nenabled = "yes"\n', "mcp.s.enabled in", id="enabled a string"),
+    pytest.param('command = "x"\nenabled = 1\n', "mcp.s.enabled in", id="enabled a number"),
+    pytest.param('command = "x"\ntimeout = 0\n', "mcp.s.timeout", id="timeout zero"),
+    pytest.param('command = "x"\ntimeout = 601\n', "mcp.s.timeout", id="timeout too long"),
+    pytest.param('command = "x"\ntimeout = -5\n', "mcp.s.timeout", id="timeout negative"),
+    pytest.param('command = "x"\ntimeout = 1.5\n', "mcp.s.timeout in", id="timeout fractional"),
+    pytest.param('command = "x"\ntimeout = "30"\n', "mcp.s.timeout in", id="timeout a string"),
+    pytest.param('command = "x"\ntimeout = true\n', "mcp.s.timeout in", id="timeout a bool"),
+    pytest.param('command = "x"\ntransport = 3\n', "mcp.s.transport in", id="transport a number"),
+    pytest.param(
+        'command = "x"\ntransport = "carrier-pigeon"\n', "one of: stdio", id="unknown transport"
+    ),
+    pytest.param(
+        'command = "x"\ntransport = "streamable-http"\n', "one of: stdio", id="named in a spec"
+    ),
+]
+
+
+@pytest.mark.parametrize(("body", "expected"), MCP_FIELD_MISTAKES)
+def test_a_mistake_in_a_server_is_refused_and_names_the_key_and_the_file(tmp_path, body, expected):
+    message = refusal(tmp_path, BASE + "[mcp.s]\n" + body)
+    assert expected in message, message
+    assert str(home_file(tmp_path)) in message
+
+
+@pytest.mark.parametrize("value", ["sse", "http"])
+def test_a_transport_that_is_not_built_is_said_not_to_be_supported_in_this_version(tmp_path, value):
+    message = refusal(tmp_path, BASE + f'[mcp.s]\ncommand = "x"\ntransport = "{value}"\n')
+    assert "not supported in this version" in message
+    assert "stdio" in message
+
+
+def test_a_server_that_names_stdio_is_accepted_and_so_is_one_that_names_nothing(tmp_path):
+    named = load(tmp_path, BASE + '[mcp.a]\ncommand = "x"\ntransport = "stdio"\n').mcp["a"]
+    assert named.transport == "stdio"
+
+
+@pytest.mark.parametrize("seconds", [1, 30, 600])
+def test_a_timeout_from_one_to_six_hundred_seconds_is_accepted(tmp_path, seconds):
+    text = BASE + f'[mcp.s]\ncommand = "x"\ntimeout = {seconds}\n'
+    assert load(tmp_path, text).mcp["s"].timeout == seconds
+
+
+def test_mcp_that_is_not_a_table_is_refused_like_every_other_section(tmp_path):
+    message = refusal(tmp_path, "mcp = 'x'\n" + BASE)
+    assert "mcp in" in message
+    assert "must be a table" in message
+
+
+def test_a_server_that_is_not_a_table_is_refused(tmp_path):
+    message = refusal(tmp_path, BASE + "[mcp]\ns = 1\n")
+    assert "mcp.s in" in message
+    assert "must be a table" in message
+
+
+def test_the_sections_the_error_lists_include_mcp(tmp_path):
+    assert "the sections are models, roles, permissions, limits, ui, mcp" in refusal(
+        tmp_path, BASE + "[hooks]\nx = 1\n"
+    )
+
+
+@pytest.mark.parametrize("key", ["allow", "ask", "deny"])
+def test_a_wildcard_over_mcp_names_is_refused_when_the_file_is_loaded(tmp_path, key):
+    message = refusal(tmp_path, BASE + f'[permissions]\n{key} = ["mcp__github__*"]\n')
+    assert f"permissions.{key}[0] in {home_file(tmp_path)} is not a valid rule" in message
+    assert "wildcard" in message
+
+
+@pytest.mark.parametrize("key", ["ask", "deny"])
+def test_an_exact_mcp_tool_name_is_a_valid_rule_in_the_home_file_and_in_a_projects(tmp_path, key):
+    rule = "mcp__github__create_issue"
+    config = load(
+        tmp_path,
+        BASE + f'[permissions]\n{key} = ["{rule}"]\n',
+        f'[permissions]\n{key} = ["mcp__github__delete_repo"]\n',
+    )
+    assert getattr(config.permissions, key) == (rule, "mcp__github__delete_repo")
+
+
+def test_an_exact_mcp_tool_name_in_allow_is_valid_in_the_home_file(tmp_path):
+    text = BASE + '[permissions]\nallow = ["Read", "mcp__github__list_issues"]\n'
+    assert "mcp__github__list_issues" in load(tmp_path, text).permissions.allow
+
+
+def test_a_servers_env_is_not_in_its_repr_because_that_is_where_its_credentials_go(tmp_path):
+    text = BASE + '[mcp.s]\ncommand = "x"\nenv = { TOKEN = "hunter2-not-a-real-one" }\n'
+    config = load(tmp_path, text)
+    assert config.mcp["s"].env == {"TOKEN": "hunter2-not-a-real-one"}
+    assert "hunter2" not in repr(config.mcp["s"])
+    assert "hunter2" not in repr(config)

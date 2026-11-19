@@ -514,7 +514,7 @@ def test_the_rule_ids_in_the_architecture_document_are_the_ones_the_code_decides
     for name in ("permissions/policy.py", "permissions/sandbox.py", "agent/executor.py"):
         ids |= set(
             re.findall(
-                r'"((?:rule|secret|sandbox|bash|mode|grant|tool|default)\.[a-z-]+)"',
+                r'"((?:rule|secret|sandbox|bash|mode|grant|tool|default|mcp)\.[a-z-]+)"',
                 _text(SRC / name),
             )
         )
@@ -527,11 +527,12 @@ def test_the_rule_ids_in_the_architecture_document_are_the_ones_the_code_decides
     )
 
 
-def test_the_architecture_document_states_the_three_extensions_of_the_plan():
+def test_the_architecture_document_states_the_four_extensions_of_the_plan():
     text = _text(ARCHITECTURE)
-    assert "**Three extensions of the plan.**" in text
+    assert "**Four extensions of the plan.**" in text
     assert "tool.internal-error" in text
     assert "sandbox.protected-path" in text
+    assert "mcp.changed" in text
     assert "messages_archive(session_id, seq, role, blocks_json, created_at, archived_at)" in text
 
 
@@ -852,7 +853,9 @@ def _rule_ids_in_the_order_of_the_checks() -> list[str]:
 
 def _policy_rule_ids_in_the_order_the_source_names_them() -> list[str]:
     source = _text(SRC / "permissions" / "policy.py")
-    found = re.findall(r'"((?:rule|secret|sandbox|bash|mode|grant|tool|default)\.[a-z-]+)"', source)
+    found = re.findall(
+        r'"((?:rule|secret|sandbox|bash|mode|grant|tool|default|mcp)\.[a-z-]+)"', source
+    )
     return list(dict.fromkeys(found))
 
 
@@ -890,17 +893,20 @@ def test_the_reference_lists_the_checks_in_the_order_of_the_architecture_table()
     )
 
 
-def test_the_documents_count_the_hard_denials_as_the_checks_before_bypass():
+def test_the_documents_count_the_hard_denials_as_the_checks_before_mcp_changed_and_bypass():
     section = _section(_text(CONFIGURATION), "Permissions")
-    numbered = re.findall(r"^(\d+)\. `([a-z]+\.[a-z-]+)`", section, re.MULTILINE)
-    position = next(int(number) for number, rule in numbered if rule == "mode.bypass")
-    words = {6: "six", 7: "seventh"}
-    assert position == 7, (
-        f"mode.bypass is check {position} of the reference's list, not the seventh"
+    numbered = {
+        rule: int(number)
+        for number, rule in re.findall(r"^(\d+)\. `([a-z]+\.[a-z-]+)`", section, re.MULTILINE)
+    }
+    assert (numbered["mcp.changed"], numbered["mode.bypass"]) == (7, 8), (
+        f"mcp.changed is check {numbered['mcp.changed']} and mode.bypass check "
+        f"{numbered['mode.bypass']} of the reference's list, not the seventh and the eighth"
     )
-    assert f"The first {words[position - 1]} are the hard denials" in _text(CONFIGURATION)
+    assert "The first six are the hard denials" in _text(CONFIGURATION)
     note = _text(DESIGN / "0015-bypass-does-not-disable-the-sandbox.md")
-    assert f"Bypass is the {words[position]}, and the {words[position - 1]} before it" in note
+    assert "Bypass is the eighth. The first six are the hard-denial band" in note
+    assert "The seventh is `mcp.changed`" in note
 
 
 def _decide(policy: Policy, tool: str, relative: str, *, write: bool) -> PermissionResult:

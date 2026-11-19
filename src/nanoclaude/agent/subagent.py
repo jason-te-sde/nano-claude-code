@@ -39,6 +39,7 @@ from nanoclaude.conversation.budget import ContextTooSmallError
 from nanoclaude.conversation.transcript import TextBlock, Transcript
 from nanoclaude.providers.base import ModelError
 from nanoclaude.subagents import SUBAGENTS, SubAgent, SubAgentCall, SubAgentResult
+from nanoclaude.tools.base import cap_bytes
 from nanoclaude.tools.glob import GlobTool
 from nanoclaude.tools.grep import GrepTool
 from nanoclaude.tools.read import ReadTool
@@ -130,20 +131,6 @@ def build_registry(agent: SubAgent) -> ToolRegistry:
             f"which a sub-agent cannot be given; the tools are {', '.join(sorted(TOOLS))}"
         )
     return ToolRegistry([TOOLS[name]() for name in agent.tools])
-
-
-def cap_bytes(text: str, cap: int) -> str:
-    """``text`` cut to at most ``cap`` bytes of UTF-8, with a note of how many were cut.
-
-    The cut falls between characters, and what is dropped is counted in bytes, a character
-    that did not fit included.
-    """
-    data = text.encode("utf-8")
-    if len(data) <= cap:
-        return text
-    kept = data[:cap].decode("utf-8", errors="ignore")
-    cut = len(data) - len(kept.encode("utf-8"))
-    return f"{kept}\n[output cut: {cut} bytes beyond the {cap}-byte limit]"
 
 
 def last_text(transcript: Transcript) -> str:

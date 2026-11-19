@@ -41,8 +41,11 @@ Defended when the file is loaded, with an error that names the file and the sett
 - It may not change the adapter of a model your own file defines, which would send the key
   you set up for one vendor to another's endpoint.
 - It may lower `max_turns`, `bash_timeout_s` and `output_cap_bytes`, and may not raise them.
-- A file that names a section this version does not have (`hooks` and `mcp` among them) is
-  refused, and not ignored: a guard that is silently dropped is worse than none.
+- It may not define an MCP server (`[mcp.<name>]`), since each one names a program that is
+  started with your authority; servers belong in your own file, and a project file that has
+  an `mcp` section at all is refused.
+- A file that names a section this version does not have (`hooks`, for one) is refused, and
+  not ignored: a guard that is silently dropped is worse than none.
 
 A project's `deny` and `ask` lists are added to yours, so your own `deny` rules always apply.
 Keys are never read from a file; a model entry names an environment variable. In either file, a

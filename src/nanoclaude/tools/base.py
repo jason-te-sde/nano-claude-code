@@ -52,6 +52,42 @@ def sanitize(text: str) -> str:
     return _CONTROL.sub("", _ANSI.sub("", text))
 
 
+def without_lone_surrogates(text: str) -> str:
+    """``text`` with each lone surrogate replaced by U+FFFD.
+
+    Text that was decoded from JSON can hold one (``"\\ud800"`` is valid JSON), and a string
+    that does cannot be written as UTF-8: the size of a result, a request body and a screen
+    would each raise on it.
+    """
+    return _LONE_SURROGATE.sub("\ufffd", text)
+
+
+def cut_bytes(text: str, cap: int) -> tuple[str, int]:
+    """``text`` cut to at most ``cap`` bytes of UTF-8, and how many bytes were dropped.
+
+    The cut falls between characters, and what is dropped is counted in bytes, a character
+    that did not fit included. ``text`` holds no lone surrogate (see
+    :func:`without_lone_surrogates`), which would not encode.
+    """
+    data = text.encode("utf-8")
+    if len(data) <= cap:
+        return text, 0
+    kept = data[:cap].decode("utf-8", errors="ignore")
+    return kept, len(data) - len(kept.encode("utf-8"))
+
+
+def cap_bytes(text: str, cap: int) -> str:
+    """``text`` cut to at most ``cap`` bytes of UTF-8, with a note of how many were cut.
+
+    The one way a result is held to the output cap, whoever wrote it: a sub-agent's answer
+    and a tool of an MCP server alike.
+    """
+    kept, cut = cut_bytes(text, cap)
+    if cut == 0:
+        return text
+    return f"{kept}\n[output cut: {cut} bytes beyond the {cap}-byte limit]"
+
+
 @dataclass(frozen=True, slots=True)
 class ToolOutcome:
     tool_use_id: str
@@ -121,6 +157,19 @@ class Tool(Protocol):
     async def run(
         self, ctx: ToolContext, call_id: str, arguments: Mapping[str, Any]
     ) -> ToolOutcome: ...
+
+
+@runtime_checkable
+class GrantAware(Protocol):
+    """A tool that wants to hear when the person answers "always" to a question about it.
+
+    The executor tells it after it has recorded the grant, once, and only for an answer of
+    "always": not for "yes", which is for one call. The one tool that listens is an MCP tool,
+    which renews its fingerprint pin so that the next session does not ask about a definition
+    the person has approved. A tool that has no use for it does not implement it.
+    """
+
+    def on_grant(self) -> None: ...
 
 
 def require_str(arguments: Mapping[str, Any], key: str) -> str:

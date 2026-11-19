@@ -31,6 +31,10 @@ Nothing here is silently ignored. A key that nothing reads, a section this
 version does not have, a misspelled role: each is an error, because the
 alternative is a setting the person believes is in force and is not.
 
+A repository's file may not define an MCP server either: each one names a program that is
+started with the person's authority, so ``[mcp.<name>]`` belongs in the home file, and a
+project's is refused for it, whatever it holds.
+
 Keys are never read from the file. The file names an environment variable; the
 value comes from the environment. A config file full of secrets is a config
 file someone will commit.
@@ -55,10 +59,14 @@ from typing import Any, NamedTuple
 from nanoclaude.config.schema import (
     DIFF_STYLES,
     KNOWN_ADAPTERS,
+    MCP_SERVER_NAME,
+    MCP_TIMEOUT_RANGE,
+    MCP_TRANSPORTS,
     ROLES,
     THEMES,
     Config,
     LimitsConfig,
+    McpServerConfig,
     ModelConfig,
     PermissionsConfig,
     RolesConfig,
@@ -349,10 +357,84 @@ def _models(value: object, where: str, path: Path) -> dict[str, Any]:
     return {alias: _model_entry(entry, f"{where}.{alias}", path) for alias, entry in table.items()}
 
 
-# Any section here may appear in a project's file, which is untrusted. The spec's
-# hooks, mcp, verify and tools sections run commands or load code: when they are
-# added, a project's file must be refused for them, the way it is for allow and
-# base_url. Today they are refused only because no file may have them.
+_MCP_NAME = re.compile(MCP_SERVER_NAME)
+
+#: Transports that are named in the design and not built: a person who writes one is told so.
+_UNBUILT_TRANSPORTS = ("sse", "http")
+
+
+def _mcp_command(value: object, where: str, path: Path) -> str:
+    text = _string(value, where, path)
+    if not text.strip():
+        raise ConfigError(f"{where} in {path} is empty — name the program that starts the server")
+    return text
+
+
+def _mcp_env(value: object, where: str, path: Path) -> dict[str, str]:
+    table = _table(value, where, path)
+    return {key: _string(item, f"{where}.{key}", path) for key, item in table.items()}
+
+
+def _mcp_transport(value: object, where: str, path: Path) -> str:
+    text = _string(value, where, path)
+    if text in _UNBUILT_TRANSPORTS:
+        raise ConfigError(
+            f"{where} in {path} is {text!r}, which is not supported in this version "
+            f"— this version starts a server over {', '.join(MCP_TRANSPORTS)}; "
+            'leave transport out or set it to "stdio"'
+        )
+    if text not in MCP_TRANSPORTS:
+        raise ConfigError(
+            f"{where} in {path} is {text!r} — set it to one of: {', '.join(MCP_TRANSPORTS)}"
+        )
+    return text
+
+
+def _mcp_timeout(value: object, where: str, path: Path) -> int:
+    seconds: int = _whole(MCP_TIMEOUT_RANGE[0])(value, where, path)
+    if seconds > MCP_TIMEOUT_RANGE[1]:
+        raise ConfigError(
+            f"{where} in {path} is {seconds}, above the maximum of {MCP_TIMEOUT_RANGE[1]} seconds "
+            f"— set it to {MCP_TIMEOUT_RANGE[1]} or less"
+        )
+    return seconds
+
+
+_MCP_FIELDS: dict[str, Checker] = {
+    "transport": _mcp_transport,
+    "command": _mcp_command,
+    "args": _strings,
+    "env": _mcp_env,
+    "enabled": _boolean,
+    "timeout": _mcp_timeout,
+}
+
+
+def _mcp_server(value: object, where: str, path: Path) -> dict[str, Any]:
+    entry = _fields(value, _MCP_FIELDS, where, path)
+    if "command" not in entry:
+        raise ConfigError(
+            f"{where}.command in {path} is missing — name the program that starts the server"
+        )
+    return entry
+
+
+def _mcp_servers(value: object, where: str, path: Path) -> dict[str, Any]:
+    table = _table(value, where, path)
+    for name in table:
+        if not _MCP_NAME.fullmatch(name):
+            raise ConfigError(
+                f"the server name {name!r} in [{where}] of {path} is not valid — a name is "
+                f"{MCP_SERVER_NAME}: lower-case letters, digits and underscores, up to 24, "
+                "starting with a letter or a digit, and no hyphen, since the name becomes "
+                "part of the tool names the model writes"
+            )
+    return {name: _mcp_server(entry, f"{where}.{name}", path) for name, entry in table.items()}
+
+
+# Any section here may appear in a project's file, which is untrusted, except those that
+# run commands or load code, which are refused there by name (see _refuse_commands): mcp
+# today, and the spec's hooks, verify and tools sections when they are added.
 _SECTION_CHECKS: dict[str, Checker] = {
     "models": _models,
     "roles": _section(dict.fromkeys(ROLES, _alias), noun="role"),
@@ -371,6 +453,7 @@ _SECTION_CHECKS: dict[str, Checker] = {
         }
     ),
     "ui": _section({"theme": _choice(THEMES), "diff_style": _choice(DIFF_STYLES)}),
+    "mcp": _mcp_servers,
 }
 
 
@@ -426,6 +509,20 @@ def _refuse_widening(raw: dict[str, Any], path: Path, home: Path) -> None:
             f"permissions.allow in {path} is not allowed in a project config "
             "— a repository's file may add deny and ask rules but cannot grant itself "
             f"permissions, so add allow rules to {home} if you trust the project"
+        )
+
+
+def _refuse_commands(raw: dict[str, Any], path: Path, home: Path) -> None:
+    """Refuse a project config that defines an MCP server.
+
+    Checked on presence, like the refusals above, and before the types are: a server is a
+    command that is started with the person's authority, and a repository's file is not
+    trusted to name one, whatever else is wrong with it.
+    """
+    if "mcp" in raw:
+        raise ConfigError(
+            f"mcp in {path} is not allowed in a project config — a repository's file is not "
+            f"trusted to name a command to run, so define MCP servers in {home}"
         )
 
 
@@ -486,6 +583,7 @@ def _check_layer(raw: dict[str, Any], path: Path, *, home: _Home | None = None) 
     if home is not None:
         _refuse_credential_routing(raw, path, home.path)
         _refuse_widening(raw, path, home.path)
+        _refuse_commands(raw, path, home.path)
     layer = {name: _SECTION_CHECKS[name](value, name, path) for name, value in raw.items()}
     if home is not None:
         _refuse_adapter_change(layer, path, home)
@@ -610,6 +708,9 @@ def _build(
         limits=LimitsConfig(**raw.get("limits", {})),
         permissions=PermissionsConfig(**raw.get("permissions", {})),
         ui=UiConfig(**raw.get("ui", {})),
+        mcp={
+            name: McpServerConfig(name=name, **entry) for name, entry in raw.get("mcp", {}).items()
+        },
         env={name: env[name] for name in held if name in env},
     )
 

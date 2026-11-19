@@ -32,7 +32,7 @@ A project's `.nanoclaude/config.toml` arrives with a repository, so it is untrus
 | choose models and roles that are already defined, and define a model of its own with the `anthropic` or `ollama` adapter | set `base_url` or `api_key_env` on any model; for that reason it cannot define an `openai_compat` model, which needs a `base_url`, though it can select one your home file defines |
 | change the `model`, `context_window` or `native_tools` of an alias your home file defines | change the `adapter` of an alias your home file defines |
 | lower `max_turns`, `bash_timeout_s` and `output_cap_bytes`, or leave them as they are | raise any of those three above the value in effect |
-| set `compact_soft`, `compact_hard` and `keep_recent_turns`, which cap nothing a session may do | |
+| set `compact_soft`, `compact_hard` and `keep_recent_turns`, which cap nothing a session may do | define an MCP server in an `mcp` section, which names a command to run; servers belong in your own file |
 
 Each thing on the right is refused with an error that names the file and says where the setting belongs, and nothing is silently ignored. A project's lists add to yours: its `deny` and `ask` rules are appended to the ones in effect, each rule once, and an empty list removes nothing. Your own `deny` rules therefore always apply. When `ncc` is run from your home directory, the project file is your own file and is read once as that.
 
@@ -169,15 +169,16 @@ A `deny` rule compares a path as written and again after case folding and NFC no
 4. `sandbox.protected-path` refuses a write into a `.git` or a `.nanoclaude` directory inside the sandbox, in every mode. Git runs what `.git/config` and `.git/hooks` name, and `ncc` reads its configuration, capability cache and session store from `.nanoclaude`, so a write there is a way for a call to run something that no confirmation described. A `.git` that is a file, as in a worktree, counts, and so does a spelling that case folding or normalization makes the same; `.github` and `.gitignore` do not. Reads are not refused.
 5. `bash.dangerous` and `bash.unparseable` refuse a command the danger classifier blocks or cannot read.
 6. `mode.plan-read-only` refuses any write in `plan` mode.
-7. `mode.bypass` allows everything left, in `bypass` mode.
-8. `mode.accept-edits` allows `Edit` and `Write`, in `accept-edits` mode.
-9. `rule.allow` allows what your `allow` rule names.
-10. `grant.session` allows a tool you answered "always" to, for the rest of the session.
-11. `tool.read-only` allows `Read`, `Grep`, `Glob` and `TodoWrite`.
-12. `rule.ask` asks about what your `ask` rule names.
-13. `default.ask` asks about everything else.
+7. `mcp.changed` asks about a tool of an MCP server whose description or input schema is not what you last approved, in every mode and whatever your `allow` rules and grants say.
+8. `mode.bypass` allows everything left, in `bypass` mode.
+9. `mode.accept-edits` allows `Edit` and `Write`, in `accept-edits` mode.
+10. `rule.allow` allows what your `allow` rule names.
+11. `grant.session` allows a tool you answered "always" to, for the rest of the session.
+12. `tool.read-only` allows `Read`, `Grep`, `Glob` and `TodoWrite`.
+13. `rule.ask` asks about what your `ask` rule names.
+14. `default.ask` asks about everything else.
 
-The first six are the hard denials: no mode, rule or grant gets past them. It follows from the order that an `ask` rule has no effect on a tool that is allowed without asking, and that an `allow` rule cannot open a credentials file. To keep something from being read, use `deny`. A `Read` `deny` rule also keeps a file out of what `Grep` returns, out of an `@` mention, out of the project map and out of the instruction files, since each asks the policy whether a `Read` of the file would be refused. `Glob` asks it nothing, and still lists the names of such files.
+The first six are the hard denials: no mode, rule or grant gets past them. The seventh is not a denial and is not skipped either: it asks. It follows from the order that an `ask` rule has no effect on a tool that is allowed without asking, and that an `allow` rule cannot open a credentials file. To keep something from being read, use `deny`. A `Read` `deny` rule also keeps a file out of what `Grep` returns, out of an `@` mention, out of the project map and out of the instruction files, since each asks the policy whether a `Read` of the file would be refused. `Glob` asks it nothing, and still lists the names of such files.
 
 **Modes.** `default` asks before changing anything. `plan` refuses every write, so the model can read and reason and not change. `accept-edits` applies `Edit` and `Write` without asking and still asks about anything else. `bypass` asks about nothing, and is reached only with `--dangerously-skip-permissions`; it does not turn off the hard denials, so the sandbox, protected paths, credentials paths, dangerous commands and your `deny` rules are enforced in it. `--mode` takes `default`, `plan` or `accept-edits`. It does not take `bypass`: `--mode bypass` is refused, with the flag beside it or without, and the error names the flag that turns it on. The flag together with any `--mode` is refused too, and no configuration file can select it. `/mode` switches among the first three and refuses `bypass`.
 

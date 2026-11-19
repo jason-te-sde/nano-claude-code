@@ -145,7 +145,8 @@ def test_the_known_tools_are_the_registered_ones_and_the_reserved_ones():
         "Reads",
         "Wrte(src/**)",
         "grep(x)",
-        "mcp__server__tool",
+        "mcp_server_tool",  # one underscore: not the MCP form
+        "Mcp__server__tool",
         "(secrets/**)",
         "bash(npm test:*)",  # the prefix form
     ],
@@ -157,6 +158,94 @@ def test_a_rule_naming_no_tool_is_refused_and_the_message_lists_the_tools(rule):
     assert all(name in message for name in KNOWN_TOOLS), message
     assert "\n" not in message
     assert "case-sensitive" in message
+
+
+MCP_NAMES = [
+    "mcp__github__create_issue",
+    "mcp__a__b",
+    "mcp__fs_2__List_Dir",
+    "mcp__0__x1",
+    "mcp__a__b__c",
+]
+
+
+@pytest.mark.parametrize("name", MCP_NAMES)
+def test_an_exact_mcp_tool_name_is_accepted_in_allow_ask_and_deny(name):
+    for kind in ("allow", "ask", "deny"):
+        built = RuleSet.build(**{kind: [name]})
+        (rule,) = getattr(built, kind)
+        assert (rule.tool, rule.subject, rule.prefix) == (name, None, False)
+
+
+@pytest.mark.parametrize("name", MCP_NAMES)
+def test_an_mcp_rule_covers_calls_to_that_tool_and_no_other(name):
+    rule = Rule.parse(name)
+    assert rule.matches(name, "", "")
+    assert rule.matches(name, "server x", "server x", fold=True)
+    assert not rule.matches(name + "2", "", "")
+    assert not rule.matches("Read", "", "")
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "mcp__*",
+        "mcp__github__*",
+        "mcp__*__create_issue",
+        "mcp__github__create_*",
+        "mcp__git?ub__create_issue",
+        "mcp__[a-g]ithub__create_issue",
+        "mcp__github__create_issue*",
+        "mcp__**",
+    ],
+)
+def test_a_wildcard_over_mcp_names_is_refused_with_a_message_that_says_so(rule):
+    # A pattern here would be a rule that grows to cover a tool nobody has read yet: an allow
+    # that a server's next release extends, or a deny that a rename walks past.
+    with pytest.raises(ValueError, match="wildcard") as raised:
+        Rule.parse(rule)
+    message = str(raised.value)
+    assert "exactly" in message and "mcp__<server>__<tool>" in message, message
+    assert "\n" not in message
+
+
+def test_a_wildcard_is_refused_in_every_list_a_rule_can_be_in():
+    for kind in ("allow", "ask", "deny"):
+        with pytest.raises(ValueError, match="wildcard"):
+            RuleSet.build(**{kind: ["Read", "mcp__github__*"]})
+
+
+@given(st.text(alphabet="abcdefghijklmnopqrstuvwxyz_0123456789", max_size=12), st.text(max_size=6))
+@settings(max_examples=60)
+def test_no_name_with_a_star_in_it_is_ever_an_mcp_rule(server, tail):
+    with pytest.raises(ValueError):
+        Rule.parse(f"mcp__{server}*{tail}")
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "mcp__github__",  # no tool
+        "mcp__github",  # no tool, no separator
+        "mcp____x",
+        "mcp__GitHub__create_issue",  # server names are lower case
+        "mcp__git-hub__create_issue",
+        "mcp__github__create-issue",  # a hyphen is not in a registry name
+        "mcp__github__create issue",
+        "mcp__github__crée",
+    ],
+)
+def test_a_name_that_is_not_a_registry_name_is_refused_and_the_form_is_given(rule):
+    with pytest.raises(ValueError, match="mcp__<server>__<tool>"):
+        Rule.parse(rule)
+
+
+@pytest.mark.parametrize("rule", ["mcp__a__b(x)", "mcp__a__b(npm test:*)", "mcp__a__b(**/x)"])
+def test_an_mcp_rule_takes_no_subject_because_nothing_could_match_it(rule):
+    # The call to an MCP tool has no subject a rule could be about. A rule written with
+    # one would parse and never match, and for deny that is a refusal that is not in force.
+    with pytest.raises(ValueError, match="no subject"):
+        Rule.parse(rule)
 
 
 def test_the_message_names_the_tool_as_it_was_written():
