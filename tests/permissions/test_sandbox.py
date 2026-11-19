@@ -1,6 +1,8 @@
+from pathlib import Path
+
 import pytest
 
-from nanoclaude.permissions.sandbox import Sandbox, is_within
+from nanoclaude.permissions.sandbox import Sandbox, WiderSandboxError, is_within
 
 
 def test_is_within_is_not_a_prefix_match():
@@ -192,3 +194,59 @@ def test_sandbox_is_hashable():
     # mapping or other unhashable type gets caught the same way those were.
     sandbox = Sandbox(("/a", "/b"))
     assert hash(sandbox) == hash(Sandbox(("/a", "/b")))
+
+
+# --------------------------------------------------------------------------
+# narrowed_to: how a sub-agent gets its sandbox
+# --------------------------------------------------------------------------
+
+
+def test_a_sandbox_can_be_narrowed_to_a_directory_inside_it(tmp_path):
+    (tmp_path / "src").mkdir()
+    narrowed = Sandbox((str(tmp_path),)).narrowed_to(str(tmp_path / "src"))
+
+    assert narrowed.roots == (str((tmp_path / "src").resolve()),)
+    assert narrowed.check_read(str((tmp_path / "src" / "a.py").resolve())) is None
+    assert narrowed.check_read(str((tmp_path / "b.py").resolve())) == "sandbox.outside-root"
+
+
+def test_a_sandbox_narrowed_to_its_own_root_is_the_same_sandbox(tmp_path):
+    sandbox = Sandbox((str(tmp_path),))
+    assert sandbox.narrowed_to(str(tmp_path)) == sandbox
+
+
+@pytest.mark.parametrize("where", ["parent", "root", "sibling", "prefix-sibling"])
+def test_a_sandbox_cannot_be_narrowed_to_somewhere_it_does_not_contain(tmp_path, where):
+    project = tmp_path / "project"
+    (tmp_path / "project-evil").mkdir()
+    (tmp_path / "other").mkdir()
+    project.mkdir()
+    target = {
+        "parent": tmp_path,
+        "root": Path("/"),
+        "sibling": tmp_path / "other",
+        "prefix-sibling": tmp_path / "project-evil",
+    }[where]
+    with pytest.raises(WiderSandboxError, match="cannot cover more"):
+        Sandbox((str(project),)).narrowed_to(str(target))
+
+
+def test_a_link_inside_the_sandbox_that_leads_out_is_judged_by_where_it_leads(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (tmp_path / "outside").mkdir()
+    (project / "link").symlink_to(tmp_path / "outside")
+    with pytest.raises(WiderSandboxError):
+        Sandbox((str(project),)).narrowed_to(str(project / "link"))
+
+
+def test_a_sandbox_with_two_roots_can_be_narrowed_to_one_inside_either(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    both = Sandbox((str(tmp_path / "a"), str(tmp_path / "b")))
+    assert both.narrowed_to(str(tmp_path / "b")).roots == (str((tmp_path / "b").resolve()),)
+
+
+def test_a_sandbox_needs_at_least_one_root_to_be_narrowed_to(tmp_path):
+    with pytest.raises(ValueError, match="at least one root"):
+        Sandbox((str(tmp_path),)).narrowed_to()
