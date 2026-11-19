@@ -30,6 +30,8 @@ packages = ["src/nanoclaude"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# pytest-asyncio 1.x warns when this is unset, and the suite turns warnings into errors.
+asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [
   "error",
   # pathspec >=1.0 (pulled in transitively because mypy itself requires
