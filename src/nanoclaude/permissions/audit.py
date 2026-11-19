@@ -46,13 +46,29 @@ class AuditLog:
         arguments: Mapping[str, Any],
         decision: Decision,
         rule: str,
+        parent_call_id: str | None = None,
     ) -> None:
+        """Record what was decided about a call, before it runs.
+
+        ``parent_call_id`` is the ``Task`` call that started the sub-agent making this one, and
+        None for a call the person's own conversation made.
+        """
         payload, _ = self._redactor.scrub(json.dumps(dict(arguments), sort_keys=True))
         self.store.db.execute(
             "INSERT INTO tool_calls "
-            "(session_id, turn, tool_use_id, ts, tool, args_json, decision, rule) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (session_id, turn, tool_use_id, time.time(), tool, payload, str(decision), rule),
+            "(session_id, turn, tool_use_id, ts, tool, args_json, decision, rule, parent_call_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                turn,
+                tool_use_id,
+                time.time(),
+                tool,
+                payload,
+                str(decision),
+                rule,
+                parent_call_id,
+            ),
         )
         self.store.db.commit()
 

@@ -2,9 +2,13 @@
 
 The schema is spec 17.8 verbatim and the column names are a contract: the audit
 CLI reads them, and a database written by one version is opened by the next.
-Migrations are additive only.
+Migrations are additive only. A table or a trigger that is not there is made when the
+database is opened, and so is a nullable column that a table an earlier version made lacks
+(``parent_call_id``, below): ``Store._add_missing_columns`` is the one place that does it.
 
-One table is added to it: ``messages_archive``. ``messages`` is the transcript the
+One table and one column are added to it. The column is ``tool_calls.parent_call_id``: the
+``Task`` call that started the sub-agent which made a call, NULL for a call the conversation
+itself made. The table is ``messages_archive``. ``messages`` is the transcript the
 model is shown, which is what a resumed session reloads, so compaction and
 ``/clear`` have to replace its rows. The audit trail is append-only, so a row a
 replacement removes or changes is moved to the archive, with the time it was
@@ -97,6 +101,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     duration_ms INTEGER,
     bytes_out INTEGER,
     error TEXT,
+    parent_call_id TEXT,
     PRIMARY KEY (session_id, tool_use_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
@@ -133,6 +138,7 @@ WHEN OLD.outcome IS NOT NULL
     OR NEW.args_json IS NOT OLD.args_json
     OR NEW.decision IS NOT OLD.decision
     OR NEW.rule IS NOT OLD.rule
+    OR NEW.parent_call_id IS NOT OLD.parent_call_id
 BEGIN
     SELECT RAISE(ABORT, 'tool_calls is append-only: a row only gains its outcome, once');
 END;
@@ -280,10 +286,28 @@ class Store:
         self._db = sqlite3.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._add_missing_columns()
         self._db.executescript(SCHEMA)
         self._db.commit()
         for sidecar in ("-wal", "-shm"):
             narrow_file(self.path.with_name(self.path.name + sidecar))
+
+    def _add_missing_columns(self) -> None:
+        """Give ``tool_calls`` a column that a database made before it was added lacks.
+
+        Before the schema script runs, which makes a table that is absent and leaves one that
+        is there as it is. A table with no ``parent_call_id`` is one an earlier version made:
+        the column is added, nullable, so that every row already in it reads as a call the
+        conversation made. The trigger that keeps a decision from being rewritten is dropped
+        in the same step, because the one that database holds does not name the new column,
+        and the script makes the new one. A table that is not there is not touched.
+        """
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(tool_calls)")}
+        if not columns or "parent_call_id" in columns:
+            return
+        with self.db:
+            self.db.execute("ALTER TABLE tool_calls ADD COLUMN parent_call_id TEXT")
+            self.db.execute("DROP TRIGGER IF EXISTS tool_calls_only_gains_an_outcome")
 
     def close(self) -> None:
         if self._db is not None:

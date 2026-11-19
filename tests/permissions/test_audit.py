@@ -184,3 +184,32 @@ def test_an_outcome_for_a_call_nobody_decided_is_not_a_row(tmp_path):
     log = audit(tmp_path)
     log.record_outcome("s1", "nothing", outcome="ok", duration_ms=1, bytes_out=1, error=None)
     assert log.store.db.execute("SELECT COUNT(*) AS n FROM tool_calls").fetchone()["n"] == 0
+
+
+def test_a_call_made_by_a_sub_agent_is_recorded_with_the_task_call_that_started_it(tmp_path):
+    log = audit(tmp_path)
+    log.record_decision(
+        "s1",
+        turn=2,
+        tool_use_id="sub_1",
+        tool="Grep",
+        arguments={"pattern": "x"},
+        decision=Decision.ALLOW,
+        rule="tool.read-only",
+        parent_call_id="task_1",
+    )
+    log.record_decision(
+        "s1",
+        turn=2,
+        tool_use_id="task_1",
+        tool="Task",
+        arguments={"agent": "explore", "prompt": "q"},
+        decision=Decision.ASK,
+        rule="default.ask",
+    )
+
+    rows = {
+        row["tool_use_id"]: row["parent_call_id"]
+        for row in log.store.db.execute("SELECT tool_use_id, parent_call_id FROM tool_calls")
+    }
+    assert rows == {"sub_1": "task_1", "task_1": None}
