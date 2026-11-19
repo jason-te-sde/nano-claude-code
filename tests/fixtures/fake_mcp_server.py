@@ -63,7 +63,9 @@ DEFAULTS: Config = {
     "call_result_type": None,
     # The method whose result is a list and not an object: initialize, tools/list or tools/call.
     "non_object_result": "",
-    # Fields merged into the result of an echoed `tools/call`, to make it malformed.
+    # Fields merged into the result of `tools/list` and of an echoed `tools/call`, to make
+    # them malformed.
+    "list_patch": {},
     "call_patch": {},
     # The first tool has no name, when true.
     "tool_without_name": False,
@@ -360,7 +362,8 @@ class Server:
         page = 0 if cursor is None else int(str(cursor).removeprefix("page-"))
         per_page = settings["per_page"]
         result: dict[str, Any] = {
-            "tools": [self.tool(page * per_page + n) for n in range(per_page)]
+            "tools": [self.tool(page * per_page + n) for n in range(per_page)],
+            **settings["list_patch"],
         }
         if page + 1 < settings["pages"]:
             result["nextCursor"] = f"page-{page + 1}"

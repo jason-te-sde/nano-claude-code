@@ -135,8 +135,8 @@ class CappedLog:
 
     def append(self, data: bytes) -> None:
         descriptor = self._descriptor
-        if descriptor is None or not data:
-            return
+        if descriptor is None:
+            raise ValueError("the log is closed")
         size = os.fstat(descriptor).st_size
         if size + len(data) <= self._cap:
             self._write(descriptor, data)

@@ -180,6 +180,8 @@ def test_a_trailing_line_terminator_is_not_part_of_the_message():
         (line(id=1, method="m", result={}), "a method and a result"),
         (line(id=None, method="m"), "a request whose id is null"),
         (line(id=None, result={}), "a result whose id is null"),
+        (line(id=True, error={"code": 1, "message": "m"}), "an error whose id is a boolean"),
+        (line(id=[1], error={"code": 1, "message": "m"}), "an error whose id is a list"),
         (line(result={}), "a result with no id"),
         (line(id=True, method="m"), "a boolean id"),
         (line(id=1.5, method="m"), "a fractional id"),

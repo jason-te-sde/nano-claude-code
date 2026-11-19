@@ -411,8 +411,6 @@ class McpClient:
         """Send a request and wait for whatever answers it, a JSON-RPC error included."""
         if self._failure is not None:
             raise self._failure
-        if self._closed:
-            raise McpError("the client is closed")
         request_id = self._ids.next()
         future: asyncio.Future[Response | ErrorResponse] = (
             asyncio.get_running_loop().create_future()

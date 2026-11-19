@@ -146,6 +146,14 @@ async def test_a_command_that_cannot_be_run_is_a_transport_error(make_transport)
     assert transport.pid is None
 
 
+async def test_nothing_can_be_sent_or_received_before_the_transport_starts(make_transport):
+    transport = make_transport("/bin/cat")
+    with pytest.raises(TransportError, match="not started"):
+        await transport.send(PING)
+    with pytest.raises(TransportError, match="not started"):
+        await transport.receive()
+
+
 async def test_a_transport_starts_once(make_transport):
     transport = make_transport("/bin/cat")
     assert transport.pid is None
@@ -365,6 +373,13 @@ class TestCappedLog:
         log.append(b"new\n")
         log.close()
         assert path.read_bytes() == b"old\nnew\n"
+
+    def test_nothing_can_be_appended_after_it_is_closed(self, tmp_path):
+        log = CappedLog(tmp_path / "x.log", cap=10)
+        log.close()
+        log.close()
+        with pytest.raises(ValueError, match="closed"):
+            log.append(b"x")
 
     def test_a_file_exactly_at_the_cap_is_whole(self, tmp_path):
         log = CappedLog(tmp_path / "x.log", cap=6)

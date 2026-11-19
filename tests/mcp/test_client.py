@@ -28,6 +28,8 @@ from nanoclaude.mcp.client import (
     McpVersionError,
     RemoteTool,
 )
+from nanoclaude.mcp.jsonrpc import METHOD_NOT_FOUND, ErrorResponse, RpcError, encode
+from nanoclaude.mcp.transport import TransportError
 from tests.mcp.helpers import (
     eventually,
     group_is_gone,
@@ -98,6 +100,13 @@ async def test_a_client_says_nothing_of_its_era_before_it_has_started(make_clien
         await client.list_tools()
     with pytest.raises(McpError, match="start"):
         await client.call_tool("echo", {}, timeout=1)
+
+
+async def test_a_closed_client_cannot_be_started(make_client):
+    client = make_client("modern")
+    await client.close()
+    with pytest.raises(McpError, match="closed"):
+        await client.start()
 
 
 async def test_a_client_starts_once(make_client):
@@ -377,6 +386,13 @@ async def test_a_cursor_that_is_not_a_string_is_an_error(make_client):
         await bounded(client.list_tools())
 
 
+async def test_a_tools_field_that_is_not_a_list_is_an_error(make_client):
+    client = make_client("modern", 'list_patch={"tools": "echo"}')
+    await client.start()
+    with pytest.raises(McpProtocolError, match="list"):
+        await client.list_tools()
+
+
 async def test_a_tool_without_a_name_is_an_error(make_client):
     client = make_client("modern", "tool_without_name=true")
     await client.start()
@@ -487,6 +503,18 @@ async def test_a_call_result_of_the_wrong_shape_is_an_error(make_client, patch):
     await client.start()
     with pytest.raises(McpProtocolError):
         await client.call_tool("echo", {}, timeout=5)
+
+
+@pytest.mark.parametrize("value", [object(), float("nan"), {1, 2}], ids=["object", "nan", "set"])
+async def test_arguments_that_cannot_be_written_fail_the_call_and_not_the_client(
+    make_client, value
+):
+    client = make_client("modern")
+    await client.start()
+    with pytest.raises(McpProtocolError, match="encode"):
+        await client.call_tool("echo", {"value": value}, timeout=5)
+    assert client.failure is None
+    assert (await client.call_tool("echo", {"value": 1}, timeout=5)).is_error is False
 
 
 async def test_a_result_with_no_content_has_an_empty_content_list(make_client):
@@ -693,3 +721,75 @@ async def test_closing_while_a_call_is_waiting_fails_the_call(make_client):
 
 async def test_closing_a_client_that_never_started_is_fine(make_client):
     await make_client("modern").close()
+
+
+# --------------------------------------------------------------------------
+# A transport that does what the test says
+# --------------------------------------------------------------------------
+
+
+class ScriptedTransport:
+    """Hands the client the lines it is told to, then waits; for what a real process rarely
+    does: a pipe that breaks, an exception of our own, a server that dies between two requests."""
+
+    def __init__(
+        self, incoming: list[bytes | Exception | None], send_error: Exception | None = None
+    ) -> None:
+        self._incoming = list(incoming)
+        self._send_error = send_error
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    async def start(self) -> None:
+        pass
+
+    async def send(self, line: bytes) -> None:
+        if self._send_error is not None:
+            raise self._send_error
+        self.sent.append(line)
+
+    async def receive(self) -> bytes | None:
+        if not self._incoming:
+            await asyncio.Event().wait()  # until the client's reader is cancelled
+        item = self._incoming.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_a_pipe_that_cannot_be_written_fails_the_start_and_ends_the_server():
+    transport = ScriptedTransport([], send_error=TransportError("the server is not reading"))
+    client = McpClient(transport)
+    with pytest.raises(McpConnectionError, match="not reading"):
+        await bounded(client.start())
+    assert transport.closed
+    assert isinstance(client.failure, McpConnectionError)
+
+
+async def test_a_pipe_that_breaks_while_the_client_waits_fails_what_is_waiting():
+    transport = ScriptedTransport([TransportError("the pipe broke")])
+    client = McpClient(transport)
+    with pytest.raises(McpConnectionError, match="the pipe broke"):
+        await bounded(client.start())
+    assert transport.closed
+
+
+async def test_a_failure_of_the_readers_own_fails_what_is_waiting_instead_of_hanging_it():
+    transport = ScriptedTransport([RuntimeError("a bug of ours")])
+    client = McpClient(transport)
+    with pytest.raises(McpConnectionError, match="a bug of ours"):
+        await bounded(client.start())
+    assert transport.closed
+
+
+async def test_a_server_that_goes_between_discover_and_initialize_fails_the_start_at_once():
+    refusal = encode(ErrorResponse(1, RpcError(METHOD_NOT_FOUND, "Method not found")))
+    transport = ScriptedTransport([refusal, None])
+    # A request timeout this long would show if the client had waited for an answer that
+    # nobody is left to give.
+    client = McpClient(transport, request_timeout=60)
+    with pytest.raises(McpConnectionError, match="closed its output"):
+        await bounded(client.start(), 5)
