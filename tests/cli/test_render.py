@@ -867,6 +867,58 @@ async def test_a_confirmation_for_a_task_call_shows_the_agent_and_what_it_is_ask
     assert lines[2] == f"  called with {prompt}"
 
 
+MCP_CALL = ToolUseBlock("m1", "mcp__github__create_issue", {"title": "Bug", "labels": ["a"]})
+MCP_REQUEST = PermissionRequest("mcp__github__create_issue", "server github", (), is_write=True)
+MCP_CHANGED = PermissionResult(Decision.ASK, "mcp.changed", "the definition has changed")
+
+
+async def test_a_confirmation_for_an_mcp_call_shows_the_server_and_the_arguments_it_is_given():
+    # Somebody else's tool, run with the person's authority: they are told what it is given.
+    screen = Screen("n")
+    await screen.ui.confirm(MCP_CALL, MCP_REQUEST, ASK)
+    lines = screen.text.splitlines()
+    assert lines[1] == "mcp__github__create_issue  server github"
+    assert lines[2] == '  arguments {"title": "Bug", "labels": ["a"]}'
+    assert "called with" not in screen.text, "the arguments were shown twice"
+    assert len(lines) == 3, lines
+
+
+async def test_the_arguments_of_an_mcp_call_name_every_control_and_are_cut_where_long():
+    # JSON writes the controls of C0 as escapes of its own and leaves DEL, the C1 controls and
+    # the invisible formatting characters as they are, which is what a terminal acts on.
+    arguments = {"text": "a\x7fb\x9bc\u202ed\x1b[2J", "more": "x" * 3000}
+    screen = Screen("n", width=4000)
+    call = ToolUseBlock("m1", "mcp__github__create_issue", arguments)
+    await screen.ui.confirm(call, MCP_REQUEST, ASK)
+    line = screen.text.splitlines()[2]
+    assert line.startswith("  arguments {")
+    for raw in ("\x7f", "\x9b", "\u202e", "\x1b"):
+        assert raw not in screen.text, f"{raw!r} reached the screen as itself"
+    for named in ("\\x7f", "\\x9b", "\\u202e", "\\u001b"):
+        assert named in line, f"{named} is not spelled out in {line[:80]}"
+    assert len(line) < 1300, f"the arguments were shown in {len(line)} characters"
+    assert "more characters" in line, "nothing says that the arguments were cut"
+
+
+async def test_a_confirmation_for_a_changed_mcp_tool_says_so_and_what_always_means_for_it():
+    screen = Screen("n")
+    await screen.ui.confirm(MCP_CALL, MCP_REQUEST, MCP_CHANGED)
+    assert "its definition has changed since you last approved it" in screen.text
+    [question] = screen.prompter.asked
+    assert "later sessions" in question and "this session still asks" in question
+    assert "every mcp__github__create_issue call" not in question, (
+        "always was offered as a grant for the session, which a changed tool does not get"
+    )
+
+
+async def test_a_confirmation_for_an_mcp_tool_that_has_not_changed_offers_always_as_for_any_tool():
+    screen = Screen("n")
+    await screen.ui.confirm(MCP_CALL, MCP_REQUEST, ASK)
+    [question] = screen.prompter.asked
+    assert "every mcp__github__create_issue call this session" in question
+    assert "changed" not in screen.text
+
+
 async def test_a_command_that_begins_with_the_root_is_shown_whole_and_not_as_a_path():
     # The root comes off a path the policy resolved, and a command is not one: what a command
     # begins with is part of what it runs, and the shortened line is a different command.

@@ -1,9 +1,8 @@
 """Tests for nanoclaude.cli.commands: the slash commands.
 
-Spec 17.7 lists sixteen. Four describe subsystems that do not exist yet (``/mcp``) or
-arrive in v0.2 (``/rewind``, ``/diff``, ``/checkpoints``), so they are absent and not
-stubbed, and the first test asserts the set there is a subset of ``COMMANDS``: adding the
-others later does not break it.
+Spec 17.7 lists sixteen. Three describe a subsystem that arrives in v0.2 (``/rewind``,
+``/diff``, ``/checkpoints``), so they are absent and not stubbed, and the first test asserts
+the set there is a subset of ``COMMANDS``: adding the others later does not break it.
 """
 
 from __future__ import annotations
@@ -67,12 +66,14 @@ def test_every_documented_command_exists():
         "mode",
         "tools",
         "agents",
+        "mcp",
         "resume",
         "export",
         "init",
     }
     assert expected <= set(COMMANDS)
-    assert "mcp" not in COMMANDS, "/mcp describes a subsystem that is not built"
+    for absent in ("rewind", "diff", "checkpoints"):
+        assert absent not in COMMANDS, f"/{absent} describes a subsystem that is not built"
 
 
 def test_a_command_is_filed_under_its_own_name_and_says_what_it_does():

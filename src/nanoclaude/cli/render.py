@@ -40,6 +40,7 @@ display off by a line, which leaves a copy of its last frame behind.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import unicodedata
@@ -63,6 +64,7 @@ from nanoclaude.cli.prompt import Questioner, discard_pending_input, new_prompte
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
+from nanoclaude.permissions.rules import is_mcp_tool_name
 from nanoclaude.providers.base import ModelReply
 from nanoclaude.providers.pricing import PriceBook
 from nanoclaude.tools.base import ToolArgumentError, ToolOutcome, sanitize
@@ -82,6 +84,10 @@ WRITE_PREVIEW_DIFF_LINES = 40
 #: not how wide: a file that is one line of two hundred thousand characters is one line of
 #: the listing, two thousand rows on the screen, and the subject line is somewhere above them.
 MAX_PREVIEW_LINE_CHARS = 200
+
+#: How much of the arguments of a call to an MCP tool a confirmation shows. They are written by
+#: the model, and the tool is somebody else's; what is not shown is counted, not left out silently.
+MAX_ARGUMENTS_CHARS = 1000
 
 #: The width of the bar ``/status`` draws for how much of the context window is in use.
 BAR_WIDTH = 20
@@ -204,6 +210,31 @@ def summarise_call(call: ToolUseBlock) -> str:
     if primary is None:
         primary = ", ".join(sorted(call.arguments))
     return _shorten(visible(primary))
+
+
+#: What a confirmation says of a tool of an MCP server whose definition is not the one the
+#: person last approved.
+_CHANGED_NOTE = (
+    "  its definition has changed since you last approved it: the description or the input "
+    "schema is different (/mcp lists the tools of a server)"
+)
+
+
+def _arguments_line(call: ToolUseBlock) -> Text:
+    """The arguments of a call as one line of JSON, with every control named and the rest cut.
+
+    The cut is made on what is shown, after the controls are spelled out, so that characters
+    that become four or ten when they are named cannot make the line longer than its limit.
+    """
+    raw = json.dumps(dict(call.arguments), ensure_ascii=False, default=str)
+    shown = visible_text(raw)
+    parts: list[str | Text | tuple[str, str]] = [("  arguments ", "dim")]
+    cut = len(shown) - MAX_ARGUMENTS_CHARS
+    if cut > 0:
+        parts.extend([shown[:MAX_ARGUMENTS_CHARS], (f" … {cut} more characters", "dim")])
+    else:
+        parts.append(shown)
+    return Text.assemble(*parts)
 
 
 def _shown_line(line: str, style: str = "") -> Text:
@@ -447,7 +478,7 @@ class ConsoleUI:
         self._streamed = False
 
     async def confirm(
-        self, call: ToolUseBlock, request: PermissionRequest, _result: PermissionResult
+        self, call: ToolUseBlock, request: PermissionRequest, result: PermissionResult
     ) -> Approval:
         # The session ends a request before it runs a tool, so this is not needed. It is here
         # because a question asked over a live display cannot be read, and a rule that is only
@@ -466,18 +497,29 @@ class ConsoleUI:
                 visible_text(self._subject_shown(request)),
             )
         )
-        called_with = self._spelling_beside(call, request)
-        if called_with is not None:
-            # The policy judged the resolved path, and that is what is shown above. What
-            # the model wrote may differ from it, and a person is owed both.
-            self._console.print(Text.assemble(("  called with ", "dim"), visible_text(called_with)))
+        if is_mcp_tool_name(call.name):
+            # No path was resolved and no command classified: the subject says only which
+            # server, so what the tool is given is what there is to read.
+            self._console.print(_arguments_line(call))
+        else:
+            called_with = self._spelling_beside(call, request)
+            if called_with is not None:
+                # The policy judged the resolved path, and that is what is shown above. What
+                # the model wrote may differ from it, and a person is owed both.
+                self._console.print(
+                    Text.assemble(("  called with ", "dim"), visible_text(called_with))
+                )
         if call.name == "Edit":
             await self._preview_edit(call, request)
         elif call.name == "Write":
             await self._preview_write(call, request)
-        question = (
-            f"  allow? [y]es / [n]o / [a]lways (every {visible(call.name)} call this session) "
-        )
+        grant = f"every {visible(call.name)} call this session"
+        if result.rule == "mcp.changed":
+            self._console.print(Text(_CHANGED_NOTE, style="yellow"))
+            # A grant for the session does not hold for a changed tool, so "always" is not
+            # offered as one: it renews what the person has approved, for the next session.
+            grant = "approve this definition for later sessions; this session still asks"
+        question = f"  allow? [y]es / [n]o / [a]lways ({grant}) "
         while True:
             # Whatever was typed before now was not typed for this question: not what the
             # terminal has not delivered yet, and not what the prompt has read and kept.

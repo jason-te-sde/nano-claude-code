@@ -1,10 +1,10 @@
 # src/nanoclaude/cli/commands/__init__.py
 """Slash commands. Spec 17.7 lists them; this module is the implementation.
 
-The twelve here are the ones spec 17.7 lists that exist so far. ``/mcp`` describes a
-subsystem that arrives in v0.3, and ``/rewind``, ``/diff`` and ``/checkpoints`` one that
-arrives in v0.2, so they are absent rather than stubbed. ``/exit`` is not in spec 17.7; it
-is here because the REPL has to be leavable by a word as well as by Ctrl+D.
+The thirteen here are the ones spec 17.7 lists that exist so far. ``/rewind``, ``/diff`` and
+``/checkpoints`` describe a subsystem that arrives in v0.2, so they are absent rather than
+stubbed. ``/exit`` is not in spec 17.7; it is here because the REPL has to be leavable by a
+word as well as by Ctrl+D.
 
 A handler prints its own result. It does not catch what goes wrong in the model or the
 store: the REPL does, for every command and every turn alike, and says what failed
@@ -34,6 +34,7 @@ from nanoclaude.conversation.transcript import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from nanoclaude.mcp.servers import ServerReport
 from nanoclaude.permissions.policy import PermissionMode
 from nanoclaude.providers.base import ModelError
 from nanoclaude.subagents import SUBAGENTS, subagent_names
@@ -48,6 +49,9 @@ SETTABLE_MODES = (PermissionMode.DEFAULT, PermissionMode.PLAN, PermissionMode.AC
 
 #: How much of one tool result an export keeps.
 MAX_EXPORTED_RESULT_CHARS = 2000
+
+#: How many hexadecimal characters of a tool's fingerprint ``/mcp <server>`` shows.
+FINGERPRINT_SHOWN = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +266,86 @@ async def _agents(_args: list[str], session: Session, console: Console) -> None:
         )
 
 
+#: What ``/mcp`` says when the session has no server to report on.
+_NO_MCP_SERVERS = (
+    "no MCP servers are configured — add an [mcp.<name>] table to ~/.nanoclaude/config.toml, "
+    "as docs/configuration.md describes"
+)
+
+#: The colour of each state ``/mcp`` shows.
+_STATE_STYLES = {"running": "green", "failed": "red", "disabled": "dim"}
+
+
+def _tools_said(count: int) -> str:
+    return f"{count} tool" if count == 1 else f"{count} tools"
+
+
+def _server_line(report: ServerReport, widths: tuple[int, int, int]) -> Text:
+    """One server on one line: its name, its state, its protocol era, how many tools it has
+    registered, and for one that failed, why. Everything is shown as text, never as markup."""
+    name_width, state_width, era_width = widths
+    parts: list[str | Text | tuple[str, str]] = [
+        (report.name.ljust(name_width), "bold"),
+        "  ",
+        (report.state.ljust(state_width), _STATE_STYLES[report.state]),
+        "  ",
+        (report.era or "-").ljust(era_width),
+        "  ",
+        _tools_said(len(report.tools)),
+    ]
+    if report.reason is not None:
+        parts.extend(["  ", plain(report.reason)])
+    return Text.assemble(*(plain(p) if isinstance(p, str) else p for p in parts))
+
+
+async def _mcp(args: list[str], session: Session, console: Console) -> None:
+    reports = session.mcp.reports() if session.mcp is not None else ()
+    if not reports:
+        show_notice(console, _NO_MCP_SERVERS)
+        return
+    if len(args) > 1:
+        show_error(
+            console,
+            "/mcp takes one server name — /mcp lists every server, /mcp <server> lists the "
+            "tools of one",
+        )
+        return
+    name_width = max(len(each.name) for each in reports)
+    widths = (name_width, max(len(each.state) for each in reports), len("modern"))
+    if not args:
+        for each in reports:
+            console.print(_server_line(each, widths))
+        return
+    report = next((r for r in reports if r.name == args[0]), None)
+    if report is None:
+        names = ", ".join(r.name for r in reports)
+        show_error(console, f"no MCP server named {args[0]!r} — the servers are {names}")
+        return
+    console.print(_server_line(report, widths))
+    if not report.tools:
+        show_notice(console, "no tools are registered for it")
+        return
+    tools = sorted(report.tools, key=lambda tool: tool.name)
+    tool_width = max(len(tool.name) for tool in tools)
+    for tool in tools:
+        console.print(
+            Text.assemble(
+                "  ",
+                plain(tool.name.ljust(tool_width)),
+                "  ",
+                (tool.fingerprint[:FINGERPRINT_SHOWN], "dim"),
+                "  ",
+                ("changed", "yellow") if tool.changed else "unchanged",
+            )
+        )
+    if any(tool.changed for tool in tools):
+        show_notice(
+            console,
+            "changed: its description or input schema is not what you last approved, so it "
+            "asks before every call this session, whatever your rules and grants say",
+        )
+
+
 async def _resume(_args: list[str], _session: Session, console: Console) -> None:
     show_error(console, "/resume is a startup flag — restart with: ncc --resume <id>")
 
@@ -321,6 +405,11 @@ COMMANDS: dict[str, SlashCommand] = {
         ),
         SlashCommand("tools", "list the available tools", _tools),
         SlashCommand("agents", "list the sub-agents the Task tool can start", _agents),
+        SlashCommand(
+            "mcp",
+            "list the MCP servers, or the tools of one: /mcp <server>",
+            _mcp,
+        ),
         SlashCommand("resume", "how to resume an earlier session", _resume),
         SlashCommand(
             "export", "write the conversation to a markdown file: /export [file]", _export
