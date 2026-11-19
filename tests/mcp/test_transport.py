@@ -439,7 +439,9 @@ async def test_closing_leaves_no_descriptor_open(make_transport):
     await transport.start()
     assert open_descriptors() > before
     await transport.close()
-    assert open_descriptors() == before
+    # The event loop closes the last of the pipe transports in a callback of its own, so this
+    # is polled, with a deadline, and not read at once.
+    assert await eventually(lambda: open_descriptors() == before), (before, open_descriptors())
 
 
 async def test_stdin_is_closed_before_the_server_is_sent_a_signal(make_transport, log_path):

@@ -105,7 +105,7 @@ async def test_a_client_says_nothing_of_its_era_before_it_has_started(make_clien
 async def test_a_closed_client_cannot_be_started(make_client):
     client = make_client("modern")
     await client.close()
-    with pytest.raises(McpError, match="closed"):
+    with pytest.raises(McpError, match="the client is closed"):
         await client.start()
 
 
@@ -389,7 +389,7 @@ async def test_a_cursor_that_is_not_a_string_is_an_error(make_client):
 async def test_a_tools_field_that_is_not_a_list_is_an_error(make_client):
     client = make_client("modern", 'list_patch={"tools": "echo"}')
     await client.start()
-    with pytest.raises(McpProtocolError, match="list"):
+    with pytest.raises(McpProtocolError, match="must be a list"):
         await client.list_tools()
 
 
@@ -772,8 +772,10 @@ async def test_a_pipe_that_cannot_be_written_fails_the_start_and_ends_the_server
 async def test_a_pipe_that_breaks_while_the_client_waits_fails_what_is_waiting():
     transport = ScriptedTransport([TransportError("the pipe broke")])
     client = McpClient(transport)
-    with pytest.raises(McpConnectionError, match="the pipe broke"):
+    with pytest.raises(McpConnectionError) as caught:
         await bounded(client.start())
+    # The transport's own words, and not the catch-all's account of a failure of the reader.
+    assert str(caught.value) == "the pipe broke"
     assert transport.closed
 
 
