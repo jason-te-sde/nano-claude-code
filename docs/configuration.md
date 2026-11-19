@@ -13,12 +13,14 @@ Every TOML example in this document is loaded by the real configuration loader i
 | Stored sessions and the audit record | `~/.nanoclaude/sessions.db` |
 | What `ncc` learned about a model | `~/.nanoclaude/capabilities.json` |
 | What you typed at the prompt | `~/.nanoclaude/history` |
+| What `ncc` knows of each MCP tool it has seen | `~/.nanoclaude/mcp-pins.json` |
+| What each MCP server wrote to its stderr | `~/.nanoclaude/logs/mcp-<name>.log` |
 | Your instructions for every project | `~/.nanoclaude/NANO.md` |
 | Instructions for one project | `NANO.md` in its root and in each directory above it up to the top of its repository; `CLAUDE.md` is read in a directory that has no `NANO.md` (see [Instruction files](#instruction-files)) |
 
 `NANOCLAUDE_HOME` moves the home. Set it to a directory and `ncc` keeps `.nanoclaude` inside that directory instead of inside your home directory: the configuration, the session store, the history, the capability cache and the global `NANO.md` all move together. It may start with `~`.
 
-What `ncc` creates under `.nanoclaude` is readable by you alone from the moment it exists: the directory is mode 0700, and `sessions.db` with its write-ahead files, `history`, `capabilities.json` and the `config.toml` that `ncc init` writes are 0600. When it opens them, `ncc` narrows the directory, `sessions.db` and its write-ahead files, `history` and `capabilities.json` if an earlier version left them open to others. An existing `config.toml`, whoever wrote it, is never narrowed. It holds no key (a model entry names the environment variable that holds its key, and an `api_key` in a file is refused), so leaving it as it is exposes your settings and no key. A `base_url` is checked only for starting with `http://` or `https://`, so keep a credential out of it.
+What `ncc` creates under `.nanoclaude` is readable by you alone from the moment it exists: the directory is mode 0700, and `sessions.db` with its write-ahead files, `history`, `capabilities.json`, `mcp-pins.json` with its lock file, the logs of the MCP servers and the `config.toml` that `ncc init` writes are 0600. When it opens them, `ncc` narrows the directory, `sessions.db` and its write-ahead files, `history` and `capabilities.json` if an earlier version left them open to others. An existing `config.toml`, whoever wrote it, is never narrowed. It holds no model key (a model entry names the environment variable that holds its key, and an `api_key` in a file is refused), so leaving it as it is exposes your settings. The one credential it can hold is the `env` of an MCP server, as plain text, because that is how a server is given one: make a file that has such a value readable by you alone. A `base_url` is checked only for starting with `http://` or `https://`, so keep a credential out of it.
 
 A key is never read from a file. A model entry names the environment variable that holds its key, and an `api_key` in a file is refused with a message saying so.
 
@@ -143,6 +145,48 @@ What holds for a sub-agent, whichever it is:
 
 Not built: sub-agents defined in `~/.nanoclaude/agents/`, the `plan` and `general` sub-agents, and a sub-agent that starts another. The reasons are in [0017](design/0017-sub-agents.md).
 
+## MCP servers
+
+```toml
+# ~/.nanoclaude/config.toml (excerpt)
+[mcp.notes]
+transport = "stdio"
+command   = "/home/you/bin/notes-server"
+args      = ["--stdio", "--quiet"]
+env       = { NOTES_TOKEN = "write the token here" }
+enabled   = true
+timeout   = 30
+
+[mcp.scratch]
+command = "/home/you/bin/scratch-server"
+enabled = false
+```
+
+Each `[mcp.<name>]` table is a server that `ncc` starts and takes tools from. They are accepted in your own file only: a project's `.nanoclaude/config.toml` that has an `mcp` section at all is refused, whatever is in it, since each server names a program that is started with your authority.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `command` | none, required | The program that starts the server: not empty, started directly and not through a shell, in the project root. |
+| `args` | none | A list of strings, passed to it as they are. |
+| `env` | none | A table of strings, added to the environment the server is given. It is plain text in the file. It may hold a credential, which is how a server is given one, and a file that does should be readable by you alone. |
+| `transport` | `"stdio"` | Only `"stdio"`. `"sse"` and `"http"` are refused with "not supported in this version"; the HTTP transports are not built. |
+| `enabled` | `true` | `false` keeps the table and does not start the server; `/mcp` lists it as disabled. |
+| `timeout` | 30 | The seconds that one request to the server may take, a whole number from 1 to 600. It bounds a tool call and the requests of a start, except `server/discover`, which is waited for five seconds. |
+
+The name of the table is lower-case letters, digits and underscores, starting with a letter or a digit and at most 24 long, with no hyphen: it is part of the name of each tool, `mcp__<name>__<tool>`, which the model writes as an identifier. Any other key is an error, as everywhere else in the file.
+
+**What a server is given.** Its environment is `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR` and `TERM` from the environment `ncc` runs in, and then the `env` of its table, which wins. Nothing else of `ncc`'s environment reaches it, so a provider's key does not, unless it is written in `env`. Its stderr is appended to `~/.nanoclaude/logs/mcp-<name>.log`, which keeps the newest megabyte and is never shown to the model.
+
+**When a session starts.** Every server that is enabled is started at the same time, and `ncc` waits for all of them for at most 15 seconds in all. That includes the time to end a server that did not make it in time: starts get the first 10 seconds, a start still going then is cancelled, which ends its server (stdin closed, two seconds, SIGTERM, two seconds, SIGKILL), and a close still going at the end of the 15 is cut short with SIGKILL to the server's process group. A server that fails, whether the program cannot be started or it exits, it speaks no protocol version `ncc` does, its tool list cannot be had or it does not finish in time, is one line on stderr, `warning: MCP server 'notes' failed to start (<reason>) — its tools are not registered`. The session goes on without its tools. A pins file that cannot be read (not JSON, not the shape of one, not text) fails every enabled server in the same way, and none is started: a tool that cannot be compared with what you last approved is not registered. Fix the file, or delete it to forget every pin.
+
+**What becomes of the tools.** Each tool a server lists is registered as `mcp__<server>__<tool>`, with each character of the tool's name that is not a letter, a digit or an underscore written as an underscore. A tool is left out, with a warning, when its registry name is more than 64 characters long, when two of a server's tools come to one name, when its description is not text, or when its input schema is not an object, is over 64 KiB or 32 levels deep, or has a `$ref` that does not point inside it. A description has its terminal controls removed and is cut at 2,048 bytes, with `…(truncated)` after it. A name that two servers come to (the tool `b__t` of the server `a`, and the tool `t` of `a__b`) is left out of both, with a warning. A tool that was seen in an earlier session is compared with its pin, and one whose description or schema differs is changed: it asks before every call in this session, in every mode ([Permissions](#permissions), check 7). Answering "always" at its question approves the new definition for the next session and does not grant the tool for this one. The tool list is read once, when the session starts, and a change a server announces during the session is ignored.
+
+**Calling a tool.** It asks, as a tool that is not read-only does (`default.ask`), and a rule may name it in full: `allow = ["mcp__notes__search"]`. The confirmation shows the server and the arguments the model wrote, as JSON, cut at 1,000 characters. What comes back is one tool result: the content as text (an image or a resource is a line that says what was left out), cleaned of terminal controls, scrubbed of credentials, cut to `output_cap_bytes` and wrapped in `<mcp-result server="notes" tool="search">` and `</mcp-result>`, a closing tag inside it written `<\/mcp-result`. A result the server marks as an error is an error. A call that is not answered in the server's `timeout` is cancelled and is an error. The system prompt says that such results are third-party data and not instructions, and says it only when a registered tool is one. A sub-agent is never given one of these tools.
+
+`/mcp` lists the servers with their state, their protocol era (`modern` is the 2026-07-28 protocol, `legacy` one of the three before it) and the number of tools registered, and `/mcp <server>` lists a server's tools with whether each is changed and the first 12 hexadecimal characters of its fingerprint.
+
+Not built: the HTTP transports, resources, prompts, sampling, elicitation, a tool list that changes during a session, and restarting a server that has gone. The reasons are in [0018](design/0018-mcp-client.md).
+
 ## Permissions
 
 ```toml
@@ -180,11 +224,11 @@ A `deny` rule compares a path as written and again after case folding and NFC no
 
 The first six are the hard denials: no mode, rule or grant gets past them. The seventh is not a denial and is not skipped either: it asks. It follows from the order that an `ask` rule has no effect on a tool that is allowed without asking, and that an `allow` rule cannot open a credentials file. To keep something from being read, use `deny`. A `Read` `deny` rule also keeps a file out of what `Grep` returns, out of an `@` mention, out of the project map and out of the instruction files, since each asks the policy whether a `Read` of the file would be refused. `Glob` asks it nothing, and still lists the names of such files.
 
-**Modes.** `default` asks before changing anything. `plan` refuses every write, so the model can read and reason and not change. `accept-edits` applies `Edit` and `Write` without asking and still asks about anything else. `bypass` asks about nothing, and is reached only with `--dangerously-skip-permissions`; it does not turn off the hard denials, so the sandbox, protected paths, credentials paths, dangerous commands and your `deny` rules are enforced in it. `--mode` takes `default`, `plan` or `accept-edits`. It does not take `bypass`: `--mode bypass` is refused, with the flag beside it or without, and the error names the flag that turns it on. The flag together with any `--mode` is refused too, and no configuration file can select it. `/mode` switches among the first three and refuses `bypass`.
+**Modes.** `default` asks before changing anything. `plan` refuses every write, so the model can read and reason and not change. `accept-edits` applies `Edit` and `Write` without asking and still asks about anything else. `bypass` asks about nothing but a tool of an MCP server whose definition changed (`mcp.changed`), and is reached only with `--dangerously-skip-permissions`; it does not turn off the hard denials, so the sandbox, protected paths, credentials paths, dangerous commands and your `deny` rules are enforced in it. `--mode` takes `default`, `plan` or `accept-edits`. It does not take `bypass`: `--mode bypass` is refused, with the flag beside it or without, and the error names the flag that turns it on. The flag together with any `--mode` is refused too, and no configuration file can select it. `/mode` switches among the first three and refuses `bypass`.
 
-**Confirmations.** A call that needs confirming is shown (an `Edit` as a diff, a `Write` as a diff or the first lines and the size) and the prompt is `[y]es / [n]o / [a]lways`. "Always" grants the tool, not the command, for the rest of the session, and is kept in memory only. A call declined tells the model not to try another way to do the same thing.
+**Confirmations.** A call that needs confirming is shown (an `Edit` as a diff, a `Write` as a diff or the first lines and the size) and the prompt is `[y]es / [n]o / [a]lways`. "Always" grants the tool, not the command, for the rest of the session, and is kept in memory only. A call to an MCP tool shows the server and the arguments the model wrote, as JSON, cut at 1,000 characters, and a changed tool says that its definition has changed, and what "always" means for it. A call declined tells the model not to try another way to do the same thing.
 
-Under `-p` nobody can answer, so every call that would have asked is declined, and each is one line on stderr naming the rule that asked, `default.ask` or `rule.ask`: `ncc: declined (default.ask) Write src/x.py — pass --mode accept-edits to let -p edit files`. A path inside the project is shown relative to it, and control characters in a subject are spelled out. What follows the dash is what would let `-p` do it: `--mode accept-edits` for a file edit, or the tool's name in `allow` in your own configuration. The exit code is what it would have been. A call the policy refuses outright is not reported there: nobody was to be asked, and the model receives the refusal, with its rule id, as the tool's result.
+Under `-p` nobody can answer, so every call that would have asked is declined, and each is one line on stderr naming the rule that asked, `default.ask`, `rule.ask` or `mcp.changed`: `ncc: declined (default.ask) Write src/x.py — pass --mode accept-edits to let -p edit files`. A path inside the project is shown relative to it, and control characters in a subject are spelled out. What follows the dash is what would let `-p` do it: `--mode accept-edits` for a file edit, or the tool's name in `allow` in your own configuration. For `mcp.changed` no rule helps, and the line says so: the definition of the tool has to be approved in a session where you can be asked. The exit code is what it would have been. A call the policy refuses outright is not reported there: nobody was to be asked, and the model receives the refusal, with its rule id, as the tool's result.
 
 **The sandbox** is the project root and each `--add-dir`. A path is judged by where it resolves to, symlinks followed, and a write also checks that its parent directory resolves inside. `Grep`, `Glob`, `@` mentions and the project map do not follow a symlink that leads out of it. A root given with `~` or relative to where `ncc` was run is made absolute first. An empty value is an error, never the current directory. Without `--root` the root is the directory `ncc` was run in, and `ncc` refuses to start, with exit code 2 and before it opens anything, when that is `/`, a home directory (yours, or the one `NANOCLAUDE_HOME` names) or a directory that contains one, since the session store, the shell's startup files and every other project would be in reach. `--root` names such a directory and says it was meant; `--add-dir` does not.
 
@@ -247,7 +291,7 @@ keep_recent_turns = 3
 | --- | --- | --- |
 | `max_turns` | 40 | The most model round trips one prompt may take, a whole number of at least 1. A prompt that needs more stops with a message saying how to go on; the next prompt gets the whole count again. `--max-turns` overrides it. |
 | `bash_timeout_s` | 120 | Seconds a shell command may run, above 0. Reserved for the shell tool, which this version does not have: it is checked when the file is loaded and nothing reads it, so changing it changes nothing. |
-| `output_cap_bytes` | 100000 | The most bytes of a sub-agent's answer that come back to the conversation, a whole number of at least 1: the rest is cut, and the result says how many bytes were. It is meant as well for the most output of a command kept, which is Reserved for the shell tool in the same way as `bash_timeout_s`. |
+| `output_cap_bytes` | 100000 | The most bytes of a sub-agent's answer, or of one result of a tool of an MCP server, that come back to the conversation, a whole number of at least 1: the rest is cut, and the result says how many bytes were. It is meant as well for the most output of a command kept, which is Reserved for the shell tool in the same way as `bash_timeout_s`. |
 | `compact_soft` | 0.7 | The share of the room for a conversation at which old tool results are shrunk to one line each. Above 0, at most 1. |
 | `compact_hard` | 0.85 | The share at which everything older than the recent turns is replaced by a summary. |
 | `keep_recent_turns` | 3 | How many recent turns a summary leaves as they were, at least 1. A model whose window is under 32,000 tokens keeps at most 2. |
@@ -323,6 +367,7 @@ Flags are spelled out in full; an abbreviation is not accepted. `ncc init` takes
 | `/mode [mode]` | Shows the mode, or switches among `default`, `plan` and `accept-edits`. `bypass` is refused. |
 | `/tools` | Lists the tools and marks those that cannot change anything. |
 | `/agents` | Lists the sub-agents the `Task` tool can start, each with what it does and the model its role is routed to. In this version there is one, `explore`. |
+| `/mcp [server]` | Lists the MCP servers, each with its state (`running`, `failed` with the reason, or `disabled`), its protocol era and how many tools it has registered. With a server's name it lists that server's tools, each with whether it is changed and the first 12 hexadecimal characters of its fingerprint. |
 | `/resume` | Says to restart with `ncc --resume <id>`. |
 | `/export [file]` | Writes the conversation as markdown. It never overwrites a file; the default name is `session-<id>.md` in the project, and the file is readable by you alone. Tool results are cut at 2,000 characters and the model's private reasoning is left out. |
 | `/init` | Says to run `ncc init`. |

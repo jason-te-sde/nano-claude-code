@@ -1,6 +1,6 @@
 # Architecture
 
-This describes `main` as it is built: seven tools (Read, Edit, Write, Glob, Grep, TodoWrite, Task), three provider adapters, a permission engine with a sandbox, and a REPL and a headless mode over one session. Bash and Git are not built yet. Where the code and an earlier plan disagree, this document follows the code, and the last section lists the differences.
+This describes `main` as it is built: seven tools (Read, Edit, Write, Glob, Grep, TodoWrite, Task) and the tools of the MCP servers that are configured, three provider adapters, a permission engine with a sandbox, and a REPL and a headless mode over one session. Bash and Git are not built yet. Where the code and an earlier plan disagree, this document follows the code, and the last section lists the differences.
 
 Comments in the code cite sections of a design document ("spec 6.2"). That document is not in the repository. What matters from it is restated here, and the reasons behind the choices are in [the design notes](design/0001-scope.md).
 
@@ -17,29 +17,29 @@ Comments in the code cite sections of a design document ("spec 6.2"). That docum
             Executor  decide every call, then run them
             subagent  the session a Task call starts, held to its limits
               |
-   +----------+-----------+--------------+------------+--------------+
-   |          |           |              |            |              |
- conversation tools    permissions     context      providers      config
- transcript   registry policy          assemble     base           schema
- budget       read     rules           instructions capabilities   load
- compaction   edit     sandbox         mentions     retry
- store        write    redact          projectmap   texttools
- (SQLite)     glob     audit           git          pricing
-              grep     danger/regex                 anthropic
-              todo                                  openai_compat
+   +----------+-----------+--------------+------------+--------------+----------+
+   |          |           |              |            |              |          |
+ conversation tools    permissions     context      providers      config     mcp
+ transcript   registry policy          assemble     base           schema     jsonrpc
+ budget       read     rules           instructions capabilities   load       transport
+ compaction   edit     sandbox         mentions     retry                     client
+ store        write    redact          projectmap   texttools                 tool
+ (SQLite)     glob     audit           git          pricing                   pins
+              grep     danger/regex                 anthropic                 result
+              todo                                  openai_compat             servers
               task                                  ollama
               keyblocks
 ```
 
 `nanoclaude.testing` is also shipped: `ScriptedModel` plays back what it is told to say and `build_session` wires a real session around it. They are in the package and not in `tests/` so that anyone writing a tool can test it inside a real session.
 
-`nanoclaude/private.py` is what the files `ncc` creates under its home are made with: a file is created with mode 0600 and a directory with 0700 by the call that creates it, never made and then narrowed, and one that an earlier version left open is narrowed when `ncc` opens it. It covers the `.nanoclaude` directory, `sessions.db` and its write-ahead files, the history and the capability cache. It also makes the `config.toml` that `ncc init` writes private when it creates it (`test_the_config_is_private_from_the_moment_it_exists`). An existing `config.toml`, whoever wrote it, is never narrowed (`test_a_home_an_earlier_version_made_open_to_others_is_narrowed_and_the_config_is_left`). It holds no key, only the name of the environment variable that holds one. A `base_url` is checked only for starting with `http://` or `https://`, so a credential put in one is kept.
+`nanoclaude/private.py` is what the files `ncc` creates under its home are made with: a file is created with mode 0600 and a directory with 0700 by the call that creates it, never made and then narrowed, and one that an earlier version left open is narrowed when `ncc` opens it. It covers the `.nanoclaude` directory, `sessions.db` and its write-ahead files, the history and the capability cache. It also makes the `config.toml` that `ncc init` writes private when it creates it (`test_the_config_is_private_from_the_moment_it_exists`). An existing `config.toml`, whoever wrote it, is never narrowed (`test_a_home_an_earlier_version_made_open_to_others_is_narrowed_and_the_config_is_left`). It holds no model key, only the name of the environment variable that holds one; the one credential it can hold is the `env` of an MCP server, written as plain text because that is how a stdio server is given one. A `base_url` is checked only for starting with `http://` or `https://`, so a credential put in one is kept. The pins file, its lock and the log of each MCP server are made private by the same module.
 
-One boundary is enforced by the build. Nothing under `agent/` imports from `cli/`, and `agent/loop.py` imports none of `os`, `subprocess`, `time`, `random`, `uuid`, `asyncio`, `sqlite3` or `httpx` (`tests/test_boundaries.py`). Reasons are in [0002](design/0002-pure-loop.md) and [0006](design/0006-ui-protocol.md). The other directions (that `tools/` or `providers/` do not import `agent/`) hold today and are not enforced.
+One boundary is enforced by the build. Nothing under `agent/` imports from `cli/`, nothing under `mcp/` imports from `agent/` or `cli/`, and `agent/loop.py` imports none of `os`, `subprocess`, `time`, `random`, `uuid`, `asyncio`, `sqlite3` or `httpx` (`tests/test_boundaries.py`). Reasons are in [0002](design/0002-pure-loop.md) and [0006](design/0006-ui-protocol.md). The other directions (that `tools/` or `providers/` do not import `agent/`) hold today and are not enforced.
 
 ## What happens to one prompt
 
-1. `ncc` parses its flags, loads the configuration (your file, then the project's, with the trust rules of [configuration.md](configuration.md)), and builds a `Policy` (the sandbox roots, the rules, the mode, the credentials path patterns), a `Store`, a `Router`, the tool registry, one `Redactor`, an `AuditLog` and a `Session`. For a REPL it also builds a `ConsoleUI`; for `-p` the UI is one that declines every question and says on stderr which call it declined, and with which rule. Before the session writes a row, the router checks that the key of every role's model is set.
+1. `ncc` parses its flags, loads the configuration (your file, then the project's, with the trust rules of [configuration.md](configuration.md)), and builds a `Policy` (the sandbox roots, the rules, the mode, the credentials path patterns), a `Store`, a `Router`, one `Redactor`, the MCP servers that are configured and, from their tools, the tool registry, an `AuditLog` and a `Session` ([MCP servers](#mcp-servers) below has that part). For a REPL it also builds a `ConsoleUI`; for `-p` the UI is one that declines every question and says on stderr which call it declined, and with which rule. Before the session writes a row, the router checks that the key of every role's model is set.
 2. `Session.follow_up(prompt)` first closes what an interrupted earlier turn left open (a call nobody answered, a request nobody replied to), then expands `@` mentions in the prompt, then hands the prompt to `loop.resume`.
 3. The session then repeats the following until the loop says it is done.
    1. The conversation is stored.
@@ -63,6 +63,7 @@ A tool has a name, a `read_only` flag, a `spec()` (what the model is told) and t
 | `Grep` | yes | ripgrep when it is on `PATH`, otherwise a slower search written in Python that answers the same; neither follows a symlink. Three output modes. A file the policy would refuse a `Read` of (a credentials file, one a `Read` `deny` rule covers) is dropped before the limit is applied, and a line inside a private-key block is shown as a marker. Line numbers are the backend's: ripgrep counts newlines only, and the Python search counts as `Read` does. |
 | `TodoWrite` | no | The session's own task list, at most one task in progress. It changes nothing outside the session, and is allowed without asking. |
 | `Task` | no | Starts a sub-agent and returns its final text as one result ([0017](design/0017-sub-agents.md)). It asks by default, a rule can allow it, and a name that is not a sub-agent is refused before anyone is asked. |
+| `mcp__<server>__<tool>` | no | A tool of an MCP server, one for each the server lists that passed the checks of [MCP servers](#mcp-servers). It asks by default, `accept-edits` does not allow it, `bypass` does unless its definition changed, and a rule names it in full. The result is the server's text, wrapped, scrubbed and capped. |
 
 What a tool returns is stripped of terminal control sequences before it goes anywhere, so that a file cannot move the cursor or retitle the window of whoever reads the screen, and scrubbed of credentials before it becomes part of the transcript ([0012](design/0012-redaction-before-transcript.md)).
 
@@ -73,6 +74,32 @@ A sub-agent is a `Session`, nested. `Task` does nothing itself: it checks that t
 What it is built from is the parent's, and narrower. The registry is made from the persona's tool names, so it holds `Read`, `Glob` and `Grep` for `explore` and no `Task`, no write tool and no MCP tool. The sandbox is the parent's, through `Sandbox.narrowed_to`, which refuses a root that the parent's does not contain. The policy is the parent's, so its mode and rules hold, and the executor starts with the parent's grants. The front end passes the person only that a request is under way, and answers every question with no, so nothing inside it can ask and nothing can be granted. The router is the parent's, which is why the cost is in the parent's ledger under the `explore` role as it is spent.
 
 The three limits are enforced in two places. The gate counts requests and estimated input tokens and refuses the one that would go past a limit, by raising an exception that the runner catches; it is called from the session's one place that sends a request to the conversation's model, so a retry after an overflow and a text-protocol reply asked for again count as requests. A timeout around the whole run is the clock, so that a model that never answers is stopped too. The result is the final text, or the last text there was with a line naming the limit, cut to `output_cap_bytes`; an error from the model is a tool error that carries what the sub-agent had written. Why each of these is as it is, and what was left out, is in [0017](design/0017-sub-agents.md).
+
+## MCP servers
+
+`mcp/` is the client, and what stands between what a server says and the registry. Nothing in it imports `agent/` or `cli/`; the session imports it to register the tools and to close the servers. The reasons for each decision, and what was left out, are in [0018](design/0018-mcp-client.md).
+
+| Module | What it holds |
+| --- | --- |
+| `mcp/jsonrpc.py` | JSON-RPC 2.0 messages as typed values, one to a line, at most 4 MiB. |
+| `mcp/transport.py` | `StdioTransport`: the server as a child process (a process group of its own, an environment of nine variables and the server's `env`, its stderr in a private log of at most 1 MiB), and how it is ended: its stdin closed, SIGTERM to the group after two seconds, SIGKILL after two more. |
+| `mcp/client.py` | `McpClient`: which era the server speaks (`server/discover`, and `initialize` when that is not answered), `tools/list` with its limits, `tools/call` with a timeout and a cancellation. It holds what the server sent and names, cleans and wraps nothing. |
+| `mcp/tool.py` | `adapt_tools` and `combine_tools`, which check a server's tools and make `McpTool`s of them, and `McpTool`, the tool the registry holds: its name, description and schema, its pin, its permission request and its call. |
+| `mcp/pins.py` | `PinStore`: the fingerprints in `mcp-pins.json`, replaced whole under a lock, so that two sessions do not erase each other's. |
+| `mcp/result.py` | What a result becomes before the model reads it: text, cleaned, scrubbed, its closing tags made safe, capped and wrapped. |
+| `mcp/servers.py` | `start_servers` and `McpServers`: the servers of a session started together within a budget, a failure of one kept apart from the rest, and all of them ended at once. |
+
+**The startup flow** is where these meet, in `_build_session` of `cli/main.py`, after everything that could refuse the session on its own account (the store, the configuration, the key of every role's model) and before the `Session` is built.
+
+1. `start_servers` reads the pins. A pins file that cannot be read fails every enabled server, closed: no server is started and no tool is registered, and each is one warning line. A server that is not `enabled` is never started and is not a warning.
+2. Each enabled server is started in its own task, at the same time as the others: the transport starts the process in the project root, the client settles the era, and `adapt_tools` lists the tools and checks each one, with `limits.output_cap_bytes` as the cap a result is held to. A server that fails at any of these (the program, the era, the tool list), or does not finish, is one warning line naming it and a short reason, and registers nothing.
+3. Waiting is limited to 15 seconds in all, and ending a server is inside the 15. Starts get the first 10. A start that is still going then is cancelled, which ends its server in order, and the last 5 seconds are for that: a close that is still going half a second before the end is cut short, with SIGKILL to the group, which cannot be ignored. Nothing here waits past the budget, and a server that was started is not left running.
+4. The tools of every server that started go through `combine_tools`, which drops a name that two servers come to from both, with a warning, and never raises.
+5. The tools are registered beside the built-in ones (`default_registry(todo, servers.tools)`), the warnings go to stderr as `warning: ...` lines, and the `Session` is built with the servers. The system prompt has its one sentence about the results of MCP tools only when a registered tool is one.
+6. If anything fails after the servers were started and before the session exists (a session to resume that is not stored, say), they are closed with the store.
+7. `Session.aclose` closes them, in parallel, after the provider clients and before the store, and every way the REPL and `-p` end goes through it: a normal end, an exception, Ctrl+C. A start that is itself cancelled by Ctrl+C ends the servers that were starting and those that had started.
+
+`/mcp` reads the servers back: each configured server's state (running, failed with its reason, or disabled), its protocol era and the number of tools it registered, and for one server its tools, whether each is changed and the first 12 hexadecimal characters of its fingerprint. A server that goes away during the session is shown as failed, with the reason the client saw; its tools stay registered and a call to one is an error. A sub-agent is never given one of these tools, since its registry is made from the names its persona lists.
 
 ## Permissions
 
@@ -174,6 +201,7 @@ These are differences between the original design and what is built. The code is
 - An `allow` rule for one path cannot open a credentials file; only `--allow-secrets` can. The entropy floor of the generic secret rule is 3.5 bits per character.
 - "Always" grants a tool, not a command prefix.
 - A flag `--root` exists for the project directory.
-- A slash command `/exit` exists. The commands for MCP servers, rewinding, diffs and checkpoints do not.
+- A slash command `/exit` exists. `/mcp` lists the MCP servers and their tools. The commands for rewinding, diffs and checkpoints do not.
 - Sub-agents: one, `explore`, one level deep. The plan also has `plan` and `general`, definitions in `~/.nanoclaude/agents/`, and a depth of two.
+- MCP: stdio only. The plan has `stdio | sse`; the specification has since deprecated HTTP with server-sent events for Streamable HTTP, so a `transport` of `sse` or `http` is refused with "not supported in this version". The plan's reading of resources is not built, and a server's tool list is read once.
 - `TodoWrite` is in the default `ask` list of the configuration and is allowed all the same, because `tool.read-only` is checked before `rule.ask`.

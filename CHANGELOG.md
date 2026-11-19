@@ -17,6 +17,24 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
   and the store, and a two-phase executor that decides every call of a turn before it runs any.
 - The tools `Read`, `Edit` (a batch of exact replacements that applies whole or not at all),
   `Write`, `Glob`, `Grep` and `TodoWrite`.
+- An MCP client, for servers that `ncc` starts and talks to over stdio, and the `/mcp` command. A
+  server is a `[mcp.<name>]` table in your own configuration file, with `command`, `args`, `env`,
+  `enabled` and `timeout`; a project's file is refused for one. The servers of a session are
+  started together, `ncc` waits for them at most 15 seconds with the time to end a server that
+  did not make it included, and one that fails is a warning line and no tools. Every server is
+  closed when the session ends, on Ctrl+C and on an error, and a sub-agent is never given one of
+  their tools. The client speaks MCP 2026-07-28 and falls back to 2025-11-25, 2025-06-18 and
+  2025-03-26. A tool is registered as `mcp__<server>__<tool>` after its name, its description
+  (controls removed, cut at 2,048 bytes) and its input schema (an object, at most 64 KiB and 32
+  levels, no `$ref` that leaves it) have passed limits, and a name two servers come to is dropped
+  from both. A tool asks by default, a rule names it in full and a wildcard is refused. The
+  definition of each tool is pinned in `~/.nanoclaude/mcp-pins.json`, and a new rule id,
+  `mcp.changed`, asks about a changed one in every mode, `bypass` included, and under `-p` is
+  declined. A result is wrapped in `<mcp-result>` tags it cannot close, cleaned, scrubbed and cut
+  to `output_cap_bytes`, the system prompt says in one sentence that such results are data and
+  not instructions, and the confirmation of a call shows its arguments. HTTP transports,
+  resources, prompts, sampling, elicitation and a tool list that changes during a session are not
+  built, and `docs/design/0018-mcp-client.md` says why.
 - The `Task` tool and one built-in sub-agent, `explore`, so that the `explore` role is sent
   requests. The sub-agent is a session nested in the caller's, with `Read`, `Glob` and `Grep`
   only, the caller's sandbox, mode, rules and session grants, and no way to ask the person
@@ -68,13 +86,15 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
   directory or in a directory that holds one is refused unless `--root` names it.
 - Configuration in two files, with the project's file treated as untrusted: it may add `deny`
   and `ask` rules and choose models, and may not add `allow` rules, name a `base_url` or an
-  `api_key_env`, re-point one of your models or raise the turn, timeout and output limits.
+  `api_key_env`, define an MCP server, re-point one of your models or raise the turn, timeout and
+  output limits.
   `bash_timeout_s` and the `Bash` and `Git` entries in the rule lists are reserved for tools this
   version does not have, and the configuration `ncc init` writes says so. `output_cap_bytes` caps
-  a sub-agent's answer, and is reserved as well for the output of a command.
+  a sub-agent's answer and a result of an MCP tool, and is reserved as well for the output of a
+  command.
 - The `ncc` command: an interactive REPL with history, completion, vi keys on request and
   `/help`, `/clear`, `/compact`, `/status`, `/cost`, `/model`, `/mode`, `/tools`, `/agents`,
-  `/resume`, `/export`, `/init` and `/exit`; `-p` for one prompt with text or JSON output and the exit codes
+  `/mcp`, `/resume`, `/export`, `/init` and `/exit`; `-p` for one prompt with text or JSON output and the exit codes
   0, 1, 2, 3, 4, 130 and 141; and `ncc init`, which writes the configuration and then checks the
   key.
 - Under `-p`, a line on stderr for each call that was declined because nobody could be asked,
@@ -113,3 +133,8 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
 - Models that are not in the capability table, other than local ones that can be probed, use the
   text protocol until `native_tools` is set; the REPL says so when it starts.
 - Every provider cassette in the tests is hand-written; none was recorded from a real server.
+- No real MCP server is run by any test, in CI or elsewhere in the repository: the client is tested
+  against a fake one, and the older protocol, which most servers speak, only against that. A server
+  that goes away during a session is shown as failed by `/mcp` and is not restarted. A server's
+  credential is written in its `env` as plain text, and an existing configuration file is never
+  made private.
