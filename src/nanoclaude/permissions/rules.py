@@ -8,6 +8,11 @@ Three shapes:
 * ``Tool(prefix:*)`` -- the subject begins with ``prefix`` at a word boundary,
   so ``Bash(npm test:*)`` covers ``npm test -- --watch`` but not ``npm testify``.
 
+A tool a server brought is named by its registry name, ``mcp__<server>__<tool>``, written
+out in full and alone: no subject, and no wildcard. A pattern over those names would be a
+rule that grows to cover a tool nobody has read yet, which is not what a person who writes
+``allow`` or ``deny`` means.
+
 For path-taking tools the subject is also treated as a glob and matched against
 both the absolute resolved path and the path relative to the sandbox root, so a
 user can write either and be understood.
@@ -26,6 +31,7 @@ there would widen what runs without asking, which is the wrong direction to err 
 from __future__ import annotations
 
 import functools
+import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Literal
@@ -52,6 +58,21 @@ GLOB_PATTERN_FACTORY = "gitwildmatch"
 #: that names ``read`` matches no call to ``Read``, and for a deny rule that is a refusal
 #: the person believes is in force and is not. A test pins this list to the registry.
 KNOWN_TOOLS = ("Bash", "Edit", "Git", "Glob", "Grep", "Read", "Task", "TodoWrite", "Write")
+
+
+#: What the registry calls a tool that an MCP server brought: ``mcp__<server>__<tool>``, the
+#: server as ``MCP_SERVER_NAME`` allows (the pattern here is wider, so that a rule for a name
+#: no server can have is not refused for that) and the tool's own name with every character
+#: outside ``[A-Za-z0-9_]`` replaced by an underscore.
+MCP_TOOL_NAME = re.compile(r"mcp__[a-z0-9_]+__[A-Za-z0-9_]+")
+
+#: What makes a name a pattern, in the glob syntax this module uses.
+_WILDCARDS = frozenset("*?[")
+
+
+def is_mcp_tool_name(name: str) -> bool:
+    """Whether ``name`` is the registry name of an MCP tool, written out in full."""
+    return MCP_TOOL_NAME.fullmatch(name) is not None
 
 
 def fold_spelling(text: str) -> str:
@@ -99,12 +120,21 @@ class Rule:
         # discovered at match time.
         if not subject:
             raise ValueError(f"empty subject in rule {text!r}")
+        known = _known_tool(tool.strip())
+        if is_mcp_tool_name(known):
+            # The call to an MCP tool has no subject for a rule to be about, so a rule
+            # written with one would parse and never match: for deny, a refusal that is not
+            # in force.
+            raise ValueError(
+                f"rule {text!r} gives a subject, and a rule for an MCP tool has no subject "
+                f"— write {known} alone"
+            )
         if subject.endswith(":*"):
             prefix = subject[:-2]
             if not prefix:
                 raise ValueError(f"empty subject in rule {text!r}")
-            return Rule(_known_tool(tool.strip()), prefix, True, raw)
-        return Rule(_known_tool(tool.strip()), subject, False, raw)
+            return Rule(known, prefix, True, raw)
+        return Rule(known, subject, False, raw)
 
     def matches(
         self, tool: str, subject: str, relative_subject: str, *, fold: bool = False
@@ -135,12 +165,35 @@ class Rule:
 def _known_tool(name: str) -> str:
     """``name``, if a rule may name it. The same hazard as an empty subject, from the other
     side: ``read(secrets/**)`` parses, never matches a call to ``Read``, and is a deny rule
-    that denies nothing."""
+    that denies nothing. A tool a server brought is named in full: see
+    :func:`_mcp_tool_name`."""
+    if name.startswith("mcp__"):
+        return _mcp_tool_name(name)
     if name not in KNOWN_TOOLS:
         raise ValueError(
             f"unknown tool {name!r}; tool names are case-sensitive and are {', '.join(KNOWN_TOOLS)}"
         )
     return name
+
+
+def _mcp_tool_name(name: str) -> str:
+    """``name``, if it is the registry name of an MCP tool, written out in full.
+
+    A name with a wildcard in it is refused as one, because the likeliest mistake is the
+    pattern (``mcp__github__*``) and the useful answer is that a rule names one tool.
+    """
+    if is_mcp_tool_name(name):
+        return name
+    if _WILDCARDS & set(name):
+        raise ValueError(
+            f"{name!r} is a wildcard over MCP tools, and a rule names one tool exactly "
+            "— write the whole registry name, mcp__<server>__<tool>, for each tool"
+        )
+    raise ValueError(
+        f"{name!r} is not the registry name of an MCP tool — a rule names one exactly, as "
+        "mcp__<server>__<tool>: the server in lower case letters, digits and underscores, "
+        "the tool with letters, digits and underscores only"
+    )
 
 
 def _prefix_match(subject: str, prefix: str) -> bool:

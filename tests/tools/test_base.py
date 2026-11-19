@@ -8,9 +8,11 @@ from nanoclaude.tools.base import (
     Tool,
     ToolArgumentError,
     ToolOutcome,
+    cut_bytes,
     optional_int,
     require_str,
     sanitize,
+    without_lone_surrogates,
 )
 from nanoclaude.tools.read import ReadTool
 
@@ -143,3 +145,26 @@ def test_a_name_with_bytes_that_are_not_text_is_displayed_in_a_form_that_can_be_
 
 def test_a_name_that_is_text_is_displayed_as_it_is(ctx, tmp_repo):
     assert ctx.display(str(tmp_repo / "caf\u00e9.txt")) == "caf\u00e9.txt"
+
+
+# ---- cutting text to a number of bytes
+
+
+def test_cut_bytes_keeps_what_fits_and_counts_what_it_dropped():
+    assert cut_bytes("abcdef", 4) == ("abcd", 2)
+    assert cut_bytes("abc", 3) == ("abc", 0)
+    assert cut_bytes("", 0) == ("", 0)
+
+
+def test_cut_bytes_falls_between_characters_and_counts_a_character_that_did_not_fit():
+    # Three bytes each: a fourth byte is a third of a letter, which is dropped whole.
+    assert cut_bytes("\u20ac" * 4, 4) == ("\u20ac", 9)
+    assert cut_bytes("\u20ac" * 4, 2) == ("", 12)
+
+
+def test_a_lone_surrogate_becomes_the_replacement_character_and_nothing_else_changes():
+    # A server's JSON can say \ud800, and a string that holds one cannot be written as UTF-8:
+    # the audit row's size, a request body and a terminal would each fail on it.
+    assert without_lone_surrogates("a\ud800b\udfffc") == "a\ufffdb\ufffdc"
+    assert without_lone_surrogates("caf\u00e9 \U0001f600") == "caf\u00e9 \U0001f600"
+    without_lone_surrogates("\ud800").encode("utf-8")

@@ -52,7 +52,7 @@ def test_a_deny_rule_beats_everything():
 def test_secret_paths_are_denied_before_the_sandbox_is_even_consulted():
     result = evaluate(req(subject="/p/.env", paths=("/p/.env",)), policy(), Grants())
     assert (result.decision, result.rule) == (Decision.DENY, "secret.path")
-    # Row 2 runs six rows before row 8 (rule.allow): no allow rule can ever
+    # Row 2 runs seven rows before row 9 (rule.allow): no allow rule can ever
     # override it, so the message must not suggest one can.
     assert "allow rule" not in result.reason
 

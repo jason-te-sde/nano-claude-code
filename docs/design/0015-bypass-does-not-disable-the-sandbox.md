@@ -2,7 +2,7 @@
 
 Status: accepted. A deliberate difference from the tool this project is modelled on.
 
-`--dangerously-skip-permissions` puts a session in `bypass` mode. In that mode nothing asks for confirmation. What it does not do is switch off the checks that decide whether a call may happen at all. The policy is a fixed list of checks and the first one that matches decides. Bypass is the seventh, and the six before it are the hard-denial band: a rule of the person's own with `deny`, a credentials path, a path outside the sandbox or a write through a symlink that leaves it, a write into a `.git` or a `.nanoclaude` directory, a command the danger classifier refuses or cannot parse, and a write in plan mode. No mode and no rule gets past them.
+`--dangerously-skip-permissions` puts a session in `bypass` mode. In that mode nothing asks for confirmation. What it does not do is switch off the checks that decide whether a call may happen at all. The policy is a fixed list of checks and the first one that matches decides. Bypass is the eighth. The first six are the hard-denial band: a rule of the person's own with `deny`, a credentials path, a path outside the sandbox or a write through a symlink that leaves it, a write into a `.git` or a `.nanoclaude` directory, a command the danger classifier refuses or cannot parse, and a write in plan mode. No mode and no rule gets past them. The seventh is `mcp.changed`, which is not a denial and which bypass does not skip: it asks about a tool of an MCP server whose definition changed since the person last approved it.
 
 ## Why
 

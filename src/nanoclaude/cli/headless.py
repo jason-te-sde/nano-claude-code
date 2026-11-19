@@ -49,13 +49,20 @@ def _subject_shown(request: PermissionRequest, root: str) -> str:
     return shown
 
 
-def _advice(tool: str, mode: PermissionMode) -> str:
+def _advice(tool: str, mode: PermissionMode, rule: str) -> str:
     """What lets a headless run do what was declined.
 
     A file edit is let through by the mode made for that, unless it is already on. Anything
     else is allowed by a rule, which has to be in the person's own config: a project's file
-    cannot add one, so it is not named as a place to put it.
+    cannot add one, so it is not named as a place to put it. A tool of an MCP server whose
+    definition changed (``mcp.changed``) asks whatever the rules say, so no rule is the advice:
+    somebody has to look at the new definition, in a session where they can be asked.
     """
+    if rule == "mcp.changed":
+        return (
+            "its definition has changed since it was last approved, so no rule lets -p run it: "
+            "approve it in an interactive session first"
+        )
     if tool in EDIT_TOOLS and mode is PermissionMode.DEFAULT:
         return "pass --mode accept-edits to let -p edit files"
     return f'add "{visible(tool)}" to allow under [permissions] in your config to let -p run it'
@@ -72,7 +79,7 @@ def declined_line(
     """
     return (
         f"declined ({visible(rule)}) {visible(tool)} {_subject_shown(request, root)} "
-        f"— {_advice(tool, mode)}"
+        f"— {_advice(tool, mode, rule)}"
     )
 
 

@@ -12,6 +12,14 @@ write to any file git or ncc itself reads its behaviour from (see
 extended it, because the spec's sandbox rows answer where a path is and none of them
 answers what it is.
 
+A second row is not in the table either: ``mcp.changed``. It is the one place where the
+policy is told something about a tool and not about a call: that the definition of a tool a
+server brought (its description or its input schema) is not what the person last saw. It
+asks, in every mode, and it sits after every row that can refuse and before every row that
+can allow, so that no mode, rule or grant lets such a call go unasked, and a ``deny`` rule
+still wins. It is an ask and not a denial because the person may well approve the new
+definition, and answering "always" is how its pin is renewed.
+
 The first two rows, which say what a file is (a deny rule, a credentials path) and not where it
 is, are one function, :func:`_refusal_of_the_file`, that :func:`evaluate` runs first. It is the
 only place they are written, so that :func:`read_refusal` can ask them alone for a file that is
@@ -29,7 +37,12 @@ from enum import StrEnum
 from pathlib import PurePosixPath
 
 from nanoclaude.permissions.danger import DangerLevel, DangerVerdict
-from nanoclaude.permissions.rules import RuleSet, fold_spelling, glob_matches_any
+from nanoclaude.permissions.rules import (
+    RuleSet,
+    fold_spelling,
+    glob_matches_any,
+    is_mcp_tool_name,
+)
 from nanoclaude.permissions.sandbox import Sandbox, is_within
 
 #: Tools that cannot change anything, and so never need confirming on their own.
@@ -48,6 +61,10 @@ EDIT_TOOLS = frozenset({"Edit", "Write"})
 #: What a tool that asks does that makes it ask, for the reason ``default.ask`` gives. Most
 #: change something; ``Task`` changes nothing and starts model requests, which cost money.
 _WHY_IT_ASKS = {"Task": "starts a sub-agent that spends model requests"}
+
+#: The same, for a tool an MCP server brought: it runs somebody else's code, and what it does
+#: is whatever its server does.
+_WHY_AN_MCP_TOOL_ASKS = "runs a tool of an MCP server, which can do whatever that server does"
 
 #: Directories whose files make git or ncc run something, or change how they behave: git
 #: runs what ``.git/config`` and ``.git/hooks`` name (a hook at the next commit the person
@@ -110,6 +127,9 @@ class PermissionRequest:
     resolved_paths: tuple[str, ...] = ()
     is_write: bool = False
     danger: DangerVerdict | None = None
+    #: True for a tool whose definition is not what the person last saw (an MCP tool whose
+    #: description or input schema differs from its pin). Only the tool knows, so it says so.
+    definition_changed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,7 +251,7 @@ _NO_GRANTS = Grants()
 
 
 def _unpromotable(danger: DangerVerdict | None) -> bool:
-    """True when a SAFE verdict must not be promoted to ALLOW by rows 8-9.
+    """True when a SAFE verdict must not be promoted to ALLOW by rows 9-10.
 
     A verdict's ``authoritative`` defaults to True; the one thing allowed to
     set it False is a fallback classifier owning up to being unable to
@@ -303,7 +323,7 @@ def _refusal_of_the_file(request: PermissionRequest, policy: Policy) -> Permissi
                     Decision.DENY,
                     "secret.path",
                     f"{path} looks like a credentials file and is never read. "
-                    # Row 2 runs six rows before row 8 (rule.allow): no allow
+                    # Row 2 runs seven rows before row 9 (rule.allow): no allow
                     # rule, however exact, can ever reach this request. Only
                     # --allow-secrets (this same row's own guard) or removing
                     # the path from secret_paths changes the outcome.
@@ -389,38 +409,51 @@ def evaluate(
             "plan mode is read-only. Present your plan and exit plan mode first.",
         )
 
-    # 6. mode.bypass
+    # 6. mcp.changed -- not in spec 17.4's table; see the module docstring. After everything
+    # that refuses and before everything that allows, so that nothing lets it go unasked.
+    if request.definition_changed:
+        return PermissionResult(
+            Decision.ASK,
+            "mcp.changed",
+            f"the definition of {request.tool} (its description or input schema) has changed "
+            "since you last approved it, so it asks each time this session, whatever your "
+            "rules and grants say",
+        )
+
+    # 7. mode.bypass
     if policy.mode is PermissionMode.BYPASS:
         return PermissionResult(Decision.ALLOW, "mode.bypass", "permission prompts are disabled")
 
-    # 7. mode.accept-edits
+    # 8. mode.accept-edits
     if policy.mode is PermissionMode.ACCEPT_EDITS and request.tool in EDIT_TOOLS:
         return PermissionResult(
             Decision.ALLOW, "mode.accept-edits", "file edits are auto-approved in this mode"
         )
 
-    # 8. rule.allow
+    # 9. rule.allow
     allowed = policy.rules.first_match("allow", request.tool, *subjects)
     if allowed is not None and not _unpromotable(request.danger):
         return PermissionResult(Decision.ALLOW, "rule.allow", f"allowed by {allowed.source}")
 
-    # 9. grant.session
+    # 10. grant.session
     if request.tool in grants.tools and not _unpromotable(request.danger):
         return PermissionResult(
             Decision.ALLOW, "grant.session", f"{request.tool} was approved for this session"
         )
 
-    # 10. tool.read-only
+    # 11. tool.read-only
     if request.tool in ALLOWED_WITHOUT_ASKING:
         return PermissionResult(Decision.ALLOW, "tool.read-only", f"{request.tool} only reads")
 
-    # 11. rule.ask
+    # 12. rule.ask
     asked = policy.rules.first_match("ask", request.tool, *subjects)
     if asked is not None:
         return PermissionResult(Decision.ASK, "rule.ask", f"{asked.source} requires confirmation")
 
-    # 12. default.ask
-    does = _WHY_IT_ASKS.get(request.tool, "changes state")
+    # 13. default.ask
+    does = _WHY_IT_ASKS.get(request.tool) or (
+        _WHY_AN_MCP_TOOL_ASKS if is_mcp_tool_name(request.tool) else "changes state"
+    )
     return PermissionResult(
         Decision.ASK, "default.ask", f"{request.tool} {does} and has no matching rule"
     )

@@ -102,3 +102,18 @@ def test_gitwildmatch_has_a_single_home():
         if "gitwildmatch" in path.read_text(encoding="utf-8")
     )
     assert offenders == ["permissions/rules.py"]
+
+
+def test_mcp_never_imports_the_agent_or_the_cli():
+    """The session imports the MCP adapter to put its tools in the registry, and the adapter
+    imports the tools, the policy and the configuration it is built from; nothing in it reaches
+    back up to the loop or the front end, which would make the two import each other."""
+    modules = sorted((SRC / "mcp").rglob("*.py"))
+    assert modules, "no module of the MCP package was found, so the check looked at nothing"
+    offenders = [
+        f"{path.relative_to(SRC)} imports {name}"
+        for path in modules
+        for name in imported_modules(path)
+        if name.startswith(("nanoclaude.agent", "nanoclaude.cli"))
+    ]
+    assert offenders == []
