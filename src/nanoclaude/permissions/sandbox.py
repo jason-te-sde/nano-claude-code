@@ -21,6 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
+class WiderSandboxError(ValueError):
+    """A sandbox was asked to cover somewhere the sandbox it comes from does not."""
+
+
 def is_within(root: str, path: str) -> bool:
     """True if ``path`` is ``root`` or sits underneath it.
 
@@ -85,6 +89,26 @@ class Sandbox:
 
     def contains(self, resolved: str) -> bool:
         return any(is_within(root, resolved) for root in self.roots)
+
+    def narrowed_to(self, *roots: str) -> Sandbox:
+        """A sandbox that covers only ``roots``, each of which must be inside this one.
+
+        How a sub-agent gets its sandbox: from its parent's, and never by naming one of its
+        own. It can be narrower, and a root that this sandbox does not contain is refused,
+        so that a delegate cannot be given more reach than the session that delegated.
+        ``roots`` are resolved as a sandbox's roots are, so that a link to a directory
+        outside is judged by where it leads.
+        """
+        if not roots:
+            raise ValueError("a narrowed sandbox needs at least one root")
+        narrowed = Sandbox(roots)
+        for root in narrowed.roots:
+            if not self.contains(root):
+                raise WiderSandboxError(
+                    f"{root} is not inside the sandbox ({', '.join(self.roots)}), "
+                    "and a narrower sandbox cannot cover more than the one it comes from"
+                )
+        return narrowed
 
     def check_read(self, resolved: str) -> str | None:
         return None if self.contains(resolved) else "sandbox.outside-root"

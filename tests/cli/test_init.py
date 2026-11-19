@@ -231,14 +231,16 @@ def test_the_comment_above_the_roles_says_what_a_role_is_for():
 
 
 def test_the_comment_above_the_roles_says_which_are_routed_and_promises_no_saving():
-    # Only main and compact are routed to a model of their own in this version; the rest wait
-    # for sub-agents (spec 13, v0.3). A file that calls pointing `explore` at a cheap model
-    # "the easiest saving available" invites somebody to change a line that changes nothing.
+    # Only main, explore and compact are routed to a model of their own in this version; the
+    # rest wait for the sub-agents and commands that would use them (spec 13, v0.3). A file that
+    # calls pointing `explore` at a cheap model "the easiest saving available" promises what has
+    # not been measured.
     lines = render_config(PRESETS["anthropic"], "a", "m").splitlines()
     above = " ".join(line.lstrip("# ") for line in lines[: lines.index("[roles]")]).lower()
     assert "saving" not in above and "easiest" not in above
-    assert "main" in above and "compact" in above
+    assert "main" in above and "explore" in above and "compact" in above
     assert "v0.3" in above and "sub-agent" in above
+    assert "plan" in above and "verify" in above and "title" in above
 
 
 def comment_above(lines: list[str], header: str) -> str:

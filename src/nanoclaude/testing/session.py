@@ -87,10 +87,13 @@ class ScriptedClient(ScriptedModel):
 class ScriptedSession(Session):
     """A Session that also holds the scripted clients it was built with."""
 
-    #: The client every role but ``compact`` talks to, with the requests it was sent.
+    #: The client every role talks to that was not given a script of its own, with the
+    #: requests it was sent.
     model: ScriptedClient = field(kw_only=True)
     #: The client for the ``compact`` role, when it was given a script of its own.
     compact_model: ScriptedClient | None = field(default=None, kw_only=True)
+    #: The client for the ``explore`` role, when it was given a script of its own.
+    explore_model: ScriptedClient | None = field(default=None, kw_only=True)
 
 
 def build_session(
@@ -98,10 +101,13 @@ def build_session(
     script: Sequence[ModelReply | ModelError],
     *,
     compact_script: Sequence[ModelReply | ModelError] | None = None,
+    explore_script: Sequence[ModelReply | ModelError] | None = None,
     model: str | None = None,
     compact_model: str = "claude-haiku-4-5",
+    explore_model: str = "claude-haiku-4-5",
     capabilities: Capabilities | None = None,
     compact_capabilities: Capabilities | None = None,
+    explore_capabilities: Capabilities | None = None,
     context_window: int | None = None,
     native_tools: bool | None = None,
     max_turns: int = 40,
@@ -125,6 +131,9 @@ def build_session(
     ``compact_capabilities`` are that model's, with the same caveat as
     ``capabilities`` below: they only take effect for a model id the table does not
     know.
+
+    ``explore_script`` does the same for the ``explore`` role, the one a sub-agent's model
+    comes from (``explore_model`` is its id), with ``explore_capabilities`` for it.
 
     ``model`` is the id the roles are routed to. ``capabilities`` replace what the
     capability table says for it: they are read through the capability cache,
@@ -165,10 +174,19 @@ def build_session(
             cache.put("anthropic", compact_model, compact_capabilities)
         clients["c"] = compact_client
         compact_alias = "c"
+    explore_client: ScriptedClient | None = None
+    explore_alias = "m"
+    if explore_script is not None:
+        explore_client = ScriptedClient(explore_script)
+        models["e"] = ModelConfig("anthropic", explore_model)
+        if explore_capabilities is not None:
+            cache.put("anthropic", explore_model, explore_capabilities)
+        clients["e"] = explore_client
+        explore_alias = "e"
 
     config = Config(
         models=models,
-        roles=RolesConfig("m", "m", "m", "m", compact_alias, "m"),
+        roles=RolesConfig("m", explore_alias, "m", "m", compact_alias, "m"),
         limits=LimitsConfig(
             max_turns=max_turns,
             compact_soft=compact_soft,
@@ -204,4 +222,5 @@ def build_session(
         home=str(home if home is not None else state_dir / "home"),
         model=main_client,
         compact_model=compact_client,
+        explore_model=explore_client,
     )

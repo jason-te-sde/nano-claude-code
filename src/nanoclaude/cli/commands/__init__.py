@@ -1,10 +1,10 @@
 # src/nanoclaude/cli/commands/__init__.py
 """Slash commands. Spec 17.7 lists them; this module is the implementation.
 
-The eleven here are what v0.1 has. ``/agents`` and ``/mcp`` describe subsystems that
-arrive in v0.3, and ``/rewind``, ``/diff`` and ``/checkpoints`` in v0.2, so they are
-absent rather than stubbed. ``/exit`` is not in spec 17.7; it is here because the
-REPL has to be leavable by a word as well as by Ctrl+D.
+The twelve here are the ones spec 17.7 lists that exist so far. ``/mcp`` describes a
+subsystem that arrives in v0.3, and ``/rewind``, ``/diff`` and ``/checkpoints`` one that
+arrives in v0.2, so they are absent rather than stubbed. ``/exit`` is not in spec 17.7; it
+is here because the REPL has to be leavable by a word as well as by Ctrl+D.
 
 A handler prints its own result. It does not catch what goes wrong in the model or the
 store: the REPL does, for every command and every turn alike, and says what failed
@@ -36,6 +36,7 @@ from nanoclaude.conversation.transcript import (
 )
 from nanoclaude.permissions.policy import PermissionMode
 from nanoclaude.providers.base import ModelError
+from nanoclaude.subagents import SUBAGENTS, subagent_names
 from nanoclaude.tools.base import sanitize
 
 Handler = Callable[[list[str], Session, Console], Awaitable[None]]
@@ -245,6 +246,22 @@ async def _tools(_args: list[str], session: Session, console: Console) -> None:
         console.print(plain(f"{tool.name} (read-only)" if tool.read_only else tool.name))
 
 
+async def _agents(_args: list[str], session: Session, console: Console) -> None:
+    config = session.router.config
+    width = max(len(name) for name in SUBAGENTS)
+    for name in subagent_names():
+        agent = SUBAGENTS[name]
+        # Read when asked and not when built: /model and --role change which model plays a role.
+        model = config.models[config.roles.alias_for(agent.role)].model
+        console.print(
+            Text.assemble(
+                (agent.name.ljust(width), "bold"),
+                "  ",
+                plain(f"{agent.summary}; model: {model} (the {agent.role} role)"),
+            )
+        )
+
+
 async def _resume(_args: list[str], _session: Session, console: Console) -> None:
     show_error(console, "/resume is a startup flag — restart with: ncc --resume <id>")
 
@@ -303,6 +320,7 @@ COMMANDS: dict[str, SlashCommand] = {
             "mode", "show or switch the permission mode: default, plan, accept-edits", _mode
         ),
         SlashCommand("tools", "list the available tools", _tools),
+        SlashCommand("agents", "list the sub-agents the Task tool can start", _agents),
         SlashCommand("resume", "how to resume an earlier session", _resume),
         SlashCommand(
             "export", "write the conversation to a markdown file: /export [file]", _export

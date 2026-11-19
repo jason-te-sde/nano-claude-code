@@ -20,6 +20,7 @@ from nanoclaude.permissions.policy import PermissionRequest, Policy
 from nanoclaude.permissions.redact import Redactor
 from nanoclaude.permissions.sandbox import Sandbox
 from nanoclaude.providers.base import ToolSpec
+from nanoclaude.subagents import Spawner
 from nanoclaude.tools.fs import FileStamp
 
 
@@ -68,6 +69,9 @@ class ToolContext:
     redactor: Redactor
     read_state: Mapping[str, FileStamp]
     root: str
+    #: Runs a sub-agent, for the one tool that starts them. None where there is nothing to
+    #: run it, and in a sub-agent's own session, which is why a sub-agent cannot start one.
+    spawn: Spawner | None = None
 
     # Declared unhashable rather than left to the default: read_state is a
     # mapping, and callers pass a plain dict. frozen=True's generated __hash__

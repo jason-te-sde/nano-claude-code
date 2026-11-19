@@ -7,12 +7,14 @@ into the repository itself.
 import json
 import os
 import sqlite3
+import threading
 from collections.abc import Hashable
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from nanoclaude.conversation import store as store_module
 from nanoclaude.conversation.store import (
     MessageConflictError,
     SessionRow,
@@ -1059,3 +1061,276 @@ def test_the_other_tables_are_not_append_only(tmp_path):
     store.db.execute("UPDATE sessions SET ended_at = 1 WHERE id = 's1'")
     store.db.execute("DELETE FROM messages WHERE session_id = 's1'")
     store.db.commit()
+
+
+# --------------------------------------------------------------------------
+# tool_calls.parent_call_id: the Task call that started the sub-agent which made a call
+# --------------------------------------------------------------------------
+
+#: The audit table and its update trigger as a database made before the column has them.
+_BEFORE_PARENT_CALL_ID = """
+CREATE TABLE tool_calls (
+    session_id TEXT NOT NULL,
+    turn INTEGER NOT NULL,
+    tool_use_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    tool TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    rule TEXT NOT NULL,
+    outcome TEXT,
+    duration_ms INTEGER,
+    bytes_out INTEGER,
+    error TEXT,
+    PRIMARY KEY (session_id, tool_use_id)
+);
+CREATE TRIGGER tool_calls_only_gains_an_outcome
+BEFORE UPDATE ON tool_calls
+WHEN OLD.outcome IS NOT NULL
+    OR NEW.outcome IS NULL
+    OR NEW.session_id IS NOT OLD.session_id
+    OR NEW.turn IS NOT OLD.turn
+    OR NEW.tool_use_id IS NOT OLD.tool_use_id
+    OR NEW.ts IS NOT OLD.ts
+    OR NEW.tool IS NOT OLD.tool
+    OR NEW.args_json IS NOT OLD.args_json
+    OR NEW.decision IS NOT OLD.decision
+    OR NEW.rule IS NOT OLD.rule
+BEGIN
+    SELECT RAISE(ABORT, 'tool_calls is append-only: a row only gains its outcome, once');
+END;
+"""
+
+
+def _columns(store: Store) -> list[str]:
+    return [row["name"] for row in store.db.execute("PRAGMA table_info(tool_calls)")]
+
+
+def _a_database_from_before_the_column(path: Path, *, with_the_column: bool = False) -> None:
+    """A database in the shape an earlier version left, write-ahead log and all.
+
+    ``with_the_column`` is the shape of one whose process stopped after the column was added
+    and before the trigger was replaced, as a migration that made each step on its own could
+    leave it.
+    """
+    earlier = sqlite3.connect(path)
+    earlier.execute("PRAGMA journal_mode=WAL")
+    earlier.executescript(_BEFORE_PARENT_CALL_ID)
+    if with_the_column:
+        earlier.execute("ALTER TABLE tool_calls ADD COLUMN parent_call_id TEXT")
+    earlier.execute(
+        "INSERT INTO tool_calls (session_id, turn, tool_use_id, ts, tool, args_json, decision, "
+        "rule) VALUES ('s1', 0, 'old', 0, 'Read', '{}', 'allow', 'rule.allow')"
+    )
+    earlier.commit()
+    earlier.close()
+
+
+def test_a_new_database_has_the_parent_call_id_column(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    assert _columns(store)[-1] == "parent_call_id"
+
+
+def test_a_database_from_before_the_column_gets_it_when_it_is_opened(tmp_path):
+    path = tmp_path / "s.db"
+    _a_database_from_before_the_column(path)
+
+    store = Store(path)
+    store.open()
+
+    assert _columns(store).count("parent_call_id") == 1
+    old = store.db.execute("SELECT * FROM tool_calls WHERE tool_use_id = 'old'").fetchone()
+    assert old["parent_call_id"] is None, "a row made before the column reads as the person's own"
+    assert old["tool"] == "Read" and old["rule"] == "rule.allow", "what was there is as it was"
+    store.db.execute(
+        "INSERT INTO tool_calls (session_id, turn, tool_use_id, ts, tool, args_json, decision, "
+        "rule, parent_call_id) VALUES ('s1', 0, 'new', 0, 'Grep', '{}', 'allow', 'x', 'task_1')"
+    )
+    assert (
+        store.db.execute(
+            "SELECT parent_call_id FROM tool_calls WHERE tool_use_id = 'new'"
+        ).fetchone()[0]
+        == "task_1"
+    )
+
+
+def test_the_trigger_of_a_database_from_before_the_column_is_replaced_by_one_that_guards_it(
+    tmp_path,
+):
+    path = tmp_path / "s.db"
+    _a_database_from_before_the_column(path)
+    store = Store(path)
+    store.open()
+
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store.db.execute(
+            "UPDATE tool_calls SET outcome = 'ok', parent_call_id = 'forged' "
+            "WHERE tool_use_id = 'old'"
+        )
+    # An outcome is still what a row gains.
+    store.db.execute("UPDATE tool_calls SET outcome = 'ok' WHERE tool_use_id = 'old'")
+    names = [
+        row["name"]
+        for row in store.db.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+    ]
+    assert len(names) == 3, names
+
+
+def test_opening_a_database_that_has_the_column_changes_nothing(tmp_path):
+    path = tmp_path / "s.db"
+    _a_database_from_before_the_column(path)
+    for _ in range(3):
+        store = Store(path)
+        store.open()
+        assert _columns(store).count("parent_call_id") == 1
+        assert store.db.execute("SELECT COUNT(*) FROM tool_calls").fetchone()[0] == 1
+        store.close()
+
+
+def test_the_parent_call_id_of_a_decision_cannot_be_rewritten(tmp_path):
+    store = Store(tmp_path / "s.db")
+    store.open()
+    store.create_session("s1", cwd="/p", roles={})
+    store.db.execute(
+        "INSERT INTO tool_calls (session_id, turn, tool_use_id, ts, tool, args_json, decision, "
+        "rule, parent_call_id) VALUES ('s1', 0, 't1', 0, 'Read', '{}', 'allow', 'x', 'task_1')"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store.db.execute(
+            "UPDATE tool_calls SET outcome = 'ok', parent_call_id = NULL WHERE tool_use_id = 't1'"
+        )
+
+
+def _refuses_a_rewrite_of_the_parent(store: Store) -> bool:
+    try:
+        store.db.execute(
+            "UPDATE tool_calls SET outcome = 'ok', parent_call_id = 'forged' "
+            "WHERE tool_use_id = 'old'"
+        )
+    except sqlite3.IntegrityError as refused:
+        return "append-only" in str(refused)
+    return False
+
+
+def test_a_database_with_the_column_but_the_old_trigger_is_repaired_when_it_is_opened(tmp_path):
+    path = tmp_path / "s.db"
+    _a_database_from_before_the_column(path, with_the_column=True)
+
+    store = Store(path)
+    store.open()
+
+    assert _columns(store).count("parent_call_id") == 1
+    assert _refuses_a_rewrite_of_the_parent(store), "the old trigger was left as it was"
+
+
+def test_a_database_with_the_column_and_no_trigger_at_all_gets_the_one_that_guards_it(tmp_path):
+    path = tmp_path / "s.db"
+    _a_database_from_before_the_column(path, with_the_column=True)
+    earlier = sqlite3.connect(path)
+    earlier.execute("DROP TRIGGER tool_calls_only_gains_an_outcome")
+    earlier.commit()
+    earlier.close()
+
+    store = Store(path)
+    store.open()
+
+    assert _refuses_a_rewrite_of_the_parent(store)
+
+
+def test_a_migration_that_cannot_finish_leaves_the_old_table_with_the_old_trigger(
+    tmp_path, monkeypatch
+):
+    """All or nothing: the column, the dropped trigger and the new one are one transaction, so a
+    process that stops between them does not leave a table that a rewrite is not refused on."""
+    path = tmp_path / "s.db"
+    _a_database_from_before_the_column(path)
+    monkeypatch.setattr(store_module, "_ONLY_GAINS_AN_OUTCOME", "CREATE TRIGGER broken ON")
+
+    store = Store(path)
+    with pytest.raises(sqlite3.OperationalError):
+        store.open()
+    store.close()  # a store whose open failed is closed by whoever opened it, as ncc does
+
+    left = sqlite3.connect(path)
+    try:
+        columns = [row[1] for row in left.execute("PRAGMA table_info(tool_calls)")]
+        assert "parent_call_id" not in columns, "the column outlived a migration that failed"
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            left.execute(
+                "UPDATE tool_calls SET outcome = 'ok', decision = 'deny' WHERE tool_use_id = 'old'"
+            )
+    finally:
+        left.close()
+
+
+def test_a_process_that_finds_another_has_migrated_while_it_waited_for_the_lock_goes_on(
+    tmp_path, monkeypatch
+):
+    """The check is made again once the write lock is held. Here the other process finishes
+    between the first check and the lock, which is the interleaving that adding the column a
+    second time would fail on."""
+    path = tmp_path / "s.db"
+    _a_database_from_before_the_column(path)
+    real = Store._tool_calls_is_current
+    checks: list[bool] = []
+
+    def another_process_gets_in_first(self: Store) -> bool:
+        current = real(self)
+        checks.append(current)
+        if len(checks) == 1:
+            other = Store(path)
+            other.open()
+            other.close()
+        return current
+
+    monkeypatch.setattr(Store, "_tool_calls_is_current", another_process_gets_in_first)
+    store = Store(path)
+    store.open()
+
+    assert checks[0] is False, "the database was not an old one when the first check ran"
+    assert checks[-1] is True, "the check was not made again once the other had migrated"
+    assert _columns(store).count("parent_call_id") == 1
+    assert _refuses_a_rewrite_of_the_parent(store)
+
+
+def _open_at_once(path: Path) -> tuple[list[BaseException], list[bool]]:
+    """Open ``path`` from two threads released together; what failed, and whether each store
+    that started refuses a rewrite of ``parent_call_id``."""
+    barrier = threading.Barrier(2)
+    failures: list[BaseException] = []
+    refusals: list[bool] = []
+
+    def start() -> None:
+        store = Store(path)
+        try:
+            barrier.wait(timeout=10)
+            store.open()
+            refusals.append(_refuses_a_rewrite_of_the_parent(store))
+        except BaseException as failure:
+            failures.append(failure)
+        finally:
+            store.close()
+
+    threads = [threading.Thread(target=start) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    return failures, refusals
+
+
+def test_two_processes_opening_one_old_database_at_once_both_start(tmp_path):
+    # Threads, each with a connection of its own, which is what two processes are to SQLite.
+    # Several databases, since whether the two overlap is a matter of timing.
+    for number in range(8):
+        path = tmp_path / f"s{number}.db"
+        _a_database_from_before_the_column(path)
+        failures, refusals = _open_at_once(path)
+
+        assert failures == [], f"database {number}: {failures}"
+        assert refusals == [True, True]
+        again = Store(path)
+        again.open()
+        assert _columns(again).count("parent_call_id") == 1
+        again.close()

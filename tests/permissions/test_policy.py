@@ -1076,3 +1076,23 @@ def test_the_protected_path_row_sits_after_the_credentials_row():
 def test_the_protected_path_row_sits_after_a_deny_rule():
     p = policy(rules=RuleSet.build(deny=["Write(**/.env)"]))
     assert evaluate(write_req("Write", "/p/.git/.env"), p, Grants()).rule == "rule.deny"
+
+
+def test_the_reason_a_task_call_asks_says_what_it_does_and_not_that_it_changes_state():
+    result = evaluate(req(tool="Task", subject="explore", paths=()), policy(), Grants())
+    assert (result.decision, result.rule) == (Decision.ASK, "default.ask")
+    assert (
+        result.reason
+        == "Task starts a sub-agent that spends model requests and has no matching rule"
+    )
+    assert "changes state" not in result.reason
+
+
+def test_the_reason_a_write_asks_is_still_that_it_changes_state():
+    result = evaluate(
+        req(tool="Write", subject="/p/new.txt", paths=("/p/new.txt",), is_write=True),
+        policy(rules=RuleSet.build()),
+        Grants(),
+    )
+    assert (result.decision, result.rule) == (Decision.ASK, "default.ask")
+    assert result.reason == "Write changes state and has no matching rule"

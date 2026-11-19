@@ -68,6 +68,7 @@ from nanoclaude.permissions.policy import (
     evaluate,
 )
 from nanoclaude.permissions.redact import Redactor
+from nanoclaude.subagents import Spawner
 from nanoclaude.tools.base import (
     Tool,
     ToolArgumentError,
@@ -152,6 +153,16 @@ class Executor:
     session_id: str = "session"
     grants: Grants = field(default_factory=Grants)
     redactor: Redactor = field(default_factory=Redactor)
+    #: What runs the sub-agent that a ``Task`` call asks for. None for an executor that has no
+    #: sub-agents to run: a sub-agent's own, which is why it cannot start another.
+    spawn: Spawner | None = None
+    #: The ``Task`` call that these calls are a sub-agent's, when they are: the audit marks each
+    #: row with it.
+    parent_call_id: str | None = None
+    #: False where a question put to the front end is not a question to a person, as inside a
+    #: sub-agent: a call that needed an answer is refused, and the model is told that it may not
+    #: ask, which is the truth, and not that somebody said no.
+    may_ask: bool = True
 
     def context(self, state: LoopState) -> ToolContext:
         return ToolContext(
@@ -160,6 +171,7 @@ class Executor:
             redactor=self.redactor,
             read_state=state.read_state,
             root=self.policy.sandbox.roots[0],
+            spawn=self.spawn,
         )
 
     async def run_batch(
@@ -276,10 +288,17 @@ class Executor:
                 continue
             approval = await self.ui.confirm(plan.call, plan.request, plan.result)
             if approval is Approval.NO:
+                if self.may_ask:
+                    why = f"The user declined to run {plan.call.name}."
+                else:
+                    why = (
+                        f"{plan.call.name} needs the person's confirmation, and a sub-agent "
+                        "may not ask for it."
+                    )
                 declined = ToolOutcome(
                     plan.call.id,
-                    f"The user declined to run {plan.call.name}. Do not try to achieve "
-                    "the same thing another way; say what you were attempting and stop.",
+                    f"{why} Do not try to achieve the same thing another way; say what you "
+                    "were attempting and stop.",
                     is_error=True,
                 )
                 results[plan.call.id] = declined
@@ -460,6 +479,7 @@ class Executor:
             arguments=call.arguments,
             decision=result.decision,
             rule=result.rule,
+            parent_call_id=self.parent_call_id,
         )
         # After the insert, so that a call whose decision was not stored is not owed an
         # outcome for a row that is not there.

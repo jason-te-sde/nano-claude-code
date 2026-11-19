@@ -1,9 +1,9 @@
 """Tests for nanoclaude.cli.commands: the slash commands.
 
-Spec 17.7 lists sixteen. Three describe subsystems that do not exist yet (``/agents``,
-``/mcp``) or arrive in v0.2 (``/rewind``, ``/diff``, ``/checkpoints``), so they are absent
-and not stubbed, and the first test asserts the v0.1 set is a subset of ``COMMANDS``: adding
-the others later does not break it.
+Spec 17.7 lists sixteen. Four describe subsystems that do not exist yet (``/mcp``) or
+arrive in v0.2 (``/rewind``, ``/diff``, ``/checkpoints``), so they are absent and not
+stubbed, and the first test asserts the set there is a subset of ``COMMANDS``: adding the
+others later does not break it.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from nanoclaude.conversation.transcript import (
 )
 from nanoclaude.permissions.policy import PermissionMode, PermissionRequest, PermissionResult
 from nanoclaude.providers.base import ModelError, ModelReply, Usage
+from nanoclaude.subagents import subagent_names
 from nanoclaude.testing.scripted import calls, says
 from nanoclaude.testing.session import ScriptedSession, build_session
 from tests.cli.helpers import plain_console
@@ -65,11 +66,13 @@ def test_every_documented_command_exists():
         "model",
         "mode",
         "tools",
+        "agents",
         "resume",
         "export",
         "init",
     }
     assert expected <= set(COMMANDS)
+    assert "mcp" not in COMMANDS, "/mcp describes a subsystem that is not built"
 
 
 def test_a_command_is_filed_under_its_own_name_and_says_what_it_does():
@@ -405,6 +408,29 @@ async def test_tools_lists_every_tool_and_marks_the_ones_that_cannot_change_anyt
     assert [line.split()[0] for line in lines] == sorted(tool.name for tool in session.registry)
     assert next(line for line in lines if line.startswith("Read")).endswith("(read-only)")
     assert not next(line for line in lines if line.startswith("Edit")).endswith("(read-only)")
+
+
+async def test_agents_lists_each_sub_agent_with_what_it_does_and_the_model_it_runs_on(tmp_repo):
+    session = build_session(tmp_repo, [], explore_script=[], explore_model="claude-haiku-4-5")
+    carry_on, text = await run_command(session, "agents", width=200)
+    assert carry_on
+    assert text == (
+        "explore  searches and reads the project, read-only, and reports what it found; "
+        "model: claude-haiku-4-5 (the explore role)\n"
+    )
+
+
+async def test_agents_names_the_model_the_explore_role_is_routed_to_now(tmp_repo):
+    session = build_session(tmp_repo, [], explore_script=[], explore_model="claude-haiku-4-5")
+    await session.router.route("explore", "m")
+    _, text = await run_command(session, "agents", width=200)
+    assert "model: claude-sonnet-5 (the explore role)" in text
+
+
+async def test_agents_lists_exactly_the_sub_agents_the_task_tool_accepts(tmp_repo):
+    session = build_session(tmp_repo, [])
+    _, text = await run_command(session, "agents", width=200)
+    assert [line.split()[0] for line in text.splitlines()] == list(subagent_names())
 
 
 async def test_resume_and_init_say_where_they_live_instead_of_pretending(tmp_repo):

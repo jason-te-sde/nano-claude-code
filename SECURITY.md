@@ -89,7 +89,12 @@ a tool call to run something no confirmation described. What a tool returns is s
 terminal control sequences before it is shown or stored. What is not defended: a model that
 has been persuaded to make a call the policy would allow. In `default` mode that call asks you,
 and in `accept-edits` and `bypass` mode it does not. No test puts an injection in front of a
-real model, and how well a given model resists one is not known.
+real model, and how well a given model resists one is not known. A sub-agent, which the `Task`
+tool starts, reads files and so reads what a hostile repository wrote. It is held to the same
+structure: it has `Read`, `Glob` and `Grep` and nothing else, works in the sandbox and under the
+rules of the session that started it, and cannot ask you anything, so what it can be persuaded to
+do is to read. What it sends back is a model's account of those files and enters the
+conversation as a tool result, as untrusted as they are.
 
 **5. Secret exfiltration.** The agent reads a `.env` file or a private key, and the contents
 reach a model API. Defended in two layers.

@@ -45,6 +45,10 @@ ALLOWED_WITHOUT_ASKING = READ_ONLY_TOOLS | {"TodoWrite"}
 #: Tools ACCEPT_EDITS mode auto-approves.
 EDIT_TOOLS = frozenset({"Edit", "Write"})
 
+#: What a tool that asks does that makes it ask, for the reason ``default.ask`` gives. Most
+#: change something; ``Task`` changes nothing and starts model requests, which cost money.
+_WHY_IT_ASKS = {"Task": "starts a sub-agent that spends model requests"}
+
 #: Directories whose files make git or ncc run something, or change how they behave: git
 #: runs what ``.git/config`` and ``.git/hooks`` name (a hook at the next commit the person
 #: makes, ``core.fsmonitor`` at the next ``git status`` they run), and ncc reads its own
@@ -416,6 +420,7 @@ def evaluate(
         return PermissionResult(Decision.ASK, "rule.ask", f"{asked.source} requires confirmation")
 
     # 12. default.ask
+    does = _WHY_IT_ASKS.get(request.tool, "changes state")
     return PermissionResult(
-        Decision.ASK, "default.ask", f"{request.tool} changes state and has no matching rule"
+        Decision.ASK, "default.ask", f"{request.tool} {does} and has no matching rule"
     )

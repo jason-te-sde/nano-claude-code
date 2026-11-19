@@ -46,12 +46,12 @@ RuleKind = Literal["allow", "ask", "deny"]
 GLOB_PATTERN_FACTORY = "gitwildmatch"
 
 
-#: Every tool name a rule may name: the six registered tools and two that are being built.
+#: Every tool name a rule may name: the seven registered tools and two that are being built.
 #: ``Bash`` and ``Git`` are reserved, so that a rule written for them today does not have to
 #: be rewritten the day they arrive. Names are case-sensitive, as the registry's are: a rule
 #: that names ``read`` matches no call to ``Read``, and for a deny rule that is a refusal
 #: the person believes is in force and is not. A test pins this list to the registry.
-KNOWN_TOOLS = ("Bash", "Edit", "Git", "Glob", "Grep", "Read", "TodoWrite", "Write")
+KNOWN_TOOLS = ("Bash", "Edit", "Git", "Glob", "Grep", "Read", "Task", "TodoWrite", "Write")
 
 
 def fold_spelling(text: str) -> str:

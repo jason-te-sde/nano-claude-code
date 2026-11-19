@@ -3,10 +3,11 @@
 The reason this exists: exploring a codebase is most of the tokens in a coding
 session and almost none of the difficulty, so it can be sent to a cheap or local
 model while the main conversation stays on an expensive one. That is only
-possible because the provider boundary is neutral. It is not yet a saving anyone
-can have: in v0.1 only the ``main`` and ``compact`` roles are routed, and
-``explore``, ``plan``, ``verify`` and ``title`` are accepted and checked but
-asked for by nothing until sub-agents arrive in v0.3 (spec 13).
+possible because the provider boundary is neutral. It is a saving only as far as the
+main model hands the work on: the ``main``, ``explore`` and ``compact`` roles are
+routed, ``explore`` being the model of the sub-agent that a ``Task`` call starts, and
+``plan``, ``verify`` and ``title`` are accepted and checked but asked for by nothing
+until the sub-agents and commands that need them arrive in v0.3 (spec 13).
 
 Cost is reported per role, and the total is ``None`` if any model in the
 session has no price. A partial total presented as a total is worse than no

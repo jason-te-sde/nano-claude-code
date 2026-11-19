@@ -2,9 +2,13 @@
 
 The schema is spec 17.8 verbatim and the column names are a contract: the audit
 CLI reads them, and a database written by one version is opened by the next.
-Migrations are additive only.
+Migrations are additive only. A table or a trigger that is not there is made when the
+database is opened, and so is a nullable column that a table an earlier version made lacks
+(``parent_call_id``, below): ``Store._migrate_tool_calls`` is the one place that does it.
 
-One table is added to it: ``messages_archive``. ``messages`` is the transcript the
+One table and one column are added to it. The column is ``tool_calls.parent_call_id``: the
+``Task`` call that started the sub-agent which made a call, NULL for a call the conversation
+itself made. The table is ``messages_archive``. ``messages`` is the transcript the
 model is shown, which is what a resumed session reloads, so compaction and
 ``/clear`` have to replace its rows. The audit trail is append-only, so a row a
 replacement removes or changes is moved to the archive, with the time it was
@@ -55,6 +59,28 @@ from nanoclaude.private import (
 )
 from nanoclaude.providers.base import Usage
 
+#: The trigger that keeps a decision from being rewritten: a row only gains its outcome, once.
+#: A constant of its own because opening a database that an earlier version made replaces it,
+#: inside the one transaction that adds the column it must name (``Store._migrate_tool_calls``).
+_ONLY_GAINS_AN_OUTCOME = """
+CREATE TRIGGER IF NOT EXISTS tool_calls_only_gains_an_outcome
+BEFORE UPDATE ON tool_calls
+WHEN OLD.outcome IS NOT NULL
+    OR NEW.outcome IS NULL
+    OR NEW.session_id IS NOT OLD.session_id
+    OR NEW.turn IS NOT OLD.turn
+    OR NEW.tool_use_id IS NOT OLD.tool_use_id
+    OR NEW.ts IS NOT OLD.ts
+    OR NEW.tool IS NOT OLD.tool
+    OR NEW.args_json IS NOT OLD.args_json
+    OR NEW.decision IS NOT OLD.decision
+    OR NEW.rule IS NOT OLD.rule
+    OR NEW.parent_call_id IS NOT OLD.parent_call_id
+BEGIN
+    SELECT RAISE(ABORT, 'tool_calls is append-only: a row only gains its outcome, once');
+END;
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -97,6 +123,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     duration_ms INTEGER,
     bytes_out INTEGER,
     error TEXT,
+    parent_call_id TEXT,
     PRIMARY KEY (session_id, tool_use_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
@@ -107,6 +134,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 -- the only update is an outcome, once, onto a row that has none, which may bring its
 -- duration, size and error with it. What was decided (every other column) is never rewritten.
 -- IF NOT EXISTS, and run on every open: a database an earlier version made gets them too.
+-- The trigger for the last of these, the update, is _ONLY_GAINS_AN_OUTCOME, run just after.
 CREATE TRIGGER IF NOT EXISTS tool_calls_never_deleted
 BEFORE DELETE ON tool_calls
 BEGIN
@@ -120,21 +148,6 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'tool_calls is append-only: a row is never replaced');
-END;
-CREATE TRIGGER IF NOT EXISTS tool_calls_only_gains_an_outcome
-BEFORE UPDATE ON tool_calls
-WHEN OLD.outcome IS NOT NULL
-    OR NEW.outcome IS NULL
-    OR NEW.session_id IS NOT OLD.session_id
-    OR NEW.turn IS NOT OLD.turn
-    OR NEW.tool_use_id IS NOT OLD.tool_use_id
-    OR NEW.ts IS NOT OLD.ts
-    OR NEW.tool IS NOT OLD.tool
-    OR NEW.args_json IS NOT OLD.args_json
-    OR NEW.decision IS NOT OLD.decision
-    OR NEW.rule IS NOT OLD.rule
-BEGIN
-    SELECT RAISE(ABORT, 'tool_calls is append-only: a row only gains its outcome, once');
 END;
 """
 
@@ -280,10 +293,63 @@ class Store:
         self._db = sqlite3.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._migrate_tool_calls()
         self._db.executescript(SCHEMA)
+        self._db.executescript(_ONLY_GAINS_AN_OUTCOME)
         self._db.commit()
         for sidecar in ("-wal", "-shm"):
             narrow_file(self.path.with_name(self.path.name + sidecar))
+
+    def _tool_calls_state(self) -> tuple[set[str], str | None]:
+        """The columns of ``tool_calls`` (none when the table is not there) and the SQL of the
+        trigger that keeps a decision from being rewritten (None when it is not there)."""
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(tool_calls)")}
+        trigger = self.db.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND name = 'tool_calls_only_gains_an_outcome'"
+        ).fetchone()
+        return columns, None if trigger is None else str(trigger["sql"])
+
+    def _tool_calls_is_current(self) -> bool:
+        """Whether ``tool_calls`` has ``parent_call_id`` and a trigger that guards it.
+
+        The trigger is looked at and not only the column: a database that got the column and
+        lost the process before it got the trigger has a table that a rewrite of the new
+        column is not refused on. A table that is not there is current, since the schema
+        script makes it whole.
+        """
+        columns, trigger = self._tool_calls_state()
+        if not columns:
+            return True
+        return "parent_call_id" in columns and trigger is not None and "parent_call_id" in trigger
+
+    def _migrate_tool_calls(self) -> None:
+        """Bring ``tool_calls`` of a database an earlier version made up to date, atomically.
+
+        Before the schema script runs, which makes what is absent and leaves what is there as
+        it is. The column is added, nullable, so that every row already in the table reads as
+        a call the conversation made, and the trigger that keeps a decision from being
+        rewritten is replaced by one that names it. All of it is one transaction that takes
+        the write lock first (``BEGIN IMMEDIATE``): a process that stops half way leaves the
+        old table with the old trigger and nothing in between, so the table is append-only
+        throughout, and two processes that open one old database at once take turns, the
+        second finding on getting the lock that the first has done it. The check is made again
+        under the lock for that reason.
+        """
+        if self._tool_calls_is_current():
+            return
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if not self._tool_calls_is_current():
+                columns, _ = self._tool_calls_state()
+                if "parent_call_id" not in columns:
+                    self.db.execute("ALTER TABLE tool_calls ADD COLUMN parent_call_id TEXT")
+                self.db.execute("DROP TRIGGER IF EXISTS tool_calls_only_gains_an_outcome")
+                self.db.execute(_ONLY_GAINS_AN_OUTCOME)
+        except BaseException:
+            self.db.rollback()
+            raise
+        self.db.commit()
 
     def close(self) -> None:
         if self._db is not None:

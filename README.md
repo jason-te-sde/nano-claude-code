@@ -14,7 +14,7 @@
 
 ---
 
-> **Status: version `0.1.0.dev0`, not released.** This describes `main` as it is. Built: the agent loop, the tools `Read`, `Edit`, `Write`, `Glob`, `Grep` and `TodoWrite`, four permission modes with a sandbox, the provider adapters, compaction, stored sessions, cost accounting and the REPL. **Not built yet: `Bash` and `Git`.** Until they are, the agent can read and change files in a project and cannot run a command or a test, and v0.1 will not be tagged before they land.
+> **Status: version `0.1.0.dev0`, not released.** This describes `main` as it is. Built: the agent loop, the tools `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TodoWrite` and `Task`, four permission modes with a sandbox, the provider adapters, compaction, stored sessions, cost accounting and the REPL. **Not built yet: `Bash` and `Git`.** Until they are, the agent can read and change files in a project and cannot run a command or a test, and v0.1 will not be tagged before they land.
 
 ## Install
 
@@ -65,7 +65,7 @@ compact = "cheap"
 
 The idea is that reading a codebase to work out what to change is much of the tokens in a session and little of its difficulty, so `explore` is the role meant for a cheap or a local model while `main`, which writes the change, stays strong. A role you leave out follows `main`. `--model <alias>` replaces `main` for one run, and `--role <role>=<alias>` replaces one role.
 
-**Today two roles are used.** `main` answers the conversation, and `compact` writes the summary when a long conversation is compacted; that request carries the whole older history, so a cheap model there already saves money. `explore`, `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request yet: routing them is v0.3 scope, with sub-agents. Neither that premise nor what routing exploration to a cheap model would save, or cost in the quality of what comes back, has been measured. `/cost` shows what each role spent. A session does check, when it starts, that the key of every role's model is set, those four included, and names the first role whose key is not.
+**Today three roles are used.** `main` answers the conversation. `explore` answers the `explore` sub-agent, which the `Task` tool starts: it searches and reads the project with `Read`, `Glob` and `Grep` and hands back a written answer, which is the work a cheap or a local model is meant for. `compact` writes the summary when a long conversation is compacted; that request carries the whole older history, so a cheap model there already saves money. `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request yet. Neither that premise nor what routing exploration to a cheap model would save, or cost in the quality of what comes back, has been measured. `/cost` shows what each role spent. A session does check, when it starts, that the key of every role's model is set, those three included, and names the first role whose key is not.
 
 ## Safety
 
@@ -86,8 +86,11 @@ With `-p` nothing can answer a question, so every call that would have asked is 
 | `Glob` | yes |
 | `Grep` | yes |
 | `TodoWrite` | yes (it changes only the session's own task list) |
+| `Task` | no, it asks first; the sub-agent it starts can only read |
 | `Edit` | no, it shows a diff first |
 | `Write` | no |
+
+A `Task` call starts a sub-agent in a session of its own, and the question you are asked is whether to spend the requests. The sub-agent has `Read`, `Glob` and `Grep` and no other tool, works in your sandbox and your permission mode with every `deny` rule of yours in force, holds the grants you have already given and cannot add one, and cannot ask you anything: a call that would have asked is declined. It is stopped after 30 model calls, an estimated 200,000 input tokens or ten minutes, whichever comes first, and what it returns is one message, cut to `output_cap_bytes`: a model's account of files, as untrusted as the files are. `allow = ["Task"]` in your own file lets it run without asking.
 
 `Bash` and `Git` are not built yet. They are planned to work like this: `Bash` asks first, `Git` reads without asking and asks before it changes anything, and a shell command is classified before it can run.
 
@@ -116,7 +119,7 @@ The reference is [`docs/configuration.md`](docs/configuration.md): every key and
 - **Hooks (v0.2).** A hook runs the person's command around a tool call. A feature that runs commands needs its trust rules designed with it, so a `hooks` section in a configuration file is refused rather than ignored.
 - **Post-edit verification (v0.2).** Running the project's own checker after an edit, and returning its diagnostics to the model, reuses the command-running machinery that hooks need. A `verify` section is refused for the same reason.
 - **Background commands and BashOutput (v0.2).** A command that outlives its call needs the shell tool to exist first, and a way to read what it printed since.
-- **Sub-agents and the Task tool (v0.3).** A sub-agent is a nested session with a narrower sandbox. Roles already let a session use several models; the nesting waits until a single session is solid.
+- **More sub-agents, and nesting (v0.3).** The `Task` tool starts one built-in sub-agent, `explore`, which can only read and cannot start another. Custom sub-agents from `~/.nanoclaude/agents/`, the `plan` and `general` sub-agents, and a sub-agent that starts one of its own are not built: each gives a delegate more reach than `explore` has, and that is settled one sub-agent at a time.
 - **MCP client (v0.3).** The description a server gives a tool is read by the model, so it is an injection surface. That boundary (namespaced names, truncated descriptions, confirmation by default) has to be built and tested as a whole, not added to a first release.
 - **Tool plugins (v0.3).** A plugin is arbitrary Python, and waits with the MCP trust work for the same reason.
 - **WebFetch and AskUser (v0.3).** WebFetch needs protection against requests to private addresses before it is safe to offer, and AskUser needs a new method on the UI protocol.
@@ -142,11 +145,11 @@ Each figure is produced by `python scripts/measure.py`, which also writes `metri
 
 | Figure | Key | Value | Produced by |
 | --- | --- | --- | --- |
-| Tests collected by pytest | `tests` | 4,133 | `python scripts/measure.py` |
+| Tests collected by pytest | `tests` | 4,240 | `python scripts/measure.py` |
 | Share of `nanoclaude` the tests run | `coverage_percent` | 99.9% | `python scripts/measure.py` |
-| Lines of Python in `src/` | `lines.src` | 13,365 | `python scripts/measure.py` |
-| Lines of Python in `tests/` | `lines.tests` | 39,099 | `python scripts/measure.py` |
-| Tools in the default registry | `tools` | 6 | `python scripts/measure.py` |
+| Lines of Python in `src/` | `lines.src` | 14,075 | `python scripts/measure.py` |
+| Lines of Python in `tests/` | `lines.tests` | 40,861 | `python scripts/measure.py` |
+| Tools in the default registry | `tools` | 7 | `python scripts/measure.py` |
 | Adapters the configuration accepts | `adapters` | 3 | `python scripts/measure.py` |
 | Dangerous commands the regex classifier misses | `danger_corpus` | not measured yet | `python scripts/measure.py` |
 

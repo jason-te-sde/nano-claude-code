@@ -1,6 +1,6 @@
 # Architecture
 
-This describes `main` as it is built: six tools (Read, Edit, Write, Glob, Grep, TodoWrite), three provider adapters, a permission engine with a sandbox, and a REPL and a headless mode over one session. Bash and Git are not built yet. Where the code and an earlier plan disagree, this document follows the code, and the last section lists the differences.
+This describes `main` as it is built: seven tools (Read, Edit, Write, Glob, Grep, TodoWrite, Task), three provider adapters, a permission engine with a sandbox, and a REPL and a headless mode over one session. Bash and Git are not built yet. Where the code and an earlier plan disagree, this document follows the code, and the last section lists the differences.
 
 Comments in the code cite sections of a design document ("spec 6.2"). That document is not in the repository. What matters from it is restated here, and the reasons behind the choices are in [the design notes](design/0001-scope.md).
 
@@ -15,6 +15,7 @@ Comments in the code cite sections of a design document ("spec 6.2"). That docum
             loop      the turn as a pure state machine (no I/O)
             Router    role -> model client, and the ledger of what each role spent
             Executor  decide every call, then run them
+            subagent  the session a Task call starts, held to its limits
               |
    +----------+-----------+--------------+------------+--------------+
    |          |           |              |            |              |
@@ -26,7 +27,8 @@ Comments in the code cite sections of a design document ("spec 6.2"). That docum
  (SQLite)     glob     audit           git          pricing
               grep     danger/regex                 anthropic
               todo                                  openai_compat
-              keyblocks                             ollama
+              task                                  ollama
+              keyblocks
 ```
 
 `nanoclaude.testing` is also shipped: `ScriptedModel` plays back what it is told to say and `build_session` wires a real session around it. They are in the package and not in `tests/` so that anyone writing a tool can test it inside a real session.
@@ -60,8 +62,17 @@ A tool has a name, a `read_only` flag, a `spec()` (what the model is told) and t
 | `Glob` | yes | Most recently modified first, at most 200, skips what `.gitignore` skips. Does not list a symlink that leads out of the sandbox, and asks the policy nothing about a name it does list. |
 | `Grep` | yes | ripgrep when it is on `PATH`, otherwise a slower search written in Python that answers the same; neither follows a symlink. Three output modes. A file the policy would refuse a `Read` of (a credentials file, one a `Read` `deny` rule covers) is dropped before the limit is applied, and a line inside a private-key block is shown as a marker. Line numbers are the backend's: ripgrep counts newlines only, and the Python search counts as `Read` does. |
 | `TodoWrite` | no | The session's own task list, at most one task in progress. It changes nothing outside the session, and is allowed without asking. |
+| `Task` | no | Starts a sub-agent and returns its final text as one result ([0017](design/0017-sub-agents.md)). It asks by default, a rule can allow it, and a name that is not a sub-agent is refused before anyone is asked. |
 
 What a tool returns is stripped of terminal control sequences before it goes anywhere, so that a file cannot move the cursor or retitle the window of whoever reads the screen, and scrubbed of credentials before it becomes part of the transcript ([0012](design/0012-redaction-before-transcript.md)).
+
+## Sub-agents
+
+A sub-agent is a `Session`, nested. `Task` does nothing itself: it checks that the sub-agent exists and hands the call to `ToolContext.spawn`, which the session fills in and the executor passes down, and `agent/subagent.py` builds the nested session. Where it differs from the one a person talks to is a handful of plain fields of `Session` and nothing in the loop: the `role` whose model answers it, a `system_prompt` of its own, no `@` mentions, a `gate` that is called with the estimated input tokens before each request, and the `parent_call_id` and `audit_turn` that mark its calls in the audit. A persona (`subagents.py`) is data: a name, a one-line summary, a role, the tools it is given by name and a prompt.
+
+What it is built from is the parent's, and narrower. The registry is made from the persona's tool names, so it holds `Read`, `Glob` and `Grep` for `explore` and no `Task`, no write tool and no MCP tool. The sandbox is the parent's, through `Sandbox.narrowed_to`, which refuses a root that the parent's does not contain. The policy is the parent's, so its mode and rules hold, and the executor starts with the parent's grants. The front end passes the person only that a request is under way, and answers every question with no, so nothing inside it can ask and nothing can be granted. The router is the parent's, which is why the cost is in the parent's ledger under the `explore` role as it is spent.
+
+The three limits are enforced in two places. The gate counts requests and estimated input tokens and refuses the one that would go past a limit, by raising an exception that the runner catches; it is called from the session's one place that sends a request to the conversation's model, so a retry after an overflow and a text-protocol reply asked for again count as requests. A timeout around the whole run is the clock, so that a model that never answers is stopped too. The result is the final text, or the last text there was with a line naming the limit, cut to `output_cap_bytes`; an error from the model is a tool error that carries what the sub-agent had written. Why each of these is as it is, and what was left out, is in [0017](design/0017-sub-agents.md).
 
 ## Permissions
 
@@ -102,7 +113,7 @@ A rule id that the original plan reserved, `hook.blocked`, is not in the table: 
 
 **Redaction** is in [0012](design/0012-redaction-before-transcript.md). One part of it is a matter of structure. A private-key block is recognised as a block, from its `BEGIN` line to its `END` line, and its body means nothing to anything that looks at one line of it, so a window of a file that begins or ends inside one would show the key. `tools/keyblocks.py` therefore works out the extent of a block on the whole file, with the one recogniser the scrubber uses, and the window is cut afterwards. `Read` has the text and masks the window; `Grep` has only the numbers of the lines it will show, so it streams each file that has one, as far as the last of them and no further unless a block is open, and holds one block at a time; `Edit` masks every block in the old text and in the new before it compares them, so the lines of a block are never context. A block is replaced by `[redacted:private-key]`, and text on the `BEGIN` or `END` line outside the block stays.
 
-**The audit record** is the `tool_calls` table. The decision is written before the call runs and the outcome (`ok`, `error`, `refused`, `declined` or `cancelled`, a duration, the bytes returned) is filled in afterwards. Whatever stops a call records its own outcome (a call cancelled at its confirmation, or while it ran, is recorded as `cancelled`), so a row without an outcome means the process ended between the two. The table only grows, and the database says so: three triggers refuse a delete, a second row under one key (an `INSERT OR REPLACE` included), and any update but an outcome set once on a row that has none. Arguments are scrubbed before they are stored. Nothing reads the table back in this version.
+**The audit record** is the `tool_calls` table. The decision is written before the call runs and the outcome (`ok`, `error`, `refused`, `declined` or `cancelled`, a duration, the bytes returned) is filled in afterwards. Whatever stops a call records its own outcome (a call cancelled at its confirmation, or while it ran, is recorded as `cancelled`), so a row without an outcome means the process ended between the two. The table only grows, and the database says so: three triggers refuse a delete, a second row under one key (an `INSERT OR REPLACE` included), and any update but an outcome set once on a row that has none. Arguments are scrubbed before they are stored. A call that a sub-agent made is in the same table, under the turn of the `Task` call that started it and with that call's id in the nullable column `parent_call_id`, which a database from before the column gets, empty, when it is opened. Nothing reads the table back in this version.
 
 ## Conversation, compaction and the store
 
@@ -154,7 +165,7 @@ Two files, merged key by key, validated on load, with the trust rules of [config
 These are differences between the original design and what is built. The code is right.
 
 - Redaction and the `--output-format json` mode are here and were scheduled for later versions.
-- No `ncc audit`, `ncc gc`, `ncc bench` or checkpoints table. Only the `main` and `compact` roles are sent requests; routing the others is v0.3 scope, with sub-agents.
+- No `ncc audit`, `ncc gc`, `ncc bench` or checkpoints table. Only the `main`, `explore` and `compact` roles are sent requests; `plan`, `verify` and `title` wait for the sub-agents and commands that would use them.
 - Search uses ripgrep from `PATH` or a pure Python fallback. No ripgrep is bundled.
 - Only Ollama is probed; an OpenAI-compatible model the table does not list gets the conservative default.
 - Four of the seven capability fields are not acted on ([0003](design/0003-capability-negotiation.md)).
@@ -162,5 +173,6 @@ These are differences between the original design and what is built. The code is
 - An `allow` rule for one path cannot open a credentials file; only `--allow-secrets` can. The entropy floor of the generic secret rule is 3.5 bits per character.
 - "Always" grants a tool, not a command prefix.
 - A flag `--root` exists for the project directory.
-- A slash command `/exit` exists. The commands for agents, MCP servers, rewinding, diffs and checkpoints do not.
+- A slash command `/exit` exists. The commands for MCP servers, rewinding, diffs and checkpoints do not.
+- Sub-agents: one, `explore`, one level deep. The plan also has `plan` and `general`, definitions in `~/.nanoclaude/agents/`, and a depth of two.
 - `TodoWrite` is in the default `ask` list of the configuration and is allowed all the same, because `tool.read-only` is checked before `rule.ask`.

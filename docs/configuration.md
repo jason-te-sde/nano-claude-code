@@ -116,9 +116,32 @@ title   = "local"
 
 There are six roles: `main`, `explore`, `plan`, `verify`, `compact` and `title`. Each names a model alias. A role that is not set follows `main`, and `main`, if not set, is the first model defined. A role that names a model nobody defined is refused when the file is loaded. When a session starts, `ncc` checks that the key of every role's model is set, the roles that nothing is sent to yet included. If one is not, it stops before any request, with exit code 3, and names the first such role in the order above, its model and the variable that is empty.
 
-In this version two roles are sent requests. `main` answers the conversation, and `compact` writes the summary when a conversation is compacted, so that `compact` is where a cheaper model already saves money. `explore`, `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request; routing them is v0.3 scope, with sub-agents. `--model <alias>` replaces `main` for one run, `--role <role>=<alias>` replaces one role and may be given more than once, and `/model <alias>` replaces `main` in a session.
+In this version three roles are sent requests. `main` answers the conversation. `explore` answers the `explore` sub-agent that the `Task` tool starts (see [Sub-agents](#sub-agents)): the work of searching and reading the project is what a cheaper or a local model is meant for there. `compact` writes the summary when a conversation is compacted, so that a cheaper model there already saves money. `plan`, `verify` and `title` are accepted and checked, and nothing sends them a request. `--model <alias>` replaces `main` for one run, `--role <role>=<alias>` replaces one role and may be given more than once, and `/model <alias>` replaces `main` in a session.
 
 The summary request carries the whole older history to the `compact` model, so a model with a small window can fail to write it. The conversation is then left as it was, and the error names the compact role and says how to route it elsewhere.
+
+## Sub-agents
+
+The `Task` tool starts a sub-agent: a session nested in yours, with a conversation of its own, that sends back one answer. `/agents` lists them. This version has one.
+
+| Sub-agent | Answered by | Tools | What it does |
+| --- | --- | --- | --- |
+| `explore` | the model of the `explore` role | `Read`, `Glob`, `Grep` | Searches and reads the project and answers the question it was given. It cannot change anything. |
+
+`Task` asks before it runs, like a write does, because it spends model requests, and `allow = ["Task"]` in your own file runs it without asking. A rule may also name the sub-agent, as `Task(explore)`. A call that names a sub-agent that does not exist is refused at once, with the names that do, and nobody is asked about it.
+
+What holds for a sub-agent, whichever it is:
+
+- Its sandbox is yours: the same roots, and none can be wider. It is judged in your permission mode, under your rules, `deny` rules included, and in `bypass` mode it still meets the hard denials.
+- It holds the grants you have already given in this session and cannot add one. Nothing is ever asked of you from inside it: a call that would have asked is declined, and the sub-agent is told so.
+- It has the tools in the table and no others, so it cannot write, cannot use a tool an MCP server brought and cannot start a sub-agent of its own.
+- Its system prompt is fixed, short, and says that it is read-only, answers only what it was asked and ends with a concise conclusion. It does not see your instruction files or the project map, and an `@` in what it is asked is not a mention to inline.
+- It is stopped by whichever of three limits it reaches first: 30 requests to its model, 200,000 estimated input tokens summed over those requests (counted at 3.5 characters a token, as the budget counts), and ten minutes. The first two are checked before each request, and one that would go past a limit is not sent; the third cancels a request to the model that is in flight, and a `Glob` or `Grep` that is running finishes first, so the limit is noticed when it returns. The retries that the provider layer makes inside one request, and a compaction inside the sub-agent, do not count toward the 30. What comes back is the last text it wrote, with a line that names the limit. These three are not settings in this version.
+- What comes back is one tool result, the sub-agent's final text, cut to `output_cap_bytes` with a note of how many bytes were cut. Nothing else of its conversation is in yours, or stored.
+- Its requests are priced at the model of its role and shown under that role in `/cost`.
+- Its calls are in the audit record, under the turn of the `Task` call, with that call's id in `parent_call_id`.
+
+Not built: sub-agents defined in `~/.nanoclaude/agents/`, the `plan` and `general` sub-agents, and a sub-agent that starts another. The reasons are in [0017](design/0017-sub-agents.md).
 
 ## Permissions
 
@@ -132,7 +155,7 @@ deny  = ["Read(**/.env*)", "Bash(curl:*)", "Edit(migrations/**)"]
 
 The defaults are `allow = ["Read", "Grep", "Glob"]`, `ask = ["Bash", "Write", "Edit", "Git", "TodoWrite"]` and no `deny`. A list in your own file replaces the default for that key. A rule may name one of the tools there are, or `Bash` or `Git`, which are reserved for tools this version does not have so that a rule written for them today does not have to be rewritten. Any other tool name is refused when the file is loaded, and the error lists the names there are. Names are case-sensitive, so `read` is refused: a `deny` rule that named no tool would refuse nothing.
 
-**Rules** have three shapes: `Tool`, which matches every call to that tool; `Tool(subject)`, which matches one subject exactly or, for a path, as a glob; and `Tool(prefix:*)`, which matches a subject that begins with the prefix at a word boundary, so `Bash(npm test:*)` covers `npm test -- --watch` and not `npm testify`. The subject is the resolved path for `Read`, `Edit` and `Write`, the pattern for `Glob` and `Grep`, and, when they are built, the command for `Bash` and the subcommand for `Git`. A glob is matched against both the absolute path and the path relative to the sandbox root, each as it is and without its leading slash, in the syntax of a `.gitignore` file. A rule with an empty subject or unbalanced parentheses is refused when the file is loaded.
+**Rules** have three shapes: `Tool`, which matches every call to that tool; `Tool(subject)`, which matches one subject exactly or, for a path, as a glob; and `Tool(prefix:*)`, which matches a subject that begins with the prefix at a word boundary, so `Bash(npm test:*)` covers `npm test -- --watch` and not `npm testify`. The subject is the resolved path for `Read`, `Edit` and `Write`, the pattern for `Glob` and `Grep`, the name of the sub-agent for `Task`, and, when they are built, the command for `Bash` and the subcommand for `Git`. A glob is matched against both the absolute path and the path relative to the sandbox root, each as it is and without its leading slash, in the syntax of a `.gitignore` file. A rule with an empty subject or unbalanced parentheses is refused when the file is loaded.
 
 A `deny` rule compares a path as written and again after case folding and NFC normalization, of the rule and of the path alike, so that every spelling of a file that the file system treats as one is refused: with `Read(secrets/**)` denied, `Secrets/key.txt` is refused too, and so is a name written in NFD where the rule has it in NFC. Folding only adds refusals. `allow` and `ask` rules compare as written, since a looser match would widen what runs without asking.
 
@@ -223,7 +246,7 @@ keep_recent_turns = 3
 | --- | --- | --- |
 | `max_turns` | 40 | The most model round trips one prompt may take, a whole number of at least 1. A prompt that needs more stops with a message saying how to go on; the next prompt gets the whole count again. `--max-turns` overrides it. |
 | `bash_timeout_s` | 120 | Seconds a shell command may run, above 0. Reserved for the shell tool, which this version does not have: it is checked when the file is loaded and nothing reads it, so changing it changes nothing. |
-| `output_cap_bytes` | 100000 | The most output of a command kept, a whole number of at least 1. Reserved in the same way. |
+| `output_cap_bytes` | 100000 | The most bytes of a sub-agent's answer that come back to the conversation, a whole number of at least 1: the rest is cut, and the result says how many bytes were. It is meant as well for the most output of a command kept, which is Reserved for the shell tool in the same way as `bash_timeout_s`. |
 | `compact_soft` | 0.7 | The share of the room for a conversation at which old tool results are shrunk to one line each. Above 0, at most 1. |
 | `compact_hard` | 0.85 | The share at which everything older than the recent turns is replaced by a summary. |
 | `keep_recent_turns` | 3 | How many recent turns a summary leaves as they were, at least 1. A model whose window is under 32,000 tokens keeps at most 2. |
@@ -298,6 +321,7 @@ Flags are spelled out in full; an abbreviation is not accepted. `ncc init` takes
 | `/model [alias]` | Lists the models, or switches the `main` role. |
 | `/mode [mode]` | Shows the mode, or switches among `default`, `plan` and `accept-edits`. `bypass` is refused. |
 | `/tools` | Lists the tools and marks those that cannot change anything. |
+| `/agents` | Lists the sub-agents the `Task` tool can start, each with what it does and the model its role is routed to. In this version there is one, `explore`. |
 | `/resume` | Says to restart with `ncc --resume <id>`. |
 | `/export [file]` | Writes the conversation as markdown. It never overwrites a file; the default name is `session-<id>.md` in the project, and the file is readable by you alone. Tool results are cut at 2,000 characters and the model's private reasoning is left out. |
 | `/init` | Says to run `ncc init`. |
@@ -328,7 +352,7 @@ A `NANO.md` that is skipped is not replaced by the `CLAUDE.md` beside it: the na
 
 `ncc init` is the first run. It asks which provider (Anthropic, OpenAI, OpenRouter or Ollama), for the key if one is needed and is not already in the environment, and for the model, and then:
 
-1. It writes `~/.nanoclaude/config.toml`, readable by you alone, with every role on the model you chose and a comment on each choice. A `.nanoclaude` directory that it has to create is one only you can enter. The comments in the file say that `explore`, `plan`, `verify` and `title` are not used yet, and that `bash_timeout_s` and the `Bash` and `Git` entries in its lists are reserved for tools this version does not have. If a configuration is already there it asks first, and the default answer is no.
+1. It writes `~/.nanoclaude/config.toml`, readable by you alone, with every role on the model you chose and a comment on each choice. A `.nanoclaude` directory that it has to create is one only you can enter. The comments in the file say that `plan`, `verify` and `title` are not used yet, and that `bash_timeout_s` and the `Bash` and `Git` entries in its lists are reserved for tools this version does not have. If a configuration is already there it asks first, and the default answer is no.
 2. It forgets what `ncc` learned about models, so each is probed again.
 3. It checks the key with one small request, sent with the configuration it just wrote. A check that fails is a warning, not an error: the file stays, and your choices are not lost to a mistyped key.
 

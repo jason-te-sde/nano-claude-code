@@ -86,8 +86,9 @@ MAX_PREVIEW_LINE_CHARS = 200
 #: The width of the bar ``/status`` draws for how much of the context window is in use.
 BAR_WIDTH = 20
 
-#: What a call is summarised by, most informative first.
-_SUMMARY_KEYS = ("path", "command", "pattern", "subcommand")
+#: What a call is summarised by, most informative first. ``prompt`` is what a ``Task`` call
+#: asks of a sub-agent, and the one thing about it a person needs to see before saying yes.
+_SUMMARY_KEYS = ("path", "command", "pattern", "subcommand", "prompt")
 
 #: The characters that can change what a person believes they are reading: the ones a
 #: terminal acts on (category Cc: the C0 and C1 controls and DEL), the ones it draws as

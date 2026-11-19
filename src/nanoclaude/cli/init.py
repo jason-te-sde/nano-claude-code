@@ -135,10 +135,11 @@ def render_config(preset: Preset, alias: str, model: str) -> str:
 adapter     = {_toml_string(preset.adapter)}
 model       = {_toml_string(model)}
 {base_url}{key_env}
-# Roles name the model for each job. In this version only `main` (the conversation) and
-# `compact` (the summary that replaces a long conversation) are routed to a model of their
-# own. `explore`, `plan`, `verify` and `title` are accepted so this file keeps working, but
-# nothing uses them until sub-agents arrive in v0.3.
+# Roles name the model for each job. In this version `main` (the conversation), `explore`
+# (the sub-agent that the Task tool starts to search and read the project) and `compact` (the
+# summary that replaces a long conversation) are routed to a model of their own. `plan`,
+# `verify` and `title` are accepted so this file keeps working, but nothing uses them until
+# the sub-agents and commands that need them arrive in v0.3.
 # Add another [models.<alias>] block and name it here.
 [roles]
 {roles}

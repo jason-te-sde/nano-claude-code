@@ -149,6 +149,20 @@ async def test_the_front_end_names_the_rule_of_the_verdict_it_was_given_for_each
     ]
 
 
+def test_a_declined_task_call_is_to_be_allowed_by_a_rule_like_any_other_that_is_not_an_edit():
+    line = declined_line(
+        "Task",
+        PermissionRequest("Task", "explore"),
+        rule="default.ask",
+        root="/p",
+        mode=PermissionMode.DEFAULT,
+    )
+    assert line == (
+        'declined (default.ask) Task explore — add "Task" to allow under [permissions] in '
+        "your config to let -p run it"
+    )
+
+
 def test_it_is_still_the_front_end_that_declines_everything_it_is_asked():
     # The session and the executor know it by the protocol, and tests know it by this.
     assert issubclass(ReportingDecline, AutoDecline)
