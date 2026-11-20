@@ -210,7 +210,7 @@ def test_a_file_that_is_not_the_shape_of_a_store_is_an_error_that_says_which_fil
 
 @pytest.mark.parametrize(
     "text",
-    ["[" * 200_000, '{"s": ' * 100_000, "[" * 3000 + "]" * 3000],
+    ["[" * 200_000, '{"s": ' * 100_000, "[" * 200_000 + "]" * 200_000],
     ids=["unclosed-lists", "unclosed-objects", "lists-nested-past-the-parser"],
 )
 def test_a_file_that_makes_the_json_parser_give_out_is_an_error_and_not_a_crash(tmp_path, text):

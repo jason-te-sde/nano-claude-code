@@ -1004,7 +1004,7 @@ async def test_always_is_offered_when_every_argument_is_shown():
 async def test_arguments_nested_beyond_what_can_be_shown_are_summarised_and_do_not_raise():
     # json.dumps gives out at about a thousand levels, and with it anything that walks the value.
     screen = Screen("n", width=400)
-    arguments = {"deep": nested(5000), "path": "/etc/passwd"}
+    arguments = {"deep": nested(200_000), "path": "/etc/passwd"}
     await screen.ui.confirm(mcp_call(arguments), MCP_REQUEST, ASK)
     lines = screen.text.splitlines()
     assert "  deep: (list, 1 item) (nested too deeply to show)" in lines, lines
@@ -1024,7 +1024,7 @@ async def test_a_whole_set_of_arguments_that_cannot_be_walked_is_summarised_and_
 
 def test_the_summary_of_a_call_whose_path_is_nested_past_what_can_be_written_does_not_raise():
     call = ToolUseBlock("t1", "Read", {})
-    object.__setattr__(call, "arguments", {"path": nested(5000)})
+    object.__setattr__(call, "arguments", {"path": nested(200_000)})
     assert summarise_call(call) == "(nested too deeply to show)"
 
 

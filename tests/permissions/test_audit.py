@@ -221,7 +221,7 @@ def test_arguments_nested_past_what_json_can_write_are_recorded_as_that_and_do_n
     written must not stop the call being recorded, or the turn."""
     log = audit(tmp_path)
     deep: list[Any] = []
-    for _ in range(5000):
+    for _ in range(200_000):
         deep = [deep]
     log.record_decision(
         "s1",
