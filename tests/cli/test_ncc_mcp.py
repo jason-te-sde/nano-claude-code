@@ -12,6 +12,7 @@ import json
 import os
 import signal
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from nanoclaude.cli.main import EXIT_CODES
 from nanoclaude.cli.repl import run_repl
 from nanoclaude.mcp.servers import start_servers
 from nanoclaude.prompts import MCP_RESULTS_ARE_DATA
+from nanoclaude.providers.base import ModelReply, ModelRequest
 from nanoclaude.testing.scripted import calls, says
 from nanoclaude.testing.session import ScriptedClient
 from tests.cli.helpers import INTERRUPTED, ScriptedPrompter, run_ncc, tool_results
@@ -258,6 +260,179 @@ def test_the_servers_are_ended_when_ctrl_c_stops_the_run_while_they_are_still_st
         pids = pids_of(ncc_home, name)
         assert len(pids) == 1, f"{name} was not started when Ctrl+C came"
         assert asyncio.run(all_gone(pids)), f"{name} was left running"
+
+
+SIGNALS = [
+    pytest.param(signal.SIGTERM, 143, "SIGTERM", id="SIGTERM"),
+    pytest.param(signal.SIGHUP, 129, "SIGHUP", id="SIGHUP"),
+]
+
+
+@pytest.fixture
+def a_handler_of_the_tests_own():
+    """Catch SIGTERM and SIGHUP in this process, as a program that did nothing about them is
+    not, so that a test of what ncc does with them cannot end the test run if it does nothing."""
+    previous = {sig: signal.signal(sig, lambda *_: None) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    yield
+    for sig, handler in previous.items():
+        signal.signal(sig, handler)
+
+
+@pytest.fixture
+def quick_closes(monkeypatch):
+    """Servers that are ended in the order of the design wait two seconds, and then two more,
+    for one that ignores its stdin and SIGTERM: here they wait a third of a second."""
+
+    async def started(config: Any, **options: Any) -> Any:
+        graces = {"stdin_grace": 0.3, "term_grace": 0.3}
+        return await start_servers(config, **options, transport_options=graces)
+
+    monkeypatch.setattr("nanoclaude.cli.main.start_servers", started)
+
+
+class Signalling(ScriptedClient):
+    """A model that is waiting for its answer when a signal arrives."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__([])
+        self.signum = signum
+
+    async def complete(self, _request, *, on_text=None):  # noqa: ARG002
+        os.kill(os.getpid(), self.signum)
+        await asyncio.sleep(10)
+        raise AssertionError("the signal did not end the run")
+
+
+@pytest.mark.parametrize(("signum", "exit_code", "name"), SIGNALS)
+def test_a_signal_ends_a_headless_run_and_every_server_with_it_even_one_that_ignores_term(
+    ncc_home,
+    project,
+    capsys,
+    monkeypatch,
+    python_handles_ctrl_c,
+    a_handler_of_the_tests_own,
+    quick_closes,
+    signum,
+    exit_code,
+    name,
+):
+    configure(ncc_home, mcp_server("fake", "ignore-term"))
+    clients = {"m": Signalling(signum)}
+    monkeypatch.setattr(ncc_main, "Router", lambda config, cache: Router(config, cache, clients))
+    code, out, err = run_ncc(capsys, "--root", str(project), "-p", "hello")
+    assert (code, out) == (exit_code, "")
+    assert err == f"error: ended by {name} \u2014 nothing more was done; run again to retry\n"
+    assert ended(ncc_home), f"the server outlived a run that {name} ended"
+    assert clients["m"].closed, "the session was not closed"
+
+
+@pytest.mark.parametrize(("signum", "exit_code", "name"), SIGNALS)
+def test_a_signal_still_gives_json_its_one_object(
+    ncc_home,
+    project,
+    capsys,
+    monkeypatch,
+    python_handles_ctrl_c,
+    a_handler_of_the_tests_own,
+    quick_closes,
+    signum,
+    exit_code,
+    name,
+):
+    configure(ncc_home, mcp_server("fake"))
+    clients = {"m": Signalling(signum)}
+    monkeypatch.setattr(ncc_main, "Router", lambda config, cache: Router(config, cache, clients))
+    code, out, err = run_ncc(
+        capsys, "--root", str(project), "--output-format", "json", "-p", "hello"
+    )
+    payload = json.loads(out)
+    assert code == exit_code == payload["exit_code"] and payload["is_error"] is True
+    assert err == f"error: {payload['error']}\n" and name in payload["error"]
+
+
+@pytest.mark.parametrize(("signum", "exit_code", "name"), SIGNALS)
+def test_a_signal_ends_the_repl_and_every_server_with_it(
+    ncc_home,
+    project,
+    serve,
+    capsys,
+    monkeypatch,
+    python_handles_ctrl_c,
+    a_handler_of_the_tests_own,
+    quick_closes,
+    signum,
+    exit_code,
+    name,
+):
+    configure(ncc_home, mcp_server("fake", "ignore-term"))
+    serve(m=[])
+
+    async def waits(session: Session) -> None:
+        os.kill(os.getpid(), signum)
+        await asyncio.sleep(10)
+        raise AssertionError("the signal did not end the REPL")
+
+    repl = Repl()
+    repl.body = waits
+    monkeypatch.setattr(ncc_main, "run_repl", repl)
+    code, out, err = run_ncc(capsys, "--root", str(project))
+    assert (code, out) == (exit_code, "")
+    assert name in err, err
+    assert ended(ncc_home), f"the server outlived a REPL that {name} ended"
+
+
+def test_a_signal_while_the_servers_are_still_starting_ends_them_too(
+    ncc_home,
+    project,
+    serve,
+    capsys,
+    monkeypatch,
+    python_handles_ctrl_c,
+    a_handler_of_the_tests_own,
+):
+    configure(
+        ncc_home,
+        mcp_server("fake"),
+        mcp_server("mute", "never-answers-stubborn") + "timeout = 600\n",
+    )
+    serve(m=[])
+
+    async def terminated(config: Any, **options: Any) -> Any:
+        asyncio.get_running_loop().call_later(1.0, os.kill, os.getpid(), signal.SIGTERM)
+        graces = {"stdin_grace": 0.3, "term_grace": 0.3}
+        return await start_servers(config, **options, transport_options=graces)
+
+    monkeypatch.setattr("nanoclaude.cli.main.start_servers", terminated)
+    code, out, _ = run_ncc(capsys, "--root", str(project), "-p", "hello")
+    assert (code, out) == (143, "")
+    for name in ("fake", "mute"):
+        pids = pids_of(ncc_home, name)
+        assert len(pids) == 1, f"{name} was not started when the signal came"
+        assert asyncio.run(all_gone(pids)), f"{name} was left running"
+
+
+def test_a_hangup_that_the_process_was_told_to_ignore_is_still_ignored(
+    ncc_home, project, capsys, monkeypatch, python_handles_ctrl_c
+):
+    # nohup does this, so that a terminal that closes does not end what was started in it.
+    seen: list[object] = []
+
+    class Looking(ScriptedClient):
+        async def complete(
+            self, request: ModelRequest, *, on_text: Callable[[str], None] | None = None
+        ) -> ModelReply:
+            seen.append(signal.getsignal(signal.SIGHUP))
+            return await super().complete(request, on_text=on_text)
+
+    clients = {"m": Looking([says("hi")])}
+    monkeypatch.setattr(ncc_main, "Router", lambda config, cache: Router(config, cache, clients))
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        code, out, _ = run_ncc(capsys, "--root", str(project), "-p", "hello")
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+    assert (code, out) == (0, "hi\n")
+    assert seen == [signal.SIG_IGN], f"ncc took over a hangup that was being ignored: {seen}"
 
 
 class Repl:
