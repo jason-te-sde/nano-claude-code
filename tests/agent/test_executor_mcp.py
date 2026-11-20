@@ -216,3 +216,30 @@ async def test_a_change_under_another_spelling_of_the_name_still_meets_the_allow
     batch = executor(tmp_path, adapted.tools[0], ui)
     await batch.run_batch(CALL, start("hi"))
     assert ui.asked == ["mcp.changed"] and second.calls == []
+
+
+class Unreadable(SilentUI):
+    """A front end that cannot make what it was asked about readable, as one that walks the
+    arguments of a call finds when they are nested past what it can follow."""
+
+    async def confirm(
+        self, _call: ToolUseBlock, _request: PermissionRequest, _result: PermissionResult
+    ) -> Approval:
+        raise RecursionError("maximum recursion depth exceeded")
+
+
+async def test_a_confirmation_that_cannot_be_read_declines_the_call_and_the_batch_goes_on(tmp_path):
+    subject, client = await session_tool(tmp_path, "creates an issue")
+    # No rule allows it, so it is asked about: and the question cannot be put.
+    built = Policy(Sandbox((str(tmp_path),)), RuleSet.build(), mode=PermissionMode.DEFAULT)
+    batch = Executor(registry=ToolRegistry([subject]), policy=built, ui=Unreadable())
+    calls = (
+        ToolUseBlock("t1", NAME, {"title": "t"}),
+        ToolUseBlock("t2", "mcp__nope__nothing", {}),
+    )
+    results = await batch.run_batch(calls, start("go"))
+    first, second = results
+    assert first.is_error and "nested too deeply" in first.content
+    assert "was not run" in first.content and "approve" in first.content
+    assert client.calls == [], "the tool ran although nobody could be shown what it was given"
+    assert second.is_error and second.tool_use_id == "t2", "the rest of the batch did not go on"

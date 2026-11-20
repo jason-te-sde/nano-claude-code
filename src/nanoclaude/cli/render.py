@@ -40,10 +40,12 @@ display off by a line, which leaves a copy of its last frame behind.
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
 import os
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import PurePosixPath
 from typing import ClassVar
 
@@ -63,6 +65,7 @@ from nanoclaude.cli.prompt import Questioner, discard_pending_input, new_prompte
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.transcript import TextBlock, ToolUseBlock
 from nanoclaude.permissions.policy import Decision, PermissionRequest, PermissionResult
+from nanoclaude.permissions.rules import is_mcp_tool_name
 from nanoclaude.providers.base import ModelReply
 from nanoclaude.providers.pricing import PriceBook
 from nanoclaude.tools.base import ToolArgumentError, ToolOutcome, sanitize
@@ -83,6 +86,15 @@ WRITE_PREVIEW_DIFF_LINES = 40
 #: the listing, two thousand rows on the screen, and the subject line is somewhere above them.
 MAX_PREVIEW_LINE_CHARS = 200
 
+#: How much of the arguments of a call to an MCP tool a confirmation shows. They are written by
+#: the model, and the tool is somebody else's, so what the person approves is every key of them
+#: and the beginning of every value, whatever came first: the keys are listed one to a line,
+#: each value is cut to its own limit, and what is not shown is counted and never left out
+#: silently. Past this many keys the rest are counted and not shown, and "always" is not offered.
+MAX_ARGUMENT_KEYS = 20
+MAX_ARGUMENT_KEY_CHARS = 60
+MAX_ARGUMENT_VALUE_CHARS = 200
+
 #: The width of the bar ``/status`` draws for how much of the context window is in use.
 BAR_WIDTH = 20
 
@@ -93,10 +105,12 @@ _SUMMARY_KEYS = ("path", "command", "pattern", "subcommand", "prompt")
 #: The characters that can change what a person believes they are reading: the ones a
 #: terminal acts on (category Cc: the C0 and C1 controls and DEL), the ones it draws as
 #: nothing (Cf, "format": zero-width spaces and joiners, left-to-right and right-to-left
-#: marks and overrides, the soft hyphen, the byte order mark), and a lone surrogate (Cs),
-#: which cannot be printed at all. A subject that holds one is not the subject without it,
-#: so each is shown by name and two different subjects never print alike.
-_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs"})
+#: marks and overrides, the soft hyphen, the byte order mark), the line and paragraph
+#: separators (Zl and Zp: U+2028 and U+2029, which end a line as a newline does and are not
+#: controls), and a lone surrogate (Cs), which cannot be printed at all. A subject that holds
+#: one is not the subject without it, so each is shown by name and two different subjects
+#: never print alike.
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
 #: Where an unsafe character can be: anything but printable ASCII. Most text has none, and
 #: is never looked at one character at a time.
@@ -194,7 +208,10 @@ def _primary_argument(call: ToolUseBlock) -> str | None:
     """The argument that says most about the call, as the model wrote it."""
     for key in _SUMMARY_KEYS:
         if key in call.arguments:
-            return str(call.arguments[key])
+            try:
+                return str(call.arguments[key])
+            except RecursionError:  # nested past what can be written out
+                return "(nested too deeply to show)"
     return None
 
 
@@ -204,6 +221,101 @@ def summarise_call(call: ToolUseBlock) -> str:
     if primary is None:
         primary = ", ".join(sorted(call.arguments))
     return _shorten(visible(primary))
+
+
+#: What a confirmation says of a tool of an MCP server whose definition is not the one the
+#: person last approved.
+_CHANGED_NOTE = (
+    "  its definition has changed since you last approved it: the description or the input "
+    "schema is different (/mcp lists the tools of a server)"
+)
+
+
+def _cut_visible(raw: str, limit: int) -> tuple[Text, int]:
+    """The start of ``raw`` with every control named, at most ``limit`` characters of what is
+    shown, and how many characters of ``raw`` are not in it.
+
+    Cut as it is shown, one character at a time and stopping when the line is full, so that
+    characters that become four or ten when they are named cannot make it longer than its
+    limit, and a value of a million characters costs a few hundred steps and not a million.
+    """
+    shown = Text()
+    used = taken = 0
+    for char in raw:
+        piece = visible_text(char)
+        if used + len(piece) > limit:
+            break
+        shown.append_text(piece)
+        used += len(piece)
+        taken += 1
+    return shown, len(raw) - taken
+
+
+def _more(hidden: int) -> tuple[str, str]:
+    return (f" … {hidden} more characters", "dim")
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
+
+
+def _shown_value(value: object) -> Text:
+    """One argument's value: a container by its kind and size, then as much of its JSON as the
+    limit allows. A value that cannot be written as JSON, or is nested past what can be walked,
+    is said to be that, and the rest of the arguments are shown all the same."""
+    kind = ""
+    if isinstance(value, Mapping):
+        kind = f"(object, {_count(len(value), 'key')}) "
+    elif isinstance(value, list | tuple):
+        kind = f"(list, {_count(len(value), 'item')}) "
+    try:
+        raw = json.dumps(value, ensure_ascii=False, default=str)
+    except (RecursionError, ValueError, TypeError, OverflowError):
+        return Text(f"{kind}(nested too deeply to show)")
+    shown, hidden = _cut_visible(raw, MAX_ARGUMENT_VALUE_CHARS)
+    parts: list[str | Text | tuple[str, str]] = [kind, shown]
+    if hidden:
+        parts.append(_more(hidden))
+    return Text.assemble(*parts)
+
+
+def _argument_lines(call: ToolUseBlock) -> tuple[list[Text], bool]:
+    """The arguments of a call, one line for each key, and whether every key is in them.
+
+    Each key is cut at :data:`MAX_ARGUMENT_KEY_CHARS` and each value at
+    :data:`MAX_ARGUMENT_VALUE_CHARS`, both with the count of what was cut, so that nothing a
+    model writes before the arguments that matter can push them out of sight. More than
+    :data:`MAX_ARGUMENT_KEYS` keys are counted in a last line and not shown, and the second
+    answer is False: the person has not seen everything that "always" would then allow.
+    """
+    arguments = call.arguments
+    if not arguments:
+        return [Text("  (no arguments)", style="dim")], True
+    lines = []
+    for key, value in itertools.islice(arguments.items(), MAX_ARGUMENT_KEYS):
+        shown_key, hidden = _cut_visible(str(key), MAX_ARGUMENT_KEY_CHARS)
+        parts: list[str | Text | tuple[str, str]] = ["  ", shown_key]
+        if hidden:
+            parts.append(_more(hidden))
+        parts.extend([(": ", "dim"), _shown_value(value)])
+        lines.append(Text.assemble(*parts))
+    left = len(arguments) - MAX_ARGUMENT_KEYS
+    if left > 0:
+        noun = "argument, which is" if left == 1 else "arguments, which are"
+        lines.append(Text(f"  … {left} more {noun} not shown", style="yellow"))
+    return lines, left <= 0
+
+
+def _arguments_block(call: ToolUseBlock) -> tuple[list[Text], bool]:
+    """:func:`_argument_lines`, which a set of arguments cannot make raise.
+
+    A value nested past the recursion limit is handled where it is written out. This is for
+    whatever else walks them: a line that says so, and no "always" for a call that was not read.
+    """
+    try:
+        return _argument_lines(call)
+    except RecursionError:
+        return [Text("  (the arguments are nested too deeply to show)", style="yellow")], False
 
 
 def _shown_line(line: str, style: str = "") -> Text:
@@ -447,7 +559,7 @@ class ConsoleUI:
         self._streamed = False
 
     async def confirm(
-        self, call: ToolUseBlock, request: PermissionRequest, _result: PermissionResult
+        self, call: ToolUseBlock, request: PermissionRequest, result: PermissionResult
     ) -> Approval:
         # The session ends a request before it runs a tool, so this is not needed. It is here
         # because a question asked over a live display cannot be read, and a rule that is only
@@ -466,17 +578,35 @@ class ConsoleUI:
                 visible_text(self._subject_shown(request)),
             )
         )
-        called_with = self._spelling_beside(call, request)
-        if called_with is not None:
-            # The policy judged the resolved path, and that is what is shown above. What
-            # the model wrote may differ from it, and a person is owed both.
-            self._console.print(Text.assemble(("  called with ", "dim"), visible_text(called_with)))
+        everything_shown = True
+        if is_mcp_tool_name(call.name):
+            # No path was resolved and no command classified: the subject says only which
+            # server, so what the tool is given is what there is to read.
+            lines, everything_shown = _arguments_block(call)
+            for line in lines:
+                self._console.print(line)
+        else:
+            called_with = self._spelling_beside(call, request)
+            if called_with is not None:
+                # The policy judged the resolved path, and that is what is shown above. What
+                # the model wrote may differ from it, and a person is owed both.
+                self._console.print(
+                    Text.assemble(("  called with ", "dim"), visible_text(called_with))
+                )
         if call.name == "Edit":
             await self._preview_edit(call, request)
         elif call.name == "Write":
             await self._preview_write(call, request)
+        grant = f"every {visible(call.name)} call this session"
+        if result.rule == "mcp.changed":
+            self._console.print(Text(_CHANGED_NOTE, style="yellow"))
+            # A grant for the session does not hold for a changed tool, so "always" is not
+            # offered as one: it renews what the person has approved, for the next session.
+            grant = "approve this definition for later sessions; this session still asks"
         question = (
-            f"  allow? [y]es / [n]o / [a]lways (every {visible(call.name)} call this session) "
+            f"  allow? [y]es / [n]o / [a]lways ({grant}) "
+            if everything_shown
+            else "  allow? [y]es / [n]o "
         )
         while True:
             # Whatever was typed before now was not typed for this question: not what the
@@ -498,7 +628,17 @@ class ConsoleUI:
             if choice in ("y", "yes"):
                 return Approval.ONCE
             if choice in ("a", "always"):
-                return Approval.ALWAYS
+                if everything_shown:
+                    return Approval.ALWAYS
+                # "Always" allows every later call of the tool, and this one was not shown whole.
+                self._console.print(
+                    plain(
+                        "always is not offered for a call whose arguments are not all shown "
+                        "\u2014 answer y or n",
+                        "dim",
+                    )
+                )
+                continue
             if choice in ("", "n", "no"):
                 return Approval.NO
             self._console.print(plain("answer y, n or a", "dim"))

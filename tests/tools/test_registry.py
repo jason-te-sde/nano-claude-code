@@ -112,6 +112,17 @@ async def test_default_registry_wires_a_given_todo_state_into_todowrite(ctx):
     assert [item.content for item in state.items] == ["a"]
 
 
+def test_default_registry_holds_the_tools_it_is_given_beside_its_own_and_refuses_a_name_twice():
+    class Brought(_FakeTool):
+        pass
+
+    registry = default_registry(None, [Brought("mcp__fake__echo")])
+    assert "mcp__fake__echo" in registry and len(registry) == 8
+    assert "mcp__fake__echo" not in default_registry(), "a tool leaked into the next registry"
+    with pytest.raises(ValueError, match="duplicate tool name 'Read'"):
+        default_registry(None, [_FakeTool("Read")])
+
+
 def test_default_registry_without_a_todo_state_builds_its_own():
     registry = default_registry()
     assert isinstance(registry.get("TodoWrite"), TodoWriteTool)

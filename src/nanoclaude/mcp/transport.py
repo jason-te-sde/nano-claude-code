@@ -366,6 +366,17 @@ class StdioTransport:
             return True
         return True
 
+    def kill(self) -> None:
+        """Send SIGKILL to the server's group now, and wait for nothing.
+
+        For a caller that has run out of time to close in the order the module docstring
+        gives: SIGKILL cannot be ignored, so nothing the server or a helper of it started
+        survives it. It does not release the pipes; :meth:`close` after it does that, and
+        finds nothing left to wait for. Nothing is signalled before the server was started
+        or once its group is known to be gone.
+        """
+        self._signal_group(signal.SIGKILL)
+
     def _signal_group(self, sig: signal.Signals) -> None:
         if self._process is None or self._group_ended:
             return

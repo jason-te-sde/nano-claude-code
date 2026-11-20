@@ -53,6 +53,8 @@ def test_the_exit_codes_are_documented_and_distinct():
         "provider": 4,
         "interrupted": 130,
         "output_closed": 141,
+        "hangup": 129,
+        "terminated": 143,
     }
 
 

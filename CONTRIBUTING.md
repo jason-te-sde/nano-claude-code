@@ -39,7 +39,7 @@ it was verified>
 ```
 
 Scopes are the packages under `src/nanoclaude/`: `cli`, `agent`, `conversation`, `tools`,
-`permissions`, `providers`, `context`, `config`, and `checkpoint`, `mcp` and `hooks` once they
+`permissions`, `providers`, `context`, `config`, `mcp`, and `checkpoint` and `hooks` once they
 exist. Use `build` for packaging, CI and tooling changes that are not specific to one module,
 or omit the scope entirely for a change that spans the whole repository. Common types: `feat`,
 `fix`, `refactor`, `test`, `docs`, `ci`, `build`, `chore`.

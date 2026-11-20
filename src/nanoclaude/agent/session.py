@@ -35,6 +35,7 @@ from collections.abc import Callable, Sequence
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from nanoclaude.agent import loop
 from nanoclaude.agent.executor import Executor
@@ -74,6 +75,9 @@ from nanoclaude.subagents import SubAgentCall, SubAgentResult
 from nanoclaude.tools.base import ToolOutcome
 from nanoclaude.tools.registry import ToolRegistry
 from nanoclaude.tools.todo import TodoState
+
+if TYPE_CHECKING:
+    from nanoclaude.mcp.servers import McpServers
 
 #: What a call that never reported back is told. It may have run: a write can
 #: land in the instant before the person stops the turn.
@@ -183,6 +187,10 @@ class Session:
     #: session in a test cannot pick up the instructions of whoever runs it.
     home: str = field(default_factory=lambda: str(Path.home()))
     resume: bool = False
+    #: The MCP servers the session started, whose tools are in ``registry``. The session closes
+    #: them with itself, and ``/mcp`` reports on them. None for a session with none, and for a
+    #: sub-agent's, which is never given a tool of one.
+    mcp: McpServers | None = None
     # What makes a session a sub-agent's, as plain parameters. A session a person talks to
     # leaves all of them as they are.
     #: The role whose model answers the conversation.
@@ -818,6 +826,8 @@ class Session:
             # Registered in reverse, because they run last to first: the conversation is
             # stored, the spend recorded, the clients closed, and the store closed.
             steps.callback(self._close_store)
+            if self.mcp is not None:
+                steps.push_async_callback(self.mcp.aclose)
             steps.push_async_callback(self.router.aclose)
             steps.callback(self._finish)
             steps.callback(self._persist)

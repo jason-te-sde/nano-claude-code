@@ -703,3 +703,45 @@ async def test_a_group_the_system_will_not_let_us_signal_does_not_stop_close(
         if transport.pid is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(transport.pid, signal.SIGKILL)
+
+
+# --------------------------------------------------------------------------
+# Ending the server at once, for a caller that is out of time
+# --------------------------------------------------------------------------
+
+
+async def test_kill_ends_the_server_and_what_it_started_without_waiting_out_a_period(
+    make_transport, log_path
+):
+    command, args = fake_server("ignore-term")
+    transport = make_transport(command, args, stdin_grace=30.0, term_grace=30.0)
+    await transport.start()
+    await when_ready(transport)
+    pgid, helper = transport.pid, await helper_pid(log_path)
+    assert pgid is not None and not group_is_gone(pgid)
+    transport.kill()
+    assert await eventually(lambda: group_is_gone(pgid)), "kill left a process in the group"
+    assert process_is_gone(helper), "the helper the server started is still running"
+    # What was killed is closed as any server is, and at once: nothing is left to wait for.
+    began = time.monotonic()
+    await asyncio.wait_for(transport.close(), timeout=10)
+    assert time.monotonic() - began < 5, "closing a killed server waited out its periods"
+    assert transport.returncode == -signal.SIGKILL, transport.returncode
+
+
+async def test_kill_signals_nothing_before_the_server_started_or_after_its_group_is_gone(
+    make_transport, monkeypatch
+):
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    unstarted = make_transport("/bin/cat")
+    unstarted.kill()
+    assert sent == [], "a transport that was never started signalled a group"
+    monkeypatch.undo()
+    transport = make_transport("/bin/cat")
+    await transport.start()
+    await transport.close()
+    sent.clear()
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: sent.append((pgid, sig)))
+    transport.kill()
+    assert sent == [], "a group that is known to be gone was signalled, and its number is anybody's"

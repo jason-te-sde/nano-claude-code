@@ -12,6 +12,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from nanoclaude.config.schema import (
+    Config,
+    LimitsConfig,
+    McpServerConfig,
+    ModelConfig,
+    RolesConfig,
+)
+
 FAKE_SERVER = Path(__file__).resolve().parents[1] / "fixtures" / "fake_mcp_server.py"
 
 
@@ -52,6 +60,20 @@ def events(log: Path) -> dict[str, float]:
             name, _, stamp = rest.partition(" ")
             found[name] = float(stamp) if stamp else 0.0
     return found
+
+
+def logged_server_pids(log: Path) -> list[int]:
+    """The process id the fake server logged each time it was started: its process group's too.
+
+    Empty when there is no log, which is what a server that was never started leaves.
+    """
+    if not log.exists():
+        return []
+    return [
+        int(text.split()[1])
+        for text in log.read_text(encoding="utf-8").splitlines()
+        if text.startswith("PID ")
+    ]
 
 
 def logged_helper_pid(log: Path) -> int:
@@ -122,3 +144,35 @@ async def eventually(condition: Callable[[], bool], *, within: float = 5.0) -> b
 def open_descriptors() -> int:
     """How many file descriptors this process has open."""
     return len(list(Path("/dev/fd").iterdir()))
+
+
+def server(name: str, mode: str = "modern", *settings: str, **fields: Any) -> McpServerConfig:
+    """A configured server that is the fake server in ``mode``."""
+    command, args = fake_server(mode, *settings)
+    return McpServerConfig(name=name, command=command, args=tuple(args), **fields)
+
+
+def log_of(home: Path, name: str) -> Path:
+    """Where the stderr of the server called ``name`` is kept, under ``home``."""
+    return home / ".nanoclaude" / "logs" / f"mcp-{name}.log"
+
+
+def pids_of(home: Path, name: str) -> list[int]:
+    """The process ids the server called ``name`` logged: one for each time it was started."""
+    return logged_server_pids(log_of(home, name))
+
+
+async def all_gone(pids: list[int]) -> bool:
+    """Whether every group is gone, once the kernel and the loop have reaped what ended."""
+    assert pids, "no server was started, so nothing was checked for being gone"
+    return await eventually(lambda: all(group_is_gone(pid) for pid in pids))
+
+
+def config_of(*servers: McpServerConfig, cap: int = 100_000) -> Config:
+    """A configuration that has ``servers`` and a model for every role, and nothing else."""
+    return Config(
+        models={"m": ModelConfig("anthropic", "claude-sonnet-5")},
+        roles=RolesConfig("m", "m", "m", "m", "m", "m"),
+        limits=LimitsConfig(output_cap_bytes=cap),
+        mcp={server.name: server for server in servers},
+    )

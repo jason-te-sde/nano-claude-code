@@ -1,14 +1,16 @@
 """Fixtures for the MCP tests: transports and clients that are closed when the test ends."""
 
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from nanoclaude.config.schema import McpServerConfig
 from nanoclaude.mcp.client import McpClient
+from nanoclaude.mcp.servers import McpServers, start_servers
 from nanoclaude.mcp.transport import StdioTransport
-from tests.mcp.helpers import fake_server
+from tests.mcp.helpers import config_of, fake_server
 
 
 @pytest.fixture
@@ -67,3 +69,41 @@ async def make_client(
     yield make
     for client in made:
         await client.close()
+
+
+@pytest.fixture
+def mcp_home(tmp_path: Path) -> Path:
+    """The home ncc keeps its state in for a test of the servers of a session."""
+    return tmp_path / "home"
+
+
+@pytest.fixture
+def mcp_root(tmp_path: Path) -> Path:
+    """The project directory: where a server is started."""
+    root = tmp_path / "project"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+async def start(
+    mcp_home: Path, mcp_root: Path
+) -> AsyncIterator[Callable[..., Awaitable[McpServers]]]:
+    """Start the servers of a session, and end every one that a test left running.
+
+    ``start(server, ...)`` takes the servers the configuration has and what
+    :func:`~nanoclaude.mcp.servers.start_servers` takes; the cap is the configuration's
+    ``output_cap_bytes``.
+    """
+    started: list[McpServers] = []
+
+    async def go(*servers: McpServerConfig, cap: int = 100_000, **options: Any) -> McpServers:
+        result = await start_servers(
+            config_of(*servers, cap=cap), root=str(mcp_root), home=mcp_home, **options
+        )
+        started.append(result)
+        return result
+
+    yield go
+    for servers in started:
+        await servers.aclose()

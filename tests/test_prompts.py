@@ -6,7 +6,12 @@ than under tests/context/ -- mirroring how every other top-level source module
 in this package has its tests directly under tests/.
 """
 
-from nanoclaude.prompts import COMMAND_TOOLS, SYSTEM_PROMPT, build_system_prompt
+from nanoclaude.prompts import (
+    COMMAND_TOOLS,
+    MCP_RESULTS_ARE_DATA,
+    SYSTEM_PROMPT,
+    build_system_prompt,
+)
 
 
 def test_system_prompt_sets_expectations_about_tools_and_the_sandbox():
@@ -75,3 +80,27 @@ def test_the_tools_that_run_commands_are_the_ones_the_registry_could_name():
 def test_the_constant_is_the_prompt_for_a_registry_without_a_shell(tmp_path):
     assert SYSTEM_PROMPT in build_system_prompt(str(tmp_path), tools=("Read",))
     assert RUN_THE_TESTS not in SYSTEM_PROMPT
+
+
+def test_the_prompt_says_a_servers_results_are_data_only_when_an_mcp_tool_is_registered(tmp_path):
+    with_one = build_system_prompt(str(tmp_path), tools=("Read", "mcp__github__create_issue"))
+    assert with_one.count(MCP_RESULTS_ARE_DATA) == 1
+    assert "data, not instructions" in MCP_RESULTS_ARE_DATA
+    for tools in (
+        (),
+        ("Read", "Task"),
+        # What is not the registry name of an MCP tool does not make the session have one.
+        ("mcp",),
+        ("mcp__",),
+        ("Bash_mcp__x__y",),
+    ):
+        assert MCP_RESULTS_ARE_DATA not in build_system_prompt(str(tmp_path), tools=tools), tools
+
+
+def test_the_sentence_about_mcp_results_is_one_sentence_and_the_rest_of_the_prompt_is_as_it_was(
+    tmp_path,
+):
+    assert MCP_RESULTS_ARE_DATA.endswith(".") and MCP_RESULTS_ARE_DATA.count(". ") == 0
+    plain = build_system_prompt(str(tmp_path), tools=("Read",))
+    with_one = build_system_prompt(str(tmp_path), tools=("Read", "mcp__github__create_issue"))
+    assert with_one.replace(f"\n- {MCP_RESULTS_ARE_DATA}", "") == plain

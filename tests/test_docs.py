@@ -24,14 +24,30 @@ import pytest
 
 from nanoclaude.agent.loop import StopReason
 from nanoclaude.cli import init as ncc_init
-from nanoclaude.cli.commands import COMMANDS
+from nanoclaude.cli.commands import COMMANDS, FINGERPRINT_SHOWN
 from nanoclaude.cli.headless import DECLINED_PREFIX, declined_line
 from nanoclaude.cli.init import PRESETS
 from nanoclaude.cli.main import EXIT_CODES, build_parser, main
-from nanoclaude.cli.render import status_panel
+from nanoclaude.cli.render import (
+    MAX_ARGUMENT_KEY_CHARS,
+    MAX_ARGUMENT_KEYS,
+    MAX_ARGUMENT_VALUE_CHARS,
+    status_panel,
+)
 from nanoclaude.cli.repl import TEXT_TOOL_BANNER
 from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, ConfigError, load_config
-from nanoclaude.config.schema import ROLES, LimitsConfig, ModelConfig, PermissionsConfig, UiConfig
+from nanoclaude.config.schema import (
+    MCP_DEFAULT_TIMEOUT,
+    MCP_SERVER_NAME,
+    MCP_TIMEOUT_RANGE,
+    MCP_TRANSPORTS,
+    ROLES,
+    LimitsConfig,
+    McpServerConfig,
+    ModelConfig,
+    PermissionsConfig,
+    UiConfig,
+)
 from nanoclaude.context.git import ALLOWED_SUBCOMMAND
 from nanoclaude.context.instructions import (
     MAX_INSTRUCTION_BYTES,
@@ -40,6 +56,27 @@ from nanoclaude.context.instructions import (
 )
 from nanoclaude.context.projectmap import project_map
 from nanoclaude.conversation.store import Store
+from nanoclaude.mcp.pins import LOCK_WAIT_SECONDS, PINS_FILENAME, PinStore
+from nanoclaude.mcp.servers import (
+    CLOSE_RESERVE_SECONDS,
+    LOG_DIRNAME,
+    MAX_TOOL_WARNINGS_PER_SERVER,
+    START_BUDGET_SECONDS,
+    failed_line,
+)
+from nanoclaude.mcp.tool import (
+    MAX_DESCRIPTION_BYTES,
+    MAX_REGISTRY_NAME_CHARS,
+    MAX_SCHEMA_BYTES,
+    MAX_SCHEMA_DEPTH,
+    adapt_tools,
+)
+from nanoclaude.mcp.transport import (
+    ENV_ALLOWLIST,
+    STDERR_LOG_CAP,
+    STDIN_GRACE_SECONDS,
+    TERM_GRACE_SECONDS,
+)
 from nanoclaude.permissions import redact
 from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.danger import DangerLevel
@@ -68,6 +105,7 @@ from nanoclaude.tools.registry import default_registry
 from nanoclaude.tools.todo import TodoState
 from tests.conftest import mode_of
 from tests.keys import pem
+from tests.mcp.stubs import StubClient, tool
 from tests.script_modules import load_script
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,6 +143,7 @@ DESIGN_NOTES = (
     "0015-bypass-does-not-disable-the-sandbox.md",
     "0016-attribution-policy.md",
     "0017-sub-agents.md",
+    "0018-mcp-client.md",
 )
 
 REQUIRED_SECTIONS = ("## Why", "## Costs", "## Rejected alternatives")
@@ -571,7 +610,7 @@ def _source() -> dict[str, str]:
     }
 
 
-def test_nothing_reads_the_shell_timeout_yet_and_only_the_sub_agent_reads_the_output_cap():
+def test_nothing_reads_the_shell_timeout_yet_and_only_the_sub_agent_and_mcp_read_the_output_cap():
     def readers(key: str) -> set[str]:
         return {name for name, text in _source().items() if re.search(rf"\b{key}\b", text)}
 
@@ -583,9 +622,11 @@ def test_nothing_reads_the_shell_timeout_yet_and_only_the_sub_agent_reads_the_ou
         "config/schema.py",
         "config/load.py",
         "agent/subagent.py",
+        "mcp/servers.py",
     }, (
         f"{sorted(readers('output_cap_bytes'))} read output_cap_bytes; docs/configuration.md "
-        "says that the sub-agent's answer is what it caps and that command output is reserved"
+        "says that the sub-agent's answer and a result of an MCP tool are what it caps and "
+        "that command output is reserved"
     )
 
 
@@ -723,6 +764,7 @@ README_SECTIONS = [
     "Install",
     "Why this and not Claude Code",
     "Roles",
+    "MCP servers",
     "Safety",
     "Configuration",
     "What v0.1 does not do",
@@ -1310,6 +1352,7 @@ KNOWN_LIMITS = (
     "**Files `ncc` keeps private.**",
     "**A rule's glob and the leading slash.**",
     "**Line numbers.**",
+    "**A server is not contained.**",
 )
 
 
@@ -1470,7 +1513,17 @@ def test_a_config_file_holds_no_key_because_the_loader_refuses_one(tmp_path):
             load_config(home=str(home), project=None, env={})
         assert key not in str(refused.value), "the error repeats the key it refused"
     for document in (SECURITY, CONFIGURATION, ARCHITECTURE):
-        assert "holds no key" in " ".join(_text(document).split()), document.name
+        said = " ".join(_text(document).split())
+        assert "holds no model key" in said, document.name
+        # The one credential a file can hold is the env of an MCP server, which is a literal
+        # because that is how a stdio server is given one, and the documents say so.
+        assert "`env` of an MCP server" in said, document.name
+    config.write_text(
+        EXAMPLE_HOME + '\n[mcp.notes]\ncommand = "notes"\nenv = { NOTES_TOKEN = "' + key + '" }\n'
+    )
+    assert load_config(home=str(home), project=None, env={}).mcp["notes"].env == {
+        "NOTES_TOKEN": key
+    }, "the env of a server is no longer kept as it is; correct the three documents"
     # A base_url is checked for its scheme and for nothing else, so a credential put in one is
     # kept, and the three documents that say what a config.toml shows say so too.
     config.write_text(EXAMPLE_HOME + "\n" + entry + f'base_url = "https://user:{key}@host/v1"\n')
@@ -1733,6 +1786,243 @@ def test_the_readme_says_why_the_design_notes_skip_numbers():
     text = _text(README)
     for number in skipped:
         assert f"{number:04d}" in text, f"the README does not say why note {number:04d} is missing"
+
+
+# --------------------------------------------------------------------------
+# MCP servers
+# --------------------------------------------------------------------------
+
+
+def _said(document: Path) -> str:
+    """A document on one line, so that a sentence broken across lines is still found."""
+    return " ".join(_text(document).split())
+
+
+def test_the_mcp_keys_in_the_reference_are_the_ones_the_loader_takes_with_their_defaults():
+    rows = _table_rows(_section(_text(CONFIGURATION), "MCP servers"))
+    documented = {row[0].strip("`"): row for row in rows if row[0].startswith("`")}
+    taken = {field.name for field in fields(McpServerConfig)} - {"name"}
+    assert set(documented) == taken, f"the reference has {sorted(documented)}; the loader {taken}"
+    assert documented["timeout"][1] == str(MCP_DEFAULT_TIMEOUT)
+    assert documented["transport"][1] == f'`"{MCP_TRANSPORTS[0]}"`'
+    assert documented["enabled"][1] == f"`{str(McpServerConfig('x', 'y').enabled).lower()}`"
+    low, high = MCP_TIMEOUT_RANGE
+    assert f"from {low} to {high}" in documented["timeout"][2]
+    longest = re.compile(MCP_SERVER_NAME)
+    assert longest.fullmatch("a" * 24) and not longest.fullmatch("a" * 25)
+    assert "at most 24 long" in _said(CONFIGURATION), "the name's length is not what the loader has"
+
+
+def test_the_documents_name_the_variables_a_server_is_given_and_they_are_the_allowlist():
+    names = ", ".join(f"`{n}`" for n in ENV_ALLOWLIST[:-1]) + f" and `{ENV_ALLOWLIST[-1]}`"
+    for document in (README, CONFIGURATION, SECURITY):
+        assert names in _said(document), f"{document.name} does not list {names}"
+
+
+def test_the_documents_give_the_budget_and_the_limits_that_the_mcp_code_has():
+    reserve = f"{CLOSE_RESERVE_SECONDS:g}"
+    first = f"{START_BUDGET_SECONDS - CLOSE_RESERVE_SECONDS:g}"
+    configuration, architecture = _said(CONFIGURATION), _said(ARCHITECTURE)
+    assert f"at most {START_BUDGET_SECONDS:g} seconds in all" in configuration
+    assert f"starts get the first {first} seconds" in configuration
+    assert f"Starts get the first {first}." in architecture
+    assert f"the last {reserve} seconds are for that" in architecture
+    assert f"{START_BUDGET_SECONDS:g}-second budget" in _said(TESTING)
+    assert START_BUDGET_SECONDS == 15.0 and "at most fifteen seconds" in _said(README)
+    assert STDIN_GRACE_SECONDS == TERM_GRACE_SECONDS == 2.0
+    assert "stdin closed, two seconds, SIGTERM, two seconds, SIGKILL" in configuration
+    assert STDERR_LOG_CAP == 1024 * 1024 and "newest megabyte" in configuration
+    for document in (SECURITY, CONFIGURATION):
+        text = _said(document)
+        assert f"{MAX_DESCRIPTION_BYTES:,} bytes" in text, document.name
+        assert f"{MAX_SCHEMA_BYTES // 1024} KiB" in text, document.name
+        assert f"{MAX_SCHEMA_DEPTH} levels" in text, document.name
+        assert f"{MAX_REGISTRY_NAME_CHARS} characters" in text, document.name
+    assert f"{MAX_DESCRIPTION_BYTES:,} bytes" in _said(README)
+    for document in (SECURITY, CONFIGURATION, DESIGN / "0018-mcp-client.md"):
+        said = _said(document)
+        cuts = f"each key is cut at {MAX_ARGUMENT_KEY_CHARS} characters and each value at "
+        assert f"{cuts}{MAX_ARGUMENT_VALUE_CHARS}" in said, document.name
+        assert f"at most {MAX_ARGUMENT_KEYS} keys" in said, document.name
+    assert LOCK_WAIT_SECONDS == 5.0 and MAX_TOOL_WARNINGS_PER_SERVER == 3
+    configuration = _said(CONFIGURATION)
+    assert "up to five seconds, without holding up the others" in configuration
+    assert "More than three warnings about the tools of one server are printed as one line" in (
+        configuration
+    )
+    for document in (CONFIGURATION, ARCHITECTURE):
+        assert f"first {FINGERPRINT_SHOWN} hexadecimal characters" in _said(document)
+
+
+def test_the_documents_say_where_mcp_keeps_its_pins_and_logs():
+    pins = f"~/{CONFIG_DIRNAME}/{PINS_FILENAME}"
+    logs = f"~/{CONFIG_DIRNAME}/{LOG_DIRNAME}/mcp-<name>.log"
+    assert pins in _said(CONFIGURATION) and logs in _said(CONFIGURATION)
+    assert pins in _said(SECURITY) and logs in _said(SECURITY)
+    assert pins in _said(README)
+
+
+def test_the_warning_the_reference_shows_for_a_server_that_failed_is_the_one_ncc_prints():
+    line = failed_line("notes", "<reason>")
+    assert f"`warning: {line}`" in _text(CONFIGURATION)
+    assert "\n" not in line
+
+
+def test_the_reference_names_the_third_rule_a_declined_line_can_carry_and_what_helps():
+    assert "`default.ask`, `rule.ask` or `mcp.changed`" in _said(CONFIGURATION)
+    request = PermissionRequest("mcp__notes__search", "server notes", (), is_write=True)
+    line = declined_line(
+        "mcp__notes__search",
+        request,
+        rule="mcp.changed",
+        root="/p",
+        mode=PermissionMode.DEFAULT,
+    )
+    assert "approve it in an interactive session first" in line
+    assert "no rule helps" in _said(CONFIGURATION)
+
+
+def test_bypass_allows_an_mcp_tool_except_one_whose_definition_changed_and_the_documents_say_so(
+    tmp_path,
+):
+    policy = Policy(
+        sandbox=Sandbox((str(tmp_path),)),
+        rules=RuleSet.build(),
+        mode=PermissionMode.BYPASS,
+        secret_paths=SECRET_PATH_PATTERNS,
+    )
+    plain = PermissionRequest("mcp__notes__search", "server notes", (), is_write=True)
+    assert evaluate(plain, policy).rule == "mode.bypass"
+    asked = evaluate(replace(plain, definition_changed=True), policy)
+    assert (asked.decision, asked.rule) == (Decision.ASK, "mcp.changed")
+    assert "**`bypass` allows an MCP tool, except one whose definition changed**" in _said(SECURITY)
+    assert "`bypass` does" in _said(README)
+
+
+async def test_an_mcp_call_carries_no_path_so_the_sandbox_has_nothing_to_judge_and_security_says_so(
+    tmp_path, ctx
+):
+    server = McpServerConfig(name="notes", command="x")
+    adapted = await adapt_tools(
+        StubClient([tool("search")]),
+        server,
+        PinStore.load(tmp_path / PINS_FILENAME),
+        output_cap=1000,
+    )
+    (search,) = adapted.tools
+    # Arguments that look like a path are not one: nothing here resolves them.
+    request = search.permission_request(ctx, {"path": "/etc/passwd"})
+    assert request.resolved_paths == () and request.danger is None
+    policy = Policy(
+        sandbox=Sandbox((str(tmp_path / "project"),)),
+        rules=RuleSet.build(),
+        mode=PermissionMode.DEFAULT,
+        secret_paths=SECRET_PATH_PATTERNS,
+    )
+    judged = evaluate(request, policy)
+    assert judged.rule == "default.ask", f"the sandbox or the credentials rows judged it: {judged}"
+    sentence = "MCP requests carry no paths, so the sandbox and the secret-path rows do not apply"
+    assert sentence in _said(SECURITY)
+
+
+def test_the_documents_say_exactly_when_a_changed_tool_asks_and_what_refuses_it_first():
+    stale = (
+        "a changed one asks in every mode",
+        "asks before every call in every mode",
+        "asks before every call, in every mode",
+        "a change asks in every mode",
+        "only a `deny` rule beats it",
+        "A `deny` rule still wins.",
+        "in every mode and whatever your `allow` rules and grants say",
+    )
+    for document in (README, SECURITY, CONFIGURATION, ARCHITECTURE, CHANGELOG):
+        said = _said(document)
+        for phrase in stale:
+            assert phrase not in said, f"{document.name} still says {phrase!r}"
+    note = _said(DESIGN / "0018-mcp-client.md")
+    for phrase in stale:
+        assert phrase not in note, f"0018 still says {phrase!r}"
+    for document in (README, SECURITY, CONFIGURATION, ARCHITECTURE, DESIGN / "0018-mcp-client.md"):
+        assert "`plan` mode" in _said(document), f"{document.name} does not say about plan mode"
+    # What the policy does, which is what they now say.
+    changed = PermissionRequest(
+        "mcp__notes__search", "server notes", (), is_write=True, definition_changed=True
+    )
+    for mode, expected in (
+        (PermissionMode.DEFAULT, ("ask", "mcp.changed")),
+        (PermissionMode.ACCEPT_EDITS, ("ask", "mcp.changed")),
+        (PermissionMode.BYPASS, ("ask", "mcp.changed")),
+        (PermissionMode.PLAN, ("deny", "mode.plan-read-only")),
+    ):
+        policy = Policy(
+            Sandbox(("/p",)),
+            RuleSet.build(allow=["mcp__notes__search"]),
+            mode,
+            SECRET_PATH_PATTERNS,
+        )
+        decided = evaluate(changed, policy)
+        assert (str(decided.decision), decided.rule) == expected, mode
+    deny = Policy(
+        Sandbox(("/p",)),
+        RuleSet.build(deny=["mcp__notes__search"]),
+        PermissionMode.BYPASS,
+        SECRET_PATH_PATTERNS,
+    )
+    assert evaluate(changed, deny).rule == "rule.deny"
+
+
+def test_the_documents_say_that_sigterm_and_sighup_end_a_run_as_ctrl_c_does():
+    for document in (SECURITY, CONFIGURATION, ARCHITECTURE, DESIGN / "0018-mcp-client.md"):
+        said = _said(document)
+        assert "SIGTERM" in said and "SIGHUP" in said, document.name
+    assert (EXIT_CODES["hangup"], EXIT_CODES["terminated"]) == (129, 143)
+    for code in ("`129`", "`143`"):
+        assert any(row[0] == code for row in _table_rows(_text(CONFIGURATION))), code
+
+
+def test_the_scope_note_has_built_the_mcp_client_and_lists_what_of_it_is_not():
+    note = _text(DESIGN / "0001-scope.md").split("## Why")[0]
+    items = [line for line in note.splitlines() if line.startswith("- ")]
+    assert not [item for item in items if item.startswith("- **MCP client")], (
+        "the scope note still lists the MCP client as not built"
+    )
+    (rest,) = [item for item in items if item.startswith("- **The rest of MCP")]
+    for word in ("HTTP", "resources", "prompts", "sampling", "elicitation"):
+        assert word in rest, f"the scope note's MCP item does not say that {word} is not built"
+    assert "mcp" in COMMANDS
+    assert "`/mcp`" not in _text(DESIGN / "0001-scope.md"), (
+        "the scope note still says /mcp is absent"
+    )
+
+
+def test_the_mcp_note_records_what_was_left_out():
+    text = _said(DESIGN / "0018-mcp-client.md")
+    for left_out in (
+        "HTTP",
+        "Streamable HTTP",
+        "Resources, prompts, sampling, elicitation",
+        "`list_changed`",
+        "is not an MCP server",
+    ):
+        assert left_out in text, f"0018 does not say that {left_out} was left out"
+    assert "the fifteen seconds include the time to end a server" in text.lower()
+
+
+def test_the_architecture_document_names_every_module_of_the_mcp_package():
+    section = _section(_text(ARCHITECTURE), "MCP servers")
+    modules = sorted(path.name for path in (SRC / "mcp").glob("*.py") if path.stem != "__init__")
+    assert len(modules) >= 7, f"found only {modules}, so the listing of the package is wrong"
+    missing = [module for module in modules if f"`mcp/{module}`" not in section]
+    assert missing == [], f"the architecture document does not name {missing}"
+
+
+def test_the_commands_module_no_longer_says_that_mcp_is_absent():
+    import nanoclaude.cli.commands as commands
+
+    assert "mcp" in COMMANDS
+    assert "``/mcp``" not in (commands.__doc__ or ""), (
+        "the commands' docstring still calls /mcp a command that is absent"
+    )
 
 
 # --------------------------------------------------------------------------

@@ -21,6 +21,7 @@ from nanoclaude.agent.session import Session, new_session_id
 from nanoclaude.agent.ui import UI, AutoApprove
 from nanoclaude.config.schema import Config, LimitsConfig, ModelConfig, RolesConfig
 from nanoclaude.conversation.store import Store
+from nanoclaude.mcp.servers import McpServers
 from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import PermissionMode, Policy
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS
@@ -119,6 +120,7 @@ def build_session(
     home: Path | None = None,
     session_id: str | None = None,
     resume: bool = False,
+    mcp: McpServers | None = None,
 ) -> ScriptedSession:
     """A session in ``root`` whose model replies from ``script``, in order.
 
@@ -151,6 +153,9 @@ def build_session(
     The store is the file ``root`` always gets, so a second session built in the
     same ``root`` sees the first one's rows. ``session_id`` with ``resume=True``
     makes it the continuation of that stored session.
+
+    ``mcp`` is the servers a session has started (:func:`~nanoclaude.mcp.servers.start_servers`):
+    their tools are registered beside the built-in ones, and the session closes them.
     """
     state_dir = root / ".nanoclaude"
     model_id = model or (SCRIPTED_MODEL if capabilities is not None else DEFAULT_MODEL)
@@ -201,7 +206,7 @@ def build_session(
         root=str(root),
         config=config,
         router=Router(config, cache, clients),
-        registry=default_registry(todo),
+        registry=default_registry(todo, mcp.tools if mcp is not None else ()),
         policy=Policy(
             sandbox=Sandbox((str(root),)),
             rules=RuleSet.build(
@@ -220,6 +225,7 @@ def build_session(
         todo_state=todo,
         retry=retry or RetryPolicy(base_delay_s=0.0, max_delay_s=0.0),
         home=str(home if home is not None else state_dir / "home"),
+        mcp=mcp,
         model=main_client,
         compact_model=compact_client,
         explore_model=explore_client,

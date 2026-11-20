@@ -134,18 +134,83 @@ path rule and the scan off together and prints a warning.
 provider's error, a path) can contain escape sequences that retitle a window, clear the
 screen or rewrite a line, and so change what you think you are approving. Tool results, error
 text and exported files have terminal control sequences removed. In a confirmation, the path
-or command is shown as it is with each control character spelled out by name, and so is the
+or command is shown as it is with each control character, each invisible formatting character
+and each line or paragraph separator (U+2028, U+2029) spelled out by name, and so is the
 subject of a call `ncc -p` reports as declined.
 
-**7. A malicious MCP server or plugin.** Not applicable yet: v0.1 has no MCP client, plugin
-loader or `WebFetch`. They are planned, and each is a trust boundary to be designed and
-tested as a whole before it ships (see [the scope note](docs/design/0001-scope.md)).
+**7. A malicious MCP server or plugin.** v0.1 has no plugin loader and no `WebFetch`; they are
+planned, and each is a trust boundary to be designed and tested as a whole before it ships (see
+[the scope note](docs/design/0001-scope.md)). It does have an MCP client, for servers that `ncc`
+starts itself and speaks to over stdio, and a server is a program that runs as you. What the
+model reads from one is text somebody else wrote, and what is done about it is below. The
+reasons, and what was left out, are in [0018](docs/design/0018-mcp-client.md).
+
+- **Descriptions are an injection surface.** The description and the input schema of a tool are
+  read by the model at every request, so a server can use them to give the model instructions
+  that you never see. Each is held to limits before the tool is registered, and a tool that
+  fails any of them is dropped with a warning: terminal controls and escape sequences are
+  removed from the description and from every string in the schema, the description is cut at
+  2,048 bytes, the schema must be an object, at most 64 KiB and 32 levels deep, with no `$ref`
+  that leaves the schema, and a name is made of letters, digits and underscores, namespaced as
+  `mcp__<server>__<tool>`, at most 64 characters, and dropped from both tools when two come to
+  one. What a description that passes says is not defended against: 2,048 bytes are enough to
+  tell a model to do something, and the model reads them. What stands between that and an action
+  is that a tool asks before it runs, unless you wrote an `allow` rule for it. The confirmation
+  lists the keys of the arguments, one to a line, so that nothing the model writes before the
+  arguments that matter can push them out of sight: each key is cut at 60 characters and each
+  value at 200, with a count of the characters that were cut; a nested value is given as its kind
+  and size and then the start of its JSON; every control character, and the line and paragraph
+  separators, is spelled out by name and never reaches the terminal; at most 20 keys are listed,
+  and if there are more, the line after them says how many are not shown and "always" is not
+  offered for that call. What is cut, or nested too deeply to walk, is not shown, and what you
+  approve is what you saw.
+- **A definition cannot change under you.** A fingerprint of each tool's description and schema
+  is written down when it is first seen, in `~/.nanoclaude/mcp-pins.json`. A tool whose
+  fingerprint at a later start is not its pin is changed for that session, and a changed tool
+  asks before every call in `default`, `accept-edits` and `bypass` mode, your `allow` rules and
+  session grants included. Two things come before that and refuse the call: `plan` mode, which
+  refuses every MCP tool as a write, and a `deny` rule of yours. Under `-p`, where nobody can
+  answer, a changed tool is declined. Answering "always" approves the new definition for the next session. A server's
+  `list_changed` notification is ignored and its tool list is read once, so a description cannot
+  change in the middle of a session either. A pin is trust on first sight: it does not help
+  against a server that was hostile the first time you saw its tool. If the pins file cannot be
+  read, no server is started and none of their tools is registered; the warning says why, and
+  deleting the file forgets every pin.
+- **Results are data.** What a tool returns is turned into text (an image or a resource becomes
+  a line that says what was left out), has terminal controls removed and credentials scrubbed,
+  is cut to `output_cap_bytes`, and is wrapped in `<mcp-result server=".." tool="..">` with each
+  `</mcp-result` inside it written `<\/mcp-result`, so that it cannot end the wrapper and
+  speak as if it were outside. The system prompt says that these results are third-party data and
+  not instructions, in a sentence that is there only when a tool of a server is registered.
+  That is advice to the model and is no more reliable than any advice to it.
+- **Permissions.** A tool of a server is not read-only, so it asks by default; `accept-edits`
+  does not allow it. **`bypass` allows an MCP tool, except one whose definition changed**, since
+  bypass skips questions and not the hard denials, and a changed definition is the one thing
+  that asks regardless. A rule names a tool by its full registry name; a wildcard is refused
+  when the file loads. A project's configuration cannot define a server at all.
+- **MCP requests carry no paths, so the sandbox and the secret-path rows do not apply to
+  them.** The policy judges a call by what it touches, and a call to a tool of a server has no
+  file and no command for it to look at: it sees the tool, its server, and your rules. A server
+  can read and write whatever your account can, a credentials file included, and the sandbox, the
+  protected paths and the credentials list will not stop it. What it sends back is scrubbed, and
+  what it was asked is shown to you, and that is where this ends. To forbid a tool, `deny` it by
+  name; to keep a server away from your files, do not run it on a machine that has them.
+- **What a server is given.** It is started directly, never through a shell, in the project
+  directory, as the leader of a process group of its own. Its environment is `PATH`, `HOME`,
+  `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR` and `TERM` from `ncc`'s own, and the
+  `env` you wrote for it, and nothing else, so no provider key reaches it unless you put one
+  there. Its stderr is kept in `~/.nanoclaude/logs/mcp-<name>.log`, readable by you alone and
+  never shown to the model. When the session ends, on Ctrl+C, on SIGTERM or SIGHUP and on an
+  error alike, it is closed, then sent SIGTERM and then SIGKILL, with everything it started, and a start that does
+  not finish within fifteen seconds is ended the same way.
 
 **8. What this project does not defend against.** A compromised host; another process on the
 machine that races the agent, since a path is judged when a call is decided and resolved again
 when the tool runs; a user who has passed `--dangerously-skip-permissions` and asked for
-exactly this, which still keeps the hard denials but asks about nothing; and, once `Bash`
-exists, a model that escapes it to the kernel level. The sandbox is a path-and-command
+exactly this, which still keeps the hard denials and asks about nothing but a changed MCP
+tool; an MCP server you
+configured, which is a program that runs as you; and, once `Bash` exists, a model that escapes
+it to the kernel level. The sandbox is a path-and-command
 boundary enforced in Python, not an operating-system boundary: it assumes the host it runs on
 and the programs it starts are themselves trustworthy. The sandbox compares a path with its
 roots case-sensitively, so on a case-insensitive file system a differently-cased spelling of a
@@ -178,10 +243,18 @@ your shell profile is as safe as that file.
   its write-ahead files, the history and the capability cache readable by you alone, and
   narrows them if an earlier version left them open. `ncc init` creates the `config.toml` it
   writes private too. An existing `config.toml`, whoever wrote it, is never narrowed. It holds
-  no key (a model entry names the environment variable that holds its key, and an `api_key` in
-  a file is refused), so one left open to other users shows them your settings and no key. A
-  `base_url` is checked only for starting with `http://` or `https://`, so a credential put
-  in one would be shown as well.
+  no model key (a model entry names the environment variable that holds its key, and an
+  `api_key` in a file is refused), so one left open to other users shows them your settings. The
+  one credential it can hold is in the `env` of an MCP server, which is plain text because that
+  is how a stdio server is given one: a file that has such a value should be made readable by
+  you alone. A `base_url` is checked only for starting with `http://` or `https://`, so a
+  credential put in one would be shown as well. The pins file, its lock and the log of each
+  MCP server are created private as well.
+- **A server is not contained.** A server you configure runs as you, started in the project
+  directory with a narrow environment and nothing else around it: no sandbox, and no limit on
+  the files it opens or the network it reaches. The controls are the ones above (asking before
+  a call, the pins, the wrapper), and they are about what reaches the model and the screen and
+  not about what the program does. A server that is malicious from its first start is not caught by a pin.
 - **A rule's glob and the leading slash.** A rule's glob is also matched against the absolute
   path without its leading slash, so a rule written for a directory of the project can match
   a directory at the top of the file system: `Read(private/**)` also refuses files under

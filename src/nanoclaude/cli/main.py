@@ -36,9 +36,10 @@ import json
 import os
 import re
 import shlex
+import signal
 import sqlite3
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, NoReturn, assert_never
@@ -64,6 +65,7 @@ from nanoclaude.config.load import CONFIG_DIRNAME, ConfigError, expand_root, loa
 from nanoclaude.config.schema import ROLES
 from nanoclaude.conversation.budget import ContextTooSmallError
 from nanoclaude.conversation.store import Store, same_directory
+from nanoclaude.mcp.servers import McpServers, start_servers
 from nanoclaude.permissions.audit import AuditLog
 from nanoclaude.permissions.policy import PermissionMode, Policy
 from nanoclaude.permissions.redact import SECRET_PATH_PATTERNS, Redactor
@@ -86,6 +88,10 @@ EXIT_CODES = {
     # Not a failure: whoever reads the output closed it before the end (``| head -1``). The
     # shell's own number for a process killed by SIGPIPE, which is what this stands for.
     "output_closed": 141,
+    # Stopped by a signal that asks a process to end, after the servers it started were ended:
+    # the shell's own numbers for a process that SIGHUP (the terminal closed) or SIGTERM killed.
+    "hangup": 129,
+    "terminated": 143,
 }
 
 #: Where a provider error that does not say what to do is sent.
@@ -111,6 +117,61 @@ def nanoclaude_home() -> Path:
             f"NANOCLAUDE_HOME is {given!r}, which starts with ~ but names no home directory "
             "\u2014 write the full path, or unset it"
         ) from exc
+
+
+class _Terminated(BaseException):
+    """SIGTERM or SIGHUP stopped the run, as Ctrl+C does, and the cleanup has been done.
+
+    Not an ``Exception``, so that nothing between the signal and ``main`` catches it as a
+    failure of the run it ended.
+    """
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+#: The signals that ask a process to end, which a run answers as it answers Ctrl+C: the session
+#: is closed, and with it every MCP server, before the process goes. Without this they end
+#: ``ncc`` where it stands, and a server that ignores the end of its stdin is left running.
+_ENDING_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+
+@contextlib.asynccontextmanager
+async def _ended_by_signals() -> AsyncIterator[None]:
+    """For the body of a run: SIGTERM and SIGHUP cancel it, and it ends as :class:`_Terminated`.
+
+    The cancellation goes through the body's own cleanup first (``session.aclose()`` is in a
+    ``finally``). A signal that the process was started ignoring (``nohup`` ignores SIGHUP) is
+    left ignored, since taking it over would end what the person asked to keep running.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    received: list[int] = []
+
+    def stop(signum: int) -> None:
+        received.append(signum)
+        if task is not None:
+            task.cancel()
+
+    installed: list[signal.Signals] = []
+    for ending in _ENDING_SIGNALS:
+        if signal.getsignal(ending) == signal.SIG_IGN:
+            continue
+        try:
+            loop.add_signal_handler(ending, stop, ending)
+        except (NotImplementedError, RuntimeError, ValueError):  # no loop handlers here
+            continue
+        installed.append(ending)
+    try:
+        yield
+    except asyncio.CancelledError:
+        if received:
+            raise _Terminated(received[0]) from None
+        raise
+    finally:
+        for ending in installed:
+            loop.remove_signal_handler(ending)
 
 
 class UsageError(Exception):
@@ -441,6 +502,8 @@ def main(argv: list[str] | None = None) -> int:
     except BrokenPipeError:
         _abandon_stdout()
         return EXIT_CODES["output_closed"]
+    except _Terminated as ended:
+        return _end_with(ended, err, as_json=as_json, session=run.session)
     except (Exception, KeyboardInterrupt) as exc:
         return _end_with(exc, err, as_json=as_json, session=run.session)
 
@@ -461,6 +524,10 @@ def _failure(exc: BaseException) -> tuple[str, int]:
         return str(exc), EXIT_CODES["stopped"]
     if isinstance(exc, ModelError):
         return _with_advice(str(exc), _PROVIDER_ADVICE), EXIT_CODES["provider"]
+    if isinstance(exc, _Terminated):
+        name = signal.Signals(exc.signum).name
+        code = EXIT_CODES["hangup" if exc.signum == signal.SIGHUP else "terminated"]
+        return f"ended by {name} \u2014 nothing more was done; run again to retry", code
     if isinstance(exc, KeyboardInterrupt):
         # Ctrl+C has no words of its own; one that came with a message (ncc init, interrupted
         # after it wrote the config) has, and a person who is told nothing more was done when
@@ -635,8 +702,9 @@ def _warn_about_switches(args: argparse.Namespace, err: Console) -> None:
     if args.dangerously_skip_permissions:
         _warn(
             err,
-            "permission prompts are off — tool calls run without asking. The sandbox, "
-            "credentials files, dangerous commands and your deny rules are still enforced",
+            "permission prompts are off — tool calls run without asking, except a call to an "
+            "MCP tool whose definition has changed. The sandbox, credentials files, dangerous "
+            "commands and your deny rules are still enforced",
         )
     if args.allow_secrets:
         _warn(
@@ -750,13 +818,21 @@ def _abandon_stdout() -> None:
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
-def _build_session(
+async def _build_session(
     args: argparse.Namespace,
     settings: _Settings,
     home: Path,
     console: Console | None,
     err: Console,
 ) -> Session:
+    """The session the flags and the configuration ask for, with its MCP servers started.
+
+    The servers are started last, once nothing else can refuse the session: they take up to
+    fifteen seconds, and a session that cannot run for want of a key is better told so at once.
+    A server that fails is one warning on ``err`` and the session goes on without its tools.
+    Whatever fails after they are started ends them again, with the store, since no session
+    exists to do it.
+    """
     config = load_config(home=str(home), project=settings.root, env=dict(os.environ))
     if args.model is not None:
         config = replace(config, roles=replace(config.roles, main=args.model))
@@ -778,6 +854,7 @@ def _build_session(
     )
     state_dir = home / CONFIG_DIRNAME
     store = Store(state_dir / "sessions.db")
+    servers: McpServers | None = None
     try:
         _open(store)
         # The store has narrowed the directory and its own files. The capability cache is
@@ -786,15 +863,21 @@ def _build_session(
         narrow_file(state_dir / CACHE_FILENAME)
         session_id, resume = _which_session(args, store, settings.root)
         router = Router(config, CapabilityCache(state_dir / CACHE_FILENAME))
+        # The session checks this first thing, before it writes a row. Here it is checked
+        # before a server is started that would only be ended again.
+        router.check_credentials()
         todo = TodoState()
         # One redactor for what the tools return and for what the audit records: with
         # --allow-secrets a credentials file is read, and the redactor must let it through.
         redactor = Redactor(enabled=not args.allow_secrets)
+        servers = await start_servers(config, root=settings.root, home=home)
+        for line in servers.warnings:
+            _warn(err, line)
         return Session(
             root=settings.root,
             config=config,
             router=router,
-            registry=default_registry(todo),
+            registry=default_registry(todo, servers.tools),
             policy=policy,
             ui=_ui(console, err, settings, router),
             store=store,
@@ -804,10 +887,13 @@ def _build_session(
             todo_state=todo,
             redactor=redactor,
             home=str(home),
+            mcp=servers,
         )
     except BaseException:
-        # No session exists to close the store, and nobody else has it.
+        # No session exists to close the store or the servers, and nobody else has them.
         store.close()
+        if servers is not None:
+            await servers.aclose()
         raise
 
 
@@ -877,45 +963,50 @@ def _which_session(args: argparse.Namespace, store: Store, root: str) -> tuple[s
 async def _run_interactive(
     args: argparse.Namespace, settings: _Settings, home: Path, console: Console
 ) -> int:
-    session = _build_session(args, settings, home, console, _stderr_console(args.no_color))
-    try:
-        return await run_repl(session, console, str(home / CONFIG_DIRNAME / "history"))
-    finally:
-        await session.aclose()
+    async with _ended_by_signals():
+        session = await _build_session(
+            args, settings, home, console, _stderr_console(args.no_color)
+        )
+        try:
+            return await run_repl(session, console, str(home / CONFIG_DIRNAME / "history"))
+        finally:
+            await session.aclose()
 
 
 async def _run_headless(
     args: argparse.Namespace, settings: _Settings, home: Path, err: Console, run: _Run
 ) -> _Outcome:
-    session = _build_session(args, settings, home, None, err)
-    # Kept where main can see it: a run that fails still has what it spent to report.
-    run.session = session
-    try:
+    async with _ended_by_signals():
+        session = await _build_session(args, settings, home, None, err)
+        # Kept where main can see it: a run that fails still has what it spent to report.
+        run.session = session
         try:
-            done = await session.follow_up(args.prompt)
-        except ModelError as exc:
-            cause = exc.__cause__
-            if not (isinstance(cause, ModelError) and cause.partial is not None):
-                raise
-            # The stream broke midway. What arrived is kept by the session when there was any,
-            # and the advice it gives is for somebody at a prompt: a script is told how to go on.
-            kept = session.cut_off_text
-            line = _cut_off_line(exc, kept is not None)
-            if kept is None:
-                raise ModelError(line) from exc
-            # That text is the result there is, and the run still failed.
-            code = EXIT_CODES["provider"]
-            return _Outcome(
-                payload=_payload(
-                    session, kept, "cut_off", session.state.turn, error=line, code=code
-                ),
-                text=kept,
-                error=line,
-                code=code,
-            )
-        return _finished(session, done)
-    finally:
-        await session.aclose()
+            try:
+                done = await session.follow_up(args.prompt)
+            except ModelError as exc:
+                cause = exc.__cause__
+                if not (isinstance(cause, ModelError) and cause.partial is not None):
+                    raise
+                # The stream broke midway. What arrived is kept by the session when there was
+                # any, and the advice it gives is for somebody at a prompt: a script is told how
+                # to go on.
+                kept = session.cut_off_text
+                line = _cut_off_line(exc, kept is not None)
+                if kept is None:
+                    raise ModelError(line) from exc
+                # That text is the result there is, and the run still failed.
+                code = EXIT_CODES["provider"]
+                return _Outcome(
+                    payload=_payload(
+                        session, kept, "cut_off", session.state.turn, error=line, code=code
+                    ),
+                    text=kept,
+                    error=line,
+                    code=code,
+                )
+            return _finished(session, done)
+        finally:
+            await session.aclose()
 
 
 def _cut_off_line(error: ModelError, kept: bool) -> str:

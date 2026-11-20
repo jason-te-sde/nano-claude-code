@@ -15,9 +15,10 @@ reads and answers one message at a time, which is what makes a mode like ``slow`
 answers a call, keeps reading) and ``call_delay`` (answers late) possible to state.
 
 What the tests learn from it, they learn from stderr, which the client's transport appends to
-a log file: every message the server receives is written there as ``RECV <json>``, and the
-moments the lifecycle tests care about as ``EVENT <name> <time>``. A test closes the client
-first and reads the log after, when the transport has drained it.
+a log file: every message the server receives is written there as ``RECV <json>``, the moments
+the lifecycle tests care about as ``EVENT <name> <time>``, and its own process id as
+``PID <n>``. A test closes the client first and reads the log after, when the transport has
+drained it.
 """
 
 from __future__ import annotations
@@ -154,6 +155,11 @@ MODES: dict[str, Config] = {
     "dual": {**_MODERN, "initialize": "ok"},
     "unsupported-version": {"supported": ["2099-01-01"]},
     "silent-discover": {**_LEGACY, "discover": "silent"},
+    # Reads everything and answers nothing, `server/discover` and `initialize` included.
+    "never-answers": {"discover": "silent", "initialize": "silent"},
+    # The same, and it ignores the end of stdin and SIGTERM, with a helper that does too: only
+    # the last step of ending a server ends this one.
+    "never-answers-stubborn": {"discover": "silent", "initialize": "silent", **_STUBBORN},
     "slow": {**_MODERN, "call": "never"},
     "request-flood": {**_MODERN, "call": "flood"},
     "crash": {**_MODERN, "exit_after_handshake": True},
@@ -367,6 +373,9 @@ class Server:
 
     def start(self) -> None:
         settings = self.settings
+        # Its own id, which is also its process group's: the tests that must show that nothing
+        # of a server is left running read it from the log.
+        log("PID", os.getpid())
         if settings["exit_on_start"]:
             log("EVENT", "exiting-on-start")
             raise SystemExit(3)
