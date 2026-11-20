@@ -20,21 +20,26 @@ the `Bash` and `Git` tools, and the syntax-tree danger classifier with its corpu
 - An MCP client, for servers that `ncc` starts and talks to over stdio, and the `/mcp` command. A
   server is a `[mcp.<name>]` table in your own configuration file, with `command`, `args`, `env`,
   `enabled` and `timeout`; a project's file is refused for one. The servers of a session are
-  started together, `ncc` waits for them at most 15 seconds with the time to end a server that
-  did not make it included, and one that fails is a warning line and no tools. Every server is
-  closed when the session ends, on Ctrl+C and on an error, and a sub-agent is never given one of
-  their tools. The client speaks MCP 2026-07-28 and falls back to 2025-11-25, 2025-06-18 and
-  2025-03-26. A tool is registered as `mcp__<server>__<tool>` after its name, its description
-  (controls removed, cut at 2,048 bytes) and its input schema (an object, at most 64 KiB and 32
-  levels, no `$ref` that leaves it) have passed limits, and a name two servers come to is dropped
-  from both. A tool asks by default, a rule names it in full and a wildcard is refused. The
-  definition of each tool is pinned in `~/.nanoclaude/mcp-pins.json`, and a new rule id,
-  `mcp.changed`, asks about a changed one in every mode, `bypass` included, and under `-p` is
-  declined. A result is wrapped in `<mcp-result>` tags it cannot close, cleaned, scrubbed and cut
-  to `output_cap_bytes`, the system prompt says in one sentence that such results are data and
-  not instructions, and the confirmation of a call shows its arguments. HTTP transports,
-  resources, prompts, sampling, elicitation and a tool list that changes during a session are not
-  built, and `docs/design/0018-mcp-client.md` says why.
+  started together, `ncc` waits for them at most 15 seconds with the time to end a server that did
+  not make it included, and one that fails is a warning line and no tools. Every server is closed
+  when the session ends, on Ctrl+C, on SIGTERM and SIGHUP (exit codes 143 and 129) and on an
+  error, and a sub-agent is never given one of their tools. The client speaks MCP 2026-07-28 and
+  falls back to 2025-11-25, 2025-06-18 and 2025-03-26. A tool is registered as
+  `mcp__<server>__<tool>` after its name, its description (controls removed, cut at 2,048 bytes)
+  and its input schema (an object, at most 64 KiB and 32 levels, no `$ref` that leaves it) have
+  passed limits, and a name two servers come to is dropped from both. A tool asks by default, a
+  rule names it in full and a wildcard is refused. The definition of each tool is pinned in
+  `~/.nanoclaude/mcp-pins.json`, and a new rule id, `mcp.changed`, asks about a changed one,
+  `bypass` included (`plan` mode and a `deny` rule refuse it first), and under `-p` is declined. A
+  result is wrapped in `<mcp-result>` tags it cannot close, cleaned, scrubbed and cut to
+  `output_cap_bytes`, the system prompt says in one sentence that such results are data and not
+  instructions, and the confirmation of a call lists its arguments key by key, each cut to a
+  bounded length with a count, and does not offer "always" when some are not shown. A pins file
+  that the JSON parser cannot walk fails the servers closed like any other unreadable one, waiting
+  for the pins lock held by another `ncc` does not stop the other servers starting, and more than
+  three warnings about one server's tools are one line with a count. HTTP transports, resources,
+  prompts, sampling, elicitation and a tool list that changes during a session are not built, and
+  `docs/design/0018-mcp-client.md` says why.
 - The `Task` tool and one built-in sub-agent, `explore`, so that the `explore` role is sent
   requests. The sub-agent is a session nested in the caller's, with `Read`, `Glob` and `Grep`
   only, the caller's sandbox, mode, rules and session grants, and no way to ask the person

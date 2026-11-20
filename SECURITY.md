@@ -134,7 +134,8 @@ path rule and the scan off together and prints a warning.
 provider's error, a path) can contain escape sequences that retitle a window, clear the
 screen or rewrite a line, and so change what you think you are approving. Tool results, error
 text and exported files have terminal control sequences removed. In a confirmation, the path
-or command is shown as it is with each control character spelled out by name, and so is the
+or command is shown as it is with each control character, each invisible formatting character
+and each line or paragraph separator (U+2028, U+2029) spelled out by name, and so is the
 subject of a call `ncc -p` reports as declined.
 
 **7. A malicious MCP server or plugin.** v0.1 has no plugin loader and no `WebFetch`; they are
@@ -154,14 +155,22 @@ reasons, and what was left out, are in [0018](docs/design/0018-mcp-client.md).
   `mcp__<server>__<tool>`, at most 64 characters, and dropped from both tools when two come to
   one. What a description that passes says is not defended against: 2,048 bytes are enough to
   tell a model to do something, and the model reads them. What stands between that and an action
-  is that a tool asks before it runs, with the arguments the model wrote shown to you, unless
-  you wrote an `allow` rule for it.
+  is that a tool asks before it runs, unless you wrote an `allow` rule for it. The confirmation
+  lists the keys of the arguments, one to a line, so that nothing the model writes before the
+  arguments that matter can push them out of sight: each key is cut at 60 characters and each
+  value at 200, with a count of the characters that were cut; a nested value is given as its kind
+  and size and then the start of its JSON; every control character, and the line and paragraph
+  separators, is spelled out by name and never reaches the terminal; at most 20 keys are listed,
+  and if there are more, the line after them says how many are not shown and "always" is not
+  offered for that call. What is cut, or nested too deeply to walk, is not shown, and what you
+  approve is what you saw.
 - **A definition cannot change under you.** A fingerprint of each tool's description and schema
   is written down when it is first seen, in `~/.nanoclaude/mcp-pins.json`. A tool whose
   fingerprint at a later start is not its pin is changed for that session, and a changed tool
-  asks before every call in every mode, `bypass` and your `allow` rules and session grants
-  included; only a `deny` rule beats it, and under `-p`, where nobody can answer, it is
-  declined. Answering "always" approves the new definition for the next session. A server's
+  asks before every call in `default`, `accept-edits` and `bypass` mode, your `allow` rules and
+  session grants included. Two things come before that and refuse the call: `plan` mode, which
+  refuses every MCP tool as a write, and a `deny` rule of yours. Under `-p`, where nobody can
+  answer, a changed tool is declined. Answering "always" approves the new definition for the next session. A server's
   `list_changed` notification is ignored and its tool list is read once, so a description cannot
   change in the middle of a session either. A pin is trust on first sight: it does not help
   against a server that was hostile the first time you saw its tool. If the pins file cannot be
@@ -191,8 +200,8 @@ reasons, and what was left out, are in [0018](docs/design/0018-mcp-client.md).
   `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR` and `TERM` from `ncc`'s own, and the
   `env` you wrote for it, and nothing else, so no provider key reaches it unless you put one
   there. Its stderr is kept in `~/.nanoclaude/logs/mcp-<name>.log`, readable by you alone and
-  never shown to the model. When the session ends, on Ctrl+C and on an error alike, it is
-  closed, then sent SIGTERM and then SIGKILL, with everything it started, and a start that does
+  never shown to the model. When the session ends, on Ctrl+C, on SIGTERM or SIGHUP and on an
+  error alike, it is closed, then sent SIGTERM and then SIGKILL, with everything it started, and a start that does
   not finish within fifteen seconds is ended the same way.
 
 **8. What this project does not defend against.** A compromised host; another process on the

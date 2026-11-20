@@ -86,7 +86,7 @@ Each is a program that is started directly, not through a shell, in the project 
 
 A tool of a server asks before it runs, whatever it says it does: it is somebody else's code, and nothing says it only reads. `accept-edits` does not allow it, `bypass` does, and `allow = ["mcp__notes__search"]` in your own file does for the one tool it names in full; a wildcard is refused, since it would also allow what a later version of the server adds. Under `-p` a tool that nothing allows is declined, like any other. The model is told that the results of these tools are data and not instructions, and each result is wrapped in `<mcp-result>` tags that nothing inside it can close, stripped of terminal controls, scrubbed of credentials and cut to `output_cap_bytes`.
 
-The description a server gives a tool is read by the model, so it is an injection surface, and it is treated as one. It has its terminal controls removed and is cut at 2,048 bytes, the input schema must be an object within limits that refers to nothing outside itself, and the name is made safe and namespaced. What each tool looked like when you first saw it is written down in `~/.nanoclaude/mcp-pins.json`, as a fingerprint. A tool whose description or schema is different at a later start is marked changed, and a changed tool asks before every call, in every mode, `bypass` and your `allow` rules included. Answering "always" to it approves the new definition for the next session and not for this one, and under `-p` a changed tool is declined, whatever your rules say. A pin does not help against a server that was hostile the first time it was seen. A call to a server carries no path and no command, so the sandbox and the credentials rules do not apply to it, and the server can do what your account can do. [`SECURITY.md`](SECURITY.md) has the rest, and [0018](docs/design/0018-mcp-client.md) has the reasons and what was left out.
+The description a server gives a tool is read by the model, so it is an injection surface, and it is treated as one. It has its terminal controls removed and is cut at 2,048 bytes, the input schema must be an object within limits that refers to nothing outside itself, and the name is made safe and namespaced. What each tool looked like when you first saw it is written down in `~/.nanoclaude/mcp-pins.json`, as a fingerprint. A tool whose description or schema is different at a later start is marked changed, and a changed tool asks before every call, `bypass` and your `allow` rules included (`plan` mode refuses every MCP tool, and a `deny` rule of yours refuses it, before that is asked). Answering "always" to it approves the new definition for the next session and not for this one, and under `-p` a changed tool is declined, whatever your rules say. A pin does not help against a server that was hostile the first time it was seen. A call to a server carries no path and no command, so the sandbox and the credentials rules do not apply to it, and the server can do what your account can do. [`SECURITY.md`](SECURITY.md) has the rest, and [0018](docs/design/0018-mcp-client.md) has the reasons and what was left out.
 
 ## Safety
 
@@ -110,7 +110,7 @@ With `-p` nothing can answer a question, so every call that would have asked is 
 | `Task` | no, it asks first; the sub-agent it starts can only read |
 | `Edit` | no, it shows a diff first |
 | `Write` | no |
-| A tool of an MCP server | no, it asks first, and a changed one asks in every mode |
+| A tool of an MCP server | no, it asks first, and a changed one asks in `bypass` too; `plan` mode refuses it |
 
 A `Task` call starts a sub-agent in a session of its own, and the question you are asked is whether to spend the requests. The sub-agent has `Read`, `Glob` and `Grep` and no other tool, works in your sandbox and your permission mode with every `deny` rule of yours in force, holds the grants you have already given and cannot add one, and cannot ask you anything: a call that would have asked is declined. It is stopped after 30 model calls, an estimated 200,000 input tokens or ten minutes, whichever comes first, and what it returns is one message, cut to `output_cap_bytes`: a model's account of files, as untrusted as the files are. `allow = ["Task"]` in your own file lets it run without asking.
 
@@ -127,7 +127,7 @@ A `Task` call starts a sub-agent in a session of its own, and the question you a
 | A record of every call, written before the call runs, in `~/.nanoclaude/sessions.db`; rows are only added, and an outcome is set once | Built; nothing reads it back yet |
 | What `ncc` creates under `~/.nanoclaude` is readable by you alone, and `ncc` run in `/` or in a home directory is refused unless `--root` says it was meant | Built |
 | Classifying a shell command as dangerous | **Not measured yet.** The regex classifier is written and has eight known blind spots, of which a test shows four getting through and four have no test, and there is no corpus of dangerous commands to say how many it misses (`tests/corpus/dangerous.jsonl` does not exist), so there is no figure. The syntax-tree classifier, meant to be the authority and to be installed as an optional extra, is not built, and nothing calls either until `Bash` exists. A command the regex classifier finds nothing in is not treated as cleared. |
-| MCP servers: a tool asks by default and is named exactly in a rule, its name, description and schema are held to limits, its definition is pinned and a change asks in every mode, and its results are wrapped, scrubbed and capped | Built, with the limits in [`SECURITY.md`](SECURITY.md): a server is not inside the sandbox |
+| MCP servers: a tool asks by default and is named exactly in a rule, its name, description and schema are held to limits, its definition is pinned and a change asks, `bypass` included, and its results are wrapped, scrubbed and capped | Built, with the limits in [`SECURITY.md`](SECURITY.md): a server is not inside the sandbox |
 | Undoing an edit | Not built. A write is confirmed first, and `git` is how you undo one. |
 
 ## Configuration
@@ -168,10 +168,10 @@ Each figure is produced by `python scripts/measure.py`, which also writes `metri
 
 | Figure | Key | Value | Produced by |
 | --- | --- | --- | --- |
-| Tests collected by pytest | `tests` | 4,917 | `python scripts/measure.py` |
+| Tests collected by pytest | `tests` | 4,955 | `python scripts/measure.py` |
 | Share of `nanoclaude` the tests run | `coverage_percent` | 99.9% | `python scripts/measure.py` |
-| Lines of Python in `src/` | `lines.src` | 17,036 | `python scripts/measure.py` |
-| Lines of Python in `tests/` | `lines.tests` | 47,785 | `python scripts/measure.py` |
+| Lines of Python in `src/` | `lines.src` | 17,311 | `python scripts/measure.py` |
+| Lines of Python in `tests/` | `lines.tests` | 48,420 | `python scripts/measure.py` |
 | Tools in the default registry | `tools` | 7 | `python scripts/measure.py` |
 | Adapters the configuration accepts | `adapters` | 3 | `python scripts/measure.py` |
 | Dangerous commands the regex classifier misses | `danger_corpus` | not measured yet | `python scripts/measure.py` |

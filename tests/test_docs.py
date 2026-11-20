@@ -28,7 +28,12 @@ from nanoclaude.cli.commands import COMMANDS, FINGERPRINT_SHOWN
 from nanoclaude.cli.headless import DECLINED_PREFIX, declined_line
 from nanoclaude.cli.init import PRESETS
 from nanoclaude.cli.main import EXIT_CODES, build_parser, main
-from nanoclaude.cli.render import MAX_ARGUMENTS_CHARS, status_panel
+from nanoclaude.cli.render import (
+    MAX_ARGUMENT_KEY_CHARS,
+    MAX_ARGUMENT_KEYS,
+    MAX_ARGUMENT_VALUE_CHARS,
+    status_panel,
+)
 from nanoclaude.cli.repl import TEXT_TOOL_BANNER
 from nanoclaude.config.load import CONFIG_DIRNAME, CONFIG_FILENAME, ConfigError, load_config
 from nanoclaude.config.schema import (
@@ -51,10 +56,11 @@ from nanoclaude.context.instructions import (
 )
 from nanoclaude.context.projectmap import project_map
 from nanoclaude.conversation.store import Store
-from nanoclaude.mcp.pins import PINS_FILENAME, PinStore
+from nanoclaude.mcp.pins import LOCK_WAIT_SECONDS, PINS_FILENAME, PinStore
 from nanoclaude.mcp.servers import (
     CLOSE_RESERVE_SECONDS,
     LOG_DIRNAME,
+    MAX_TOOL_WARNINGS_PER_SERVER,
     START_BUDGET_SECONDS,
     failed_line,
 )
@@ -1833,8 +1839,17 @@ def test_the_documents_give_the_budget_and_the_limits_that_the_mcp_code_has():
         assert f"{MAX_SCHEMA_DEPTH} levels" in text, document.name
         assert f"{MAX_REGISTRY_NAME_CHARS} characters" in text, document.name
     assert f"{MAX_DESCRIPTION_BYTES:,} bytes" in _said(README)
-    for document in (CONFIGURATION, DESIGN / "0018-mcp-client.md"):
-        assert f"{MAX_ARGUMENTS_CHARS:,} characters" in _said(document), document.name
+    for document in (SECURITY, CONFIGURATION, DESIGN / "0018-mcp-client.md"):
+        said = _said(document)
+        cuts = f"each key is cut at {MAX_ARGUMENT_KEY_CHARS} characters and each value at "
+        assert f"{cuts}{MAX_ARGUMENT_VALUE_CHARS}" in said, document.name
+        assert f"at most {MAX_ARGUMENT_KEYS} keys" in said, document.name
+    assert LOCK_WAIT_SECONDS == 5.0 and MAX_TOOL_WARNINGS_PER_SERVER == 3
+    configuration = _said(CONFIGURATION)
+    assert "up to five seconds, without holding up the others" in configuration
+    assert "More than three warnings about the tools of one server are printed as one line" in (
+        configuration
+    )
     for document in (CONFIGURATION, ARCHITECTURE):
         assert f"first {FINGERPRINT_SHOWN} hexadecimal characters" in _said(document)
 
@@ -1908,6 +1923,61 @@ async def test_an_mcp_call_carries_no_path_so_the_sandbox_has_nothing_to_judge_a
     assert judged.rule == "default.ask", f"the sandbox or the credentials rows judged it: {judged}"
     sentence = "MCP requests carry no paths, so the sandbox and the secret-path rows do not apply"
     assert sentence in _said(SECURITY)
+
+
+def test_the_documents_say_exactly_when_a_changed_tool_asks_and_what_refuses_it_first():
+    stale = (
+        "a changed one asks in every mode",
+        "asks before every call in every mode",
+        "asks before every call, in every mode",
+        "a change asks in every mode",
+        "only a `deny` rule beats it",
+        "A `deny` rule still wins.",
+        "in every mode and whatever your `allow` rules and grants say",
+    )
+    for document in (README, SECURITY, CONFIGURATION, ARCHITECTURE, CHANGELOG):
+        said = _said(document)
+        for phrase in stale:
+            assert phrase not in said, f"{document.name} still says {phrase!r}"
+    note = _said(DESIGN / "0018-mcp-client.md")
+    for phrase in stale:
+        assert phrase not in note, f"0018 still says {phrase!r}"
+    for document in (README, SECURITY, CONFIGURATION, ARCHITECTURE, DESIGN / "0018-mcp-client.md"):
+        assert "`plan` mode" in _said(document), f"{document.name} does not say about plan mode"
+    # What the policy does, which is what they now say.
+    changed = PermissionRequest(
+        "mcp__notes__search", "server notes", (), is_write=True, definition_changed=True
+    )
+    for mode, expected in (
+        (PermissionMode.DEFAULT, ("ask", "mcp.changed")),
+        (PermissionMode.ACCEPT_EDITS, ("ask", "mcp.changed")),
+        (PermissionMode.BYPASS, ("ask", "mcp.changed")),
+        (PermissionMode.PLAN, ("deny", "mode.plan-read-only")),
+    ):
+        policy = Policy(
+            Sandbox(("/p",)),
+            RuleSet.build(allow=["mcp__notes__search"]),
+            mode,
+            SECRET_PATH_PATTERNS,
+        )
+        decided = evaluate(changed, policy)
+        assert (str(decided.decision), decided.rule) == expected, mode
+    deny = Policy(
+        Sandbox(("/p",)),
+        RuleSet.build(deny=["mcp__notes__search"]),
+        PermissionMode.BYPASS,
+        SECRET_PATH_PATTERNS,
+    )
+    assert evaluate(changed, deny).rule == "rule.deny"
+
+
+def test_the_documents_say_that_sigterm_and_sighup_end_a_run_as_ctrl_c_does():
+    for document in (SECURITY, CONFIGURATION, ARCHITECTURE, DESIGN / "0018-mcp-client.md"):
+        said = _said(document)
+        assert "SIGTERM" in said and "SIGHUP" in said, document.name
+    assert (EXIT_CODES["hangup"], EXIT_CODES["terminated"]) == (129, 143)
+    for code in ("`129`", "`143`"):
+        assert any(row[0] == code for row in _table_rows(_text(CONFIGURATION))), code
 
 
 def test_the_scope_note_has_built_the_mcp_client_and_lists_what_of_it_is_not():

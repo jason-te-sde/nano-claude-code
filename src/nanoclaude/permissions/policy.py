@@ -15,10 +15,11 @@ answers what it is.
 A second row is not in the table either: ``mcp.changed``. It is the one place where the
 policy is told something about a tool and not about a call: that the definition of a tool a
 server brought (its description or its input schema) is not what the person last saw. It
-asks, in every mode, and it sits after every row that can refuse and before every row that
-can allow, so that no mode, rule or grant lets such a call go unasked, and a ``deny`` rule
-still wins. It is an ask and not a denial because the person may well approve the new
-definition, and answering "always" is how its pin is renewed.
+asks, in every mode that gets as far as it does, and it sits after every row that can refuse
+and before every row that can allow, so that no mode, rule or grant lets such a call go
+unasked. What comes before it still refuses: a ``deny`` rule, and plan mode, which refuses
+every MCP tool as a write. It is an ask and not a denial because the person may well approve
+the new definition, and answering "always" is how its pin is renewed.
 
 The first two rows, which say what a file is (a deny rule, a credentials path) and not where it
 is, are one function, :func:`_refusal_of_the_file`, that :func:`evaluate` runs first. It is the
