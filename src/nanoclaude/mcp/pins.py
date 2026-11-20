@@ -28,13 +28,14 @@ file it is held on, whatever happens to the process.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import AsyncIterator, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -84,33 +85,67 @@ def fingerprint(description: str, schema: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("ascii")).hexdigest()
 
 
-@contextlib.contextmanager
-def _exclusive(path: Path) -> Iterator[None]:
-    """Hold an exclusive lock on the file beside ``path`` that is made for it.
-
-    The lock is on a file of its own, never on the pins, which are replaced by a new file
-    each time and would leave a lock on the old one; the lock file is private, is made if it
-    is not there, and is left in place, since removing it would let two processes hold
-    "the" lock on two different files. Closing the descriptor lets go of the lock, which is
-    also what happens if the process dies.
-    """
+def _open_lock(path: Path) -> int:
+    """The descriptor of the private file beside ``path`` that holds the lock, made if it is
+    not there. The lock is on a file of its own, never on the pins, which are replaced by a new
+    file each time and would leave a lock on the old one; the lock file is left in place, since
+    removing it would let two processes hold "the" lock on two different files."""
     lock = path.with_name(path.name + LOCK_SUFFIX)
     make_private_directories(lock.parent)
     create_private_file(lock)
-    descriptor = os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+    return os.open(lock, os.O_RDWR | os.O_NOFOLLOW)
+
+
+def _try_lock(descriptor: int) -> bool:
+    """Take the exclusive lock if nobody holds it; False if somebody does."""
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _lock_wait_error(path: Path) -> PinStoreError:
+    lock = path.with_name(path.name + LOCK_SUFFIX)
+    return PinStoreError(
+        f"could not take the lock {lock} in {LOCK_WAIT_SECONDS:g} seconds "
+        "— another ncc session is saving pins; try again"
+    )
+
+
+@contextlib.contextmanager
+def _exclusive(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on the lock file of ``path``, waiting for it with ``time.sleep``.
+
+    Closing the descriptor lets go of the lock, which is also what happens if the process
+    dies. This blocks the thread for as long as somebody else holds the lock, up to
+    :data:`LOCK_WAIT_SECONDS`: not for a coroutine, which uses :func:`_exclusive_async`.
+    """
+    descriptor = _open_lock(path)
     try:
         deadline = time.monotonic() + LOCK_WAIT_SECONDS
-        while True:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise PinStoreError(
-                        f"could not take the lock {lock} in {LOCK_WAIT_SECONDS:g} seconds "
-                        "— another ncc session is saving pins; try again"
-                    ) from None
-                time.sleep(_LOCK_POLL_SECONDS)
+        while not _try_lock(descriptor):
+            if time.monotonic() >= deadline:
+                raise _lock_wait_error(path) from None
+            time.sleep(_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+@contextlib.asynccontextmanager
+async def _exclusive_async(path: Path) -> AsyncIterator[None]:
+    """:func:`_exclusive`, waiting with ``asyncio.sleep``, so that a lock held by another
+    process leaves the event loop free for as long as it is held: the other servers of a
+    session go on starting, and the startup budget is not spent in a call that cannot be
+    interrupted."""
+    descriptor = _open_lock(path)
+    try:
+        deadline = time.monotonic() + LOCK_WAIT_SECONDS
+        while not _try_lock(descriptor):
+            if time.monotonic() >= deadline:
+                raise _lock_wait_error(path) from None
+            await asyncio.sleep(_LOCK_POLL_SECONDS)
         yield
     finally:
         os.close(descriptor)
@@ -133,7 +168,9 @@ def _read(path: Path) -> dict[str, dict[str, str]]:
         ) from exc
     try:
         data = json.loads(text)
-    except ValueError as exc:
+    except (ValueError, RecursionError) as exc:
+        # RecursionError is not a ValueError: a file nested past what the parser can follow
+        # raises it, and a file somebody else wrote must not end the session.
         raise PinStoreError(
             f"the pins file {path} is not valid JSON ({exc}) — fix it, or delete it to forget "
             "every pin"
@@ -208,17 +245,35 @@ class PinStore:
         so that a pin another process saved is kept, and if it can no longer be read it is not
         replaced (:class:`PinStoreError`): it is somebody's, and the person is told. A lock that
         is not got is the same error. A write that fails raises ``OSError`` and leaves the old
-        file whole.
+        file whole. Waiting for the lock blocks the thread: a coroutine awaits :meth:`asave`.
         """
         if not self._unsaved:
             return
         with _exclusive(self._path):
-            on_disk = _read(self._path)
-            for (server, tool), pinned in self._unsaved.items():
-                tools = on_disk.setdefault(server, {})
-                if tool in tools or len(tools) < MAX_PINS_PER_SERVER:
-                    tools[tool] = pinned
-            text = json.dumps(on_disk, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
-            write_private(self._path, text, replace=True)
+            self._write_locked()
+
+    async def asave(self) -> None:
+        """:meth:`save`, which waits for the lock without blocking the event loop.
+
+        What a session uses when its servers start: the lock may be held by another ncc for
+        five seconds, and every other server's start would stand still for them.
+        """
+        if not self._unsaved:
+            return
+        async with _exclusive_async(self._path):
+            self._write_locked()
+
+    def _write_locked(self) -> None:
+        """The read, the merge and the write, with the lock held. There is no ``await`` in it, so
+        no other coroutine of this process runs in the middle of it."""
+        if not self._unsaved:
+            return  # another save of this process took them while this one waited
+        on_disk = _read(self._path)
+        for (server, tool), pinned in self._unsaved.items():
+            tools = on_disk.setdefault(server, {})
+            if tool in tools or len(tools) < MAX_PINS_PER_SERVER:
+                tools[tool] = pinned
+        text = json.dumps(on_disk, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
+        write_private(self._path, text, replace=True)
         self._pins = on_disk
         self._unsaved = {}

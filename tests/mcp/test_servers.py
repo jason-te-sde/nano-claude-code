@@ -18,15 +18,17 @@ from typing import Any
 import pytest
 
 from nanoclaude.config.schema import McpServerConfig
-from nanoclaude.mcp.pins import pins_path
+from nanoclaude.mcp.pins import LOCK_SUFFIX, PINS_FILENAME, pins_path
 from nanoclaude.mcp.servers import (
     CLOSE_RESERVE_SECONDS,
+    MAX_TOOL_WARNINGS_PER_SERVER,
     START_BUDGET_SECONDS,
     McpServers,
     short_reason,
     start_servers,
 )
 from nanoclaude.mcp.transport import STDIN_GRACE_SECONDS, TERM_GRACE_SECONDS
+from nanoclaude.private import create_private_file
 from nanoclaude.tools.registry import ToolRegistry
 from tests.mcp.helpers import (
     all_gone,
@@ -35,6 +37,7 @@ from tests.mcp.helpers import (
     eventually,
     group_is_gone,
     helper_pid,
+    kill_helpers,
     log_of,
     pids_of,
     process_is_gone,
@@ -191,12 +194,17 @@ async def test_a_bug_while_one_server_starts_is_that_servers_warning_and_not_a_c
     assert await all_gone(pids_of(mcp_home, "one")), "the server was left running by the bug"
 
 
+@pytest.mark.parametrize(
+    "contents",
+    ["{this is not json", "[" * 200_000],
+    ids=["not-json", "a-file-the-parser-gives-out-on"],
+)
 async def test_a_corrupt_pins_file_fails_every_enabled_server_closed_and_starts_none(
-    start, mcp_home
+    start, mcp_home, contents
 ):
     path = pins_path(mcp_home)
     path.parent.mkdir(parents=True)
-    path.write_text("{this is not json")
+    path.write_text(contents)
     servers = await start(server("one", "modern"), server("two", "legacy"))
     assert servers.tools == (), "tools were registered with no pins to check them against"
     assert len(servers.warnings) == 2, servers.warnings
@@ -206,7 +214,7 @@ async def test_a_corrupt_pins_file_fails_every_enabled_server_closed_and_starts_
     assert pids_of(mcp_home, "one") == [] and pids_of(mcp_home, "two") == [], (
         "a server was started whose tools could not be registered"
     )
-    assert path.read_text() == "{this is not json", "the pins file somebody wrote was replaced"
+    assert path.read_text() == contents, "the pins file somebody wrote was replaced"
 
 
 async def test_a_corrupt_pins_file_is_not_looked_at_when_no_server_is_enabled(start, mcp_home):
@@ -248,6 +256,39 @@ async def test_a_name_two_servers_come_to_is_dropped_from_both_with_a_warning(st
         ("c", "running", 1),
     ]
     ToolRegistry(list(servers.tools))  # raises on a name held twice
+
+
+def _bad_tools(count: int) -> str:
+    """The setting of a server whose ``count`` tools all have an input schema that is no object."""
+    tools = [
+        {"name": f"bad{n}", "description": "d", "inputSchema": {"type": "string"}}
+        for n in range(count)
+    ]
+    return "tools=" + json.dumps(tools)
+
+
+@pytest.mark.parametrize("count", [MAX_TOOL_WARNINGS_PER_SERVER, MAX_TOOL_WARNINGS_PER_SERVER + 1])
+async def test_warnings_about_one_servers_tools_are_one_line_with_a_count_past_a_few(start, count):
+    servers = await start(server("bad", "modern", _bad_tools(count)), server("good", "modern"))
+    if count <= MAX_TOOL_WARNINGS_PER_SERVER:
+        assert len(servers.warnings) == count
+        assert all("'bad" in line and "is dropped" in line for line in servers.warnings)
+        return
+    (line,) = servers.warnings
+    assert line.startswith("MCP server 'bad': "), line
+    assert (
+        f"{count} warnings about its tools" in line and "the first: tool 'bad0' is dropped" in line
+    )
+    assert "\n" not in line
+    assert [t.name for t in servers.tools] == ["mcp__good__echo"]
+
+
+async def test_the_warnings_of_each_server_are_counted_apart_from_those_of_another(start):
+    servers = await start(
+        server("one", "modern", _bad_tools(5)), server("two", "modern", _bad_tools(5))
+    )
+    assert len(servers.warnings) == 2
+    assert "'one'" in servers.warnings[0] and "'two'" in servers.warnings[1]
 
 
 # --------------------------------------------------------------------------
@@ -357,12 +398,40 @@ async def test_with_the_shipped_budget_and_periods_the_worst_server_is_gone_with
     )
     assert len(servers.warnings) == 1
     assert elapsed >= START_BUDGET_SECONDS - CLOSE_RESERVE_SECONDS - 0.1
-    assert elapsed < START_BUDGET_SECONDS + 0.5, f"{elapsed:.2f}s with a budget of 15"
+    assert elapsed < START_BUDGET_SECONDS, f"{elapsed:.2f}s with a budget of 15"
     pids = pids_of(mcp_home, "stubborn")
     assert await all_gone(pids), "a process of the stubborn server is still running"
     assert "sigterm-ignored" in events(log_of(mcp_home, "stubborn")), (
         "the server was killed at once and not ended in order"
     )
+
+
+async def test_what_is_left_to_close_after_the_kill_is_held_to_what_is_left_of_the_budget(
+    start, mcp_home
+):
+    # A helper that left the server's group and holds its pipes: SIGKILL to the group does not
+    # end it, so closing the transport waits for the end of stderr (five seconds here). The
+    # budget is two, and what is left after the kill must not wait for that.
+    log = log_of(mcp_home, "stuck")
+    graces = {"stdin_grace": 5.0, "term_grace": 5.0, "drain_grace": 5.0}
+    try:
+        servers, elapsed = await started_within(
+            start,
+            mcp_home,
+            server("stuck", "never-answers-stubborn", "helper=escaped", timeout=600),
+            bound=30,
+            budget=2.0,
+            close_reserve=1.0,
+            transport_options=graces,
+        )
+        assert len(servers.warnings) == 1
+        assert elapsed < 2.0, f"waited {elapsed:.2f}s with a budget of 2, which is not to be passed"
+    finally:
+        # Only now is the pipe let go, and what was still closing can finish.
+        kill_helpers(log)
+        leftovers = [t for t in asyncio.all_tasks() if t.get_name().startswith("mcp-start-")]
+        if leftovers:
+            await asyncio.wait(leftovers, timeout=10)
 
 
 @pytest.mark.parametrize("reserve", [0.5, 1.0], ids=["no-room-to-close", "room-for-half-a-second"])
@@ -381,9 +450,55 @@ async def test_a_close_that_does_not_finish_in_the_reserve_is_cut_short_with_a_k
         transport_options=graces,
     )
     assert len(servers.warnings) == 1
-    assert elapsed < 2.0 + 0.5, f"waited {elapsed:.2f}s with a budget of 2"
+    assert elapsed < 2.0, f"waited {elapsed:.2f}s with a budget of 2, which is not to be passed"
     pids = pids_of(mcp_home, "stubborn")
     assert await all_gone(pids), "the kill did not end the server and its helper"
+
+
+_HOLD_THE_LOCK = (
+    "import fcntl, os, sys, time\n"
+    "descriptor = os.open(sys.argv[1], os.O_RDWR)\n"
+    "fcntl.flock(descriptor, fcntl.LOCK_EX)\n"
+    "print('locked', flush=True)\n"
+    "time.sleep(60)\n"
+)
+
+
+async def test_a_pins_lock_held_by_another_process_does_not_stall_the_other_servers(
+    start, mcp_home, monkeypatch
+):
+    # Another ncc is saving pins and holds the lock. Each server waits for it to write its own,
+    # and the waits are together, not one after another: with the loop blocked in each, four
+    # servers would take four times as long as the wait, and spend a budget that is for the
+    # starts. They are started, with a warning each that their pins could not be written.
+    monkeypatch.setattr("nanoclaude.mcp.pins.LOCK_WAIT_SECONDS", 1.5)
+    lock = pins_path(mcp_home).with_name(PINS_FILENAME + LOCK_SUFFIX)
+    lock.parent.mkdir(parents=True)
+    create_private_file(lock)
+    holder = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-I",
+        "-S",
+        "-c",
+        _HOLD_THE_LOCK,
+        str(lock),
+        stdout=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert holder.stdout is not None
+        assert (await holder.stdout.readline()).decode().strip() == "locked"
+        began = time.monotonic()
+        servers = await start(
+            *[server(f"s{n}", "modern") for n in range(4)], budget=4.0, close_reserve=1.0
+        )
+        elapsed = time.monotonic() - began
+    finally:
+        holder.terminate()
+        await holder.wait()
+    assert [r.state for r in servers.reports()] == ["running"] * 4, servers.warnings
+    assert len(servers.tools) == 4
+    assert len(servers.warnings) == 4 and all("could not write" in w for w in servers.warnings)
+    assert elapsed < 4.0, f"four servers took {elapsed:.1f}s with a lock to wait for"
 
 
 async def test_a_start_that_is_cancelled_ends_every_server_it_had_started(mcp_home, mcp_root):

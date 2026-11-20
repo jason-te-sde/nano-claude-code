@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -66,6 +67,37 @@ async def test_a_step_of_closing_that_fails_does_not_leave_a_server_running(
     with pytest.raises(RuntimeError, match="would not close"):
         await session.aclose()
     assert await all_gone(pids_of(mcp_home, "one")), "the server outlived a failed close"
+
+
+async def test_the_session_closes_the_providers_then_the_servers_and_the_store_last(
+    start: Start, mcp_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    servers = await start(server("one", "modern"))
+    session = build_session(mcp_root, [says("hi")], mcp=servers)
+    order: list[str] = []
+
+    def noting(name: str, real: Callable[..., Any]) -> Callable[..., Any]:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            order.append(name)
+            return real(*args, **kwargs)
+
+        return wrapper
+
+    def noting_async(name: str, real: Callable[..., Awaitable[None]]) -> Callable[..., Any]:
+        async def wrapper(*args: Any, **kwargs: Any) -> None:
+            order.append(name)
+            await real(*args, **kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(session, "_persist", noting("conversation", session._persist))
+    monkeypatch.setattr(session, "_finish", noting("spend", session._finish))
+    monkeypatch.setattr(session.router, "aclose", noting_async("providers", session.router.aclose))
+    monkeypatch.setattr(servers, "aclose", noting_async("servers", servers.aclose))
+    monkeypatch.setattr(session, "_close_store", noting("store", session._close_store))
+    await session.aclose()
+    # docs/architecture.md says the servers go after the providers' clients and before the store.
+    assert order == ["conversation", "spend", "providers", "servers", "store"]
 
 
 async def test_the_servers_are_closed_by_the_session_once_and_a_second_close_does_nothing(

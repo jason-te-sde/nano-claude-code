@@ -61,10 +61,19 @@ CLOSE_RESERVE_SECONDS = 5.0
 #: The end of the budget is for the pipes of a server that was killed, which is quick.
 _KILL_TIDY_SECONDS = 0.5
 
+#: What the budget is shortened by so that its end holds when the event loop is late to act on
+#: it: a timer that fires a few milliseconds after its time would otherwise carry the return
+#: past the 15 seconds the documents promise.
+_LATENCY_SECONDS = 0.2
+
 #: The longest a reason is, and the longest one the person's own pins-file message may be: it
 #: names a path and says what to do about it.
 MAX_REASON_CHARS = 200
 _MAX_PINS_REASON_CHARS = 400
+
+#: How many warnings about the tools of one server are printed one to a line. A server that
+#: has more of them (five hundred tools that all break one limit) is one line with a count.
+MAX_TOOL_WARNINGS_PER_SERVER = 3
 
 #: Where the stderr of the servers is kept, under ncc's own directory.
 LOG_DIRNAME = "logs"
@@ -101,6 +110,15 @@ def _reason_of(error: BaseException) -> str:
 def failed_line(name: str, reason: str) -> str:
     """The one warning a server that failed to start adds: which server, and why."""
     return f"MCP server '{name}' failed to start ({reason}) — its tools are not registered"
+
+
+def _collapsed(name: str, warnings: Sequence[str]) -> tuple[str, ...]:
+    """The warnings about one server's tools, as one line with a count when there are more than
+    :data:`MAX_TOOL_WARNINGS_PER_SERVER`, naming the first so that the person knows what kind."""
+    if len(warnings) <= MAX_TOOL_WARNINGS_PER_SERVER:
+        return tuple(warnings)
+    first = warnings[0].removeprefix(f"MCP server '{name}': ")
+    return (f"MCP server '{name}': {len(warnings)} warnings about its tools (the first: {first})",)
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,7 +287,7 @@ class _Starts:
 async def _wait_for(starts: _Starts, budget: float, close_reserve: float) -> None:
     """Wait for the starts, within ``budget`` seconds in all, as the module docstring says."""
     loop = asyncio.get_running_loop()
-    end = loop.time() + budget
+    end = loop.time() + budget - _LATENCY_SECONDS
     start_period = max(budget - close_reserve, 0.0)
     pending = starts.unfinished()
     if pending:
@@ -391,7 +409,11 @@ async def start_servers(
         outcome = task.result() if task.done() and not task.cancelled() else None
         if isinstance(outcome, _Started):
             entry.client, entry.transport = outcome.client, outcome.transport
-            adapted.append(outcome.adapted)
+            adapted.append(
+                AdaptedTools(
+                    outcome.adapted.tools, _collapsed(server.name, outcome.adapted.warnings)
+                )
+            )
             continue
         entry.failure = (
             outcome.reason

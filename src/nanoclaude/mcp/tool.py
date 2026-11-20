@@ -430,7 +430,7 @@ async def adapt_tools(
             f"not be noticed; remove pins of tools it no longer has from {pins.path}"
         )
     try:
-        pins.save()
+        await pins.asave()
     except (OSError, PinStoreError) as exc:
         reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
         warnings.append(

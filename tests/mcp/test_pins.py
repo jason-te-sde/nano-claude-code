@@ -4,6 +4,7 @@ A pin is what a tool looked like when the person first saw it. The store is a fi
 ncc's home, so it is private from the moment it exists and is never half written.
 """
 
+import asyncio
 import fcntl
 import json
 import os
@@ -207,6 +208,21 @@ def test_a_file_that_is_not_the_shape_of_a_store_is_an_error_that_says_which_fil
     assert " — " in str(raised.value)
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["[" * 200_000, '{"s": ' * 100_000, "[" * 3000 + "]" * 3000],
+    ids=["unclosed-lists", "unclosed-objects", "lists-nested-past-the-parser"],
+)
+def test_a_file_that_makes_the_json_parser_give_out_is_an_error_and_not_a_crash(tmp_path, text):
+    # json raises RecursionError for these, which is not a ValueError: left to escape, it ended
+    # the session before it began, for a file that somebody could have left there.
+    path = tmp_path / PINS_FILENAME
+    path.write_text(text)
+    with pytest.raises(PinStoreError, match="not valid JSON") as raised:
+        PinStore.load(path)
+    assert str(path) in str(raised.value) and " — " in str(raised.value)
+
+
 def test_a_file_that_is_not_text_is_an_error_too(tmp_path):
     path = tmp_path / PINS_FILENAME
     path.write_bytes(b"\xff\xfe\x00")
@@ -395,3 +411,47 @@ def test_a_save_does_not_take_the_file_past_the_limit_when_another_process_fille
     mine.save()
     kept = json.loads(path.read_text())["s"]
     assert len(kept) == MAX_PINS_PER_SERVER and "mine" not in kept
+
+
+async def test_the_async_save_waits_for_a_held_lock_without_stopping_the_event_loop(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(pins_module, "LOCK_WAIT_SECONDS", 0.5)
+    path = tmp_path / PINS_FILENAME
+    first = PinStore.load(path)
+    first.record("s", "t", "a" * 64)
+    first.save()
+    held = os.open(path.with_name(PINS_FILENAME + ".lock"), os.O_RDWR)
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.01)
+            ticks += 1
+
+    running = asyncio.create_task(ticker())
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        stuck = PinStore.load(path)
+        stuck.record("s", "u", "b" * 64)
+        with pytest.raises(PinStoreError, match="lock"):
+            await stuck.asave()
+    finally:
+        running.cancel()
+        os.close(held)
+    # Half a second of waiting, and the loop went on running through it: a wait that blocks
+    # it leaves no tick at all.
+    assert ticks >= 20, f"the loop ran {ticks} times while the lock was waited for"
+    await stuck.asave()  # once the lock is let go the same store can be saved
+    assert PinStore.load(path).get("s", "u") == "b" * 64
+
+
+async def test_saves_made_together_by_one_process_take_turns_and_lose_no_pin(tmp_path):
+    path = tmp_path / PINS_FILENAME
+    stores = [PinStore.load(path) for _ in range(8)]
+    for number, store in enumerate(stores):
+        store.record(f"server{number}", "tool", f"{number:064x}")
+    await asyncio.gather(*(store.asave() for store in stores))
+    kept = PinStore.load(path)
+    assert [kept.get(f"server{n}", "tool") for n in range(8)] == [f"{n:064x}" for n in range(8)]
