@@ -31,6 +31,21 @@ from nanoclaude.permissions.policy import Decision
 from nanoclaude.permissions.redact import Redactor
 
 
+def _arguments_json(arguments: Mapping[str, Any]) -> str:
+    """The arguments as JSON for the record, or a line that says they cannot be.
+
+    The decision is recorded before the call is allowed to run, and what the model wrote can
+    be nested past what ``json`` can walk: that costs the record its arguments and not the
+    call its place in it, and does not end the turn.
+    """
+    try:
+        return json.dumps(dict(arguments), sort_keys=True)
+    except (RecursionError, ValueError, TypeError, OverflowError):
+        return json.dumps(
+            {"_not_recorded": "the arguments are nested too deeply, or not JSON, to be written"}
+        )
+
+
 class AuditLog:
     def __init__(self, store: Store, redactor: Redactor | None = None) -> None:
         self.store = store
@@ -53,7 +68,7 @@ class AuditLog:
         ``parent_call_id`` is the ``Task`` call that started the sub-agent making this one, and
         None for a call the person's own conversation made.
         """
-        payload, _ = self._redactor.scrub(json.dumps(dict(arguments), sort_keys=True))
+        payload, _ = self._redactor.scrub(_arguments_json(arguments))
         self.store.db.execute(
             "INSERT INTO tool_calls "
             "(session_id, turn, tool_use_id, ts, tool, args_json, decision, rule, parent_call_id) "

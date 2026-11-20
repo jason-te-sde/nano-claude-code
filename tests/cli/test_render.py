@@ -31,6 +31,9 @@ from nanoclaude.agent.ui import UI, Approval
 from nanoclaude.cli import render
 from nanoclaude.cli.prompt import build_prompt_session, new_prompter
 from nanoclaude.cli.render import (
+    MAX_ARGUMENT_KEY_CHARS,
+    MAX_ARGUMENT_KEYS,
+    MAX_ARGUMENT_VALUE_CHARS,
     ConsoleUI,
     _Arriving,
     cost_panel,
@@ -128,6 +131,9 @@ def row(text: str, label: str) -> str:
         ("a\N{LEFT-TO-RIGHT EMBEDDING}b", "a\\u202ab"),
         ("a\N{LEFT-TO-RIGHT ISOLATE}b", "a\\u2066b"),
         ("a\N{POP DIRECTIONAL ISOLATE}b", "a\\u2069b"),
+        # Ends a line as a newline does, and is not a control (Zl and Zp).
+        ("a\N{LINE SEPARATOR}b", "a\\u2028b"),
+        ("a\N{PARAGRAPH SEPARATOR}b", "a\\u2029b"),
         ("a\x9fb", "a\\x9fb"),
         # Just outside the ranges: ordinary text, and not shown as escapes.
         ("a\N{NO-BREAK SPACE}b", "a\N{NO-BREAK SPACE}b"),
@@ -872,32 +878,158 @@ MCP_REQUEST = PermissionRequest("mcp__github__create_issue", "server github", ()
 MCP_CHANGED = PermissionResult(Decision.ASK, "mcp.changed", "the definition has changed")
 
 
-async def test_a_confirmation_for_an_mcp_call_shows_the_server_and_the_arguments_it_is_given():
+def mcp_call(arguments: object) -> ToolUseBlock:
+    """A call to the MCP tool with ``arguments`` as they are, however they are nested.
+
+    ``ToolUseBlock`` copies what it is given with ``deepcopy``, which gives out at about 500
+    levels; what is set after it is built has no such limit, and is what a front end must
+    meet, since what the model wrote can be anything that reached it.
+    """
+    call = ToolUseBlock("m1", "mcp__github__create_issue", {})
+    object.__setattr__(call, "arguments", arguments)
+    return call
+
+
+def nested(depth: int) -> list[object]:
+    value: list[object] = []
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+async def test_a_confirmation_for_an_mcp_call_shows_the_server_and_each_argument_on_its_own_line():
     # Somebody else's tool, run with the person's authority: they are told what it is given.
     screen = Screen("n")
     await screen.ui.confirm(MCP_CALL, MCP_REQUEST, ASK)
-    lines = screen.text.splitlines()
-    assert lines[1] == "mcp__github__create_issue  server github"
-    assert lines[2] == '  arguments {"title": "Bug", "labels": ["a"]}'
+    assert screen.text.splitlines()[1:] == [
+        "mcp__github__create_issue  server github",
+        '  title: "Bug"',
+        '  labels: (list, 1 item) ["a"]',
+    ]
     assert "called with" not in screen.text, "the arguments were shown twice"
-    assert len(lines) == 3, lines
 
 
-async def test_the_arguments_of_an_mcp_call_name_every_control_and_are_cut_where_long():
+async def test_a_call_with_no_arguments_says_so():
+    screen = Screen("n")
+    await screen.ui.confirm(mcp_call({}), MCP_REQUEST, ASK)
+    assert screen.text.splitlines()[2] == "  (no arguments)"
+
+
+async def test_padding_before_the_arguments_that_matter_cannot_hide_them():
+    # Cut as one piece of JSON at a thousand characters, this showed nothing but the padding.
+    arguments = {"pad": "x" * 1100, "path": "/etc/passwd", "cmd": "rm -rf ~"}
+    screen = Screen("n", width=400)
+    await screen.ui.confirm(mcp_call(arguments), MCP_REQUEST, ASK)
+    lines = screen.text.splitlines()
+    assert any(line == '  path: "/etc/passwd"' for line in lines), lines
+    assert any(line == '  cmd: "rm -rf ~"' for line in lines), lines
+    (pad,) = [line for line in lines if line.startswith("  pad: ")]
+    assert pad.endswith("more characters") and len(pad) < 300, pad
+
+
+async def test_every_key_is_shown_and_a_long_value_is_cut_with_a_count_of_the_rest():
+    screen = Screen("n", width=400)
+    await screen.ui.confirm(mcp_call({"text": "y" * 500}), MCP_REQUEST, ASK)
+    line = screen.text.splitlines()[2]
+    assert line == '  text: "' + "y" * (MAX_ARGUMENT_VALUE_CHARS - 1) + " … 302 more characters"
+
+
+async def test_a_nested_value_is_summarised_by_its_kind_and_size_and_then_cut():
+    arguments = {"options": {"a": 1, "b": [1, 2, 3]}, "items": list(range(500))}
+    screen = Screen("n", width=400)
+    await screen.ui.confirm(mcp_call(arguments), MCP_REQUEST, ASK)
+    lines = screen.text.splitlines()
+    assert lines[2] == '  options: (object, 2 keys) {"a": 1, "b": [1, 2, 3]}'
+    assert (
+        lines[3].startswith("  items: (list, 500 items) [0, 1, 2, ")
+        and "more characters" in lines[3]
+    )
+
+
+async def test_the_arguments_of_an_mcp_call_name_every_control_in_a_key_and_in_a_value():
     # JSON writes the controls of C0 as escapes of its own and leaves DEL, the C1 controls and
     # the invisible formatting characters as they are, which is what a terminal acts on.
-    arguments = {"text": "a\x7fb\x9bc\u202ed\x1b[2J", "more": "x" * 3000}
-    screen = Screen("n", width=4000)
-    call = ToolUseBlock("m1", "mcp__github__create_issue", arguments)
-    await screen.ui.confirm(call, MCP_REQUEST, ASK)
+    arguments = {"te\x9bxt\u2028": "a\x7fb\x9bc\u202ed\x1b[2J\u2029"}
+    screen = Screen("n", width=400)
+    await screen.ui.confirm(mcp_call(arguments), MCP_REQUEST, ASK)
     line = screen.text.splitlines()[2]
-    assert line.startswith("  arguments {")
-    for raw in ("\x7f", "\x9b", "\u202e", "\x1b"):
+    for raw in ("\x7f", "\x9b", "\u202e", "\x1b", "\u2028", "\u2029"):
         assert raw not in screen.text, f"{raw!r} reached the screen as itself"
-    for named in ("\\x7f", "\\x9b", "\\u202e", "\\u001b"):
-        assert named in line, f"{named} is not spelled out in {line[:80]}"
-    assert len(line) < 1300, f"the arguments were shown in {len(line)} characters"
-    assert "more characters" in line, "nothing says that the arguments were cut"
+    for named in ("te\\x9bxt\\u2028", "\\x7f", "\\u202e", "\\u001b", "\\u2029"):
+        assert named in line, f"{named} is not spelled out in {line}"
+
+
+async def test_a_key_that_is_too_long_is_cut_and_the_cut_is_said():
+    screen = Screen("n", width=400)
+    await screen.ui.confirm(mcp_call({"k" * 300: 1}), MCP_REQUEST, ASK)
+    line = screen.text.splitlines()[2]
+    assert line.startswith("  " + "k" * MAX_ARGUMENT_KEY_CHARS + " … 240 more characters: 1"), line
+
+
+async def test_the_whole_is_bounded_whatever_the_model_writes():
+    arguments = {f"key{n}" + "k" * 500: "v" * 5000 for n in range(MAX_ARGUMENT_KEYS)}
+    screen = Screen("n", width=2000)
+    await screen.ui.confirm(mcp_call(arguments), MCP_REQUEST, ASK)
+    assert len(screen.text) < MAX_ARGUMENT_KEYS * 420, len(screen.text)
+    assert len(screen.text.splitlines()) == 2 + MAX_ARGUMENT_KEYS
+
+
+async def test_more_keys_than_are_shown_are_counted_and_always_is_not_offered_for_that_call():
+    arguments = {f"k{n:02d}": n for n in range(MAX_ARGUMENT_KEYS + 5)}
+    screen = Screen("a", "y")
+    approval = await screen.ui.confirm(mcp_call(arguments), MCP_REQUEST, ASK)
+    assert approval is Approval.ONCE, "'always' was taken for a call whose arguments were hidden"
+    lines = screen.text.splitlines()
+    assert "  … 5 more arguments, which are not shown" in lines
+    assert [line for line in lines if line.startswith("  k")][-1].startswith("  k19")
+    first, second = screen.prompter.asked
+    assert "[a]lways" not in first and "[y]es" in first and "[n]o" in first
+    assert "always is not offered" in screen.text and first == second
+
+
+async def test_the_arguments_of_a_changed_tool_that_are_not_all_shown_do_not_get_always_either():
+    arguments = {f"k{n:02d}": n for n in range(MAX_ARGUMENT_KEYS + 1)}
+    screen = Screen("always", "n")
+    approval = await screen.ui.confirm(mcp_call(arguments), MCP_REQUEST, MCP_CHANGED)
+    assert approval is Approval.NO
+    assert "[a]lways" not in screen.prompter.asked[0]
+
+
+async def test_always_is_offered_when_every_argument_is_shown():
+    screen = Screen("a")
+    approval = await screen.ui.confirm(MCP_CALL, MCP_REQUEST, ASK)
+    assert approval is Approval.ALWAYS and "[a]lways" in screen.prompter.asked[0]
+
+
+async def test_arguments_nested_beyond_what_can_be_shown_are_summarised_and_do_not_raise():
+    # json.dumps gives out at about a thousand levels, and with it anything that walks the value.
+    screen = Screen("n", width=400)
+    arguments = {"deep": nested(5000), "path": "/etc/passwd"}
+    await screen.ui.confirm(mcp_call(arguments), MCP_REQUEST, ASK)
+    lines = screen.text.splitlines()
+    assert "  deep: (list, 1 item) (nested too deeply to show)" in lines, lines
+    assert '  path: "/etc/passwd"' in lines, "an argument after the deep one was not shown"
+
+
+async def test_a_whole_set_of_arguments_that_cannot_be_walked_is_summarised_and_not_always(
+    monkeypatch,
+):
+    monkeypatch.setattr("nanoclaude.cli.render._argument_lines", _recursion)
+    screen = Screen("a", "n")
+    approval = await screen.ui.confirm(MCP_CALL, MCP_REQUEST, ASK)
+    assert approval is Approval.NO
+    assert "  (the arguments are nested too deeply to show)" in screen.text
+    assert "[a]lways" not in screen.prompter.asked[0]
+
+
+def test_the_summary_of_a_call_whose_path_is_nested_past_what_can_be_written_does_not_raise():
+    call = ToolUseBlock("t1", "Read", {})
+    object.__setattr__(call, "arguments", {"path": nested(5000)})
+    assert summarise_call(call) == "(nested too deeply to show)"
+
+
+def _recursion(*_args: object, **_kwargs: object) -> object:
+    raise RecursionError("maximum recursion depth exceeded")
 
 
 async def test_a_confirmation_for_a_changed_mcp_tool_says_so_and_what_always_means_for_it():

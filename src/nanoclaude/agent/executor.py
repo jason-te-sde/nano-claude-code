@@ -287,9 +287,22 @@ class Executor:
                 continue
             if plan.result.decision is not Decision.ASK:
                 continue
-            approval = await self.ui.confirm(plan.call, plan.request, plan.result)
+            try:
+                approval = await self.ui.confirm(plan.call, plan.request, plan.result)
+            except RecursionError:
+                # What the person was to read is nested past what the front end can follow,
+                # so nobody can approve it: the call is not run, and the turn is not ended.
+                approval = Approval.NO
+                unreadable = True
+            else:
+                unreadable = False
             if approval is Approval.NO:
-                if self.may_ask:
+                if unreadable:
+                    why = (
+                        f"{plan.call.name} was not run: its arguments are nested too deeply to "
+                        "be shown to the person, so nobody could approve them."
+                    )
+                elif self.may_ask:
                     why = f"The user declined to run {plan.call.name}."
                 else:
                     why = (

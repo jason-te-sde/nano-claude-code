@@ -6,6 +6,7 @@ protection rejects a push containing a string shaped like a live credential,
 even a fake one (the same convention tests/permissions/test_redact.py uses).
 """
 
+import json
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -213,3 +214,26 @@ def test_a_call_made_by_a_sub_agent_is_recorded_with_the_task_call_that_started_
         for row in log.store.db.execute("SELECT tool_use_id, parent_call_id FROM tool_calls")
     }
     assert rows == {"sub_1": "task_1", "task_1": None}
+
+
+def test_arguments_nested_past_what_json_can_write_are_recorded_as_that_and_do_not_raise(tmp_path):
+    """The record of a call is written before it is allowed to run, so a value that cannot be
+    written must not stop the call being recorded, or the turn."""
+    log = audit(tmp_path)
+    deep: list[Any] = []
+    for _ in range(5000):
+        deep = [deep]
+    log.record_decision(
+        "s1",
+        turn=0,
+        tool_use_id="t1",
+        tool="mcp__s__t",
+        arguments={"a": deep},
+        decision=Decision.ASK,
+        rule="default.ask",
+    )
+    row = log.store.db.execute("SELECT args_json, tool_use_id FROM tool_calls").fetchone()
+    assert row["tool_use_id"] == "t1"
+    assert json.loads(row["args_json"]) == {
+        "_not_recorded": "the arguments are nested too deeply, or not JSON, to be written"
+    }
