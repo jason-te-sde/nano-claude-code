@@ -94,7 +94,7 @@ def _refusal_text(rule: str, reason: str) -> str:
 
     Sentence-cased on purpose: spec 17.9's user-facing form is a different,
     lowercase string (``refused (<rule>): ...``). Whatever renders a refusal
-    to a *person* (Task 25) must format it from the ``PermissionResult`` the
+    to a *person* must format it from the ``PermissionResult`` the
     audit log and ``UI.on_decision`` already carry, not by echoing or
     re-casing this one -- this string's only reader is the model, in the next
     turn's tool_result.

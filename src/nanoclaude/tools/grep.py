@@ -209,11 +209,11 @@ class GrepTool:
     def _readability(ctx: ToolContext) -> Callable[[str], bool]:
         """Whether the policy would let Read show the model this file; a path is asked once.
 
-        Requirement (added 2026-10-01, task-14-brief.md): a credentials-shaped file
-        discovered while walking the tree must not have its contents surfaced, on
-        either search backend, unless the policy explicitly opts in. It has since been
-        widened to the whole of Read's verdict (see ``read_refusal``), since a deny
-        rule for Read is no less a statement about what the model may see. Applies to a
+        A credentials-shaped file discovered while walking the tree is never
+        returned, on either search backend, unless the policy explicitly opts in.
+        The check is the whole of Read's verdict (see ``read_refusal``), since a
+        deny rule for Read is no less a statement about what the model may see.
+        Applies to a
         context line exactly as it does to a match: both carry the same path, and the
         verdict is keyed on the path alone.
         """

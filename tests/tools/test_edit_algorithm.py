@@ -80,10 +80,9 @@ def test_a_successful_single_edit_removes_exactly_one_occurrence(prefix, needle,
     assert len(result) == len(content) - len(needle) + len("REPLACED")
 
 
-# The tests below are not in the brief. They close gaps the brief's own tests
-# leave open: two refusals apply_edits can raise that no given test triggers,
-# unified_diff (a "Produces" name in the brief with no direct test otherwise),
-# and the hashability the task notes ask to be pinned explicitly.
+# The tests below close gaps the tests above leave open: two refusals
+# apply_edits can raise that no test above triggers, unified_diff (which has no
+# direct test otherwise), and hashability, pinned explicitly.
 
 
 def test_an_empty_edit_list_is_an_error():

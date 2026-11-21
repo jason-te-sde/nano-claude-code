@@ -101,11 +101,11 @@ async def test_full_compaction_refuses_to_compact_an_unanswered_turn():
         await full_compact(pending, keep_recent=1, summarise=summarise)
 
 
-# The tests below extend the brief's own cases: byte-for-byte proof that
+# The tests below extend the cases above: byte-for-byte proof that
 # keep_recent is untouched (not just "the big string survives somewhere"), the
 # short-tool-result and non-tool-result paths micro_compact's threshold check
 # leaves alone, every early-return guard in full_compact, the two-part "did we
-# find any files" branch, and SUMMARY_TEMPLATE -- the one Produces name
+# find any files" branch, and SUMMARY_TEMPLATE, which
 # neither test file otherwise names directly.
 
 

@@ -1,6 +1,6 @@
 """Structural pins for the danger types.
 
-Step 1 of the permissions brief is three type declarations with no behaviour
+The danger module is three type declarations with no behaviour
 of their own -- the policy tests exercise them instead. This file pins only
 the one property that has nothing to do with classifier behaviour: whether
 the two dataclasses declared here are hashable.
@@ -17,9 +17,9 @@ from nanoclaude.permissions.danger import DangerClassifier, DangerLevel, DangerR
 class _StubClassifier:
     """A minimal conforming DangerClassifier, for the two tests below only.
 
-    Not a classifier implementation for Tasks 7-8 to build on -- it exists
-    solely to give DangerClassifier, named in the brief's Produces list with
-    no test of its own, an actual object to check isinstance/issubclass
+    Not a classifier implementation to build on -- it exists
+    solely to give DangerClassifier, which has no test of its own,
+    an actual object to check isinstance/issubclass
     against.
     """
 

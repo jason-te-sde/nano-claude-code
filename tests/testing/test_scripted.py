@@ -7,8 +7,8 @@ from nanoclaude.testing.scripted import ScriptedModel, calls, calls_many, cut_of
 # A static check, not a runtime one: mypy --strict verifies ScriptedModel's shape
 # (the model_id property, the signature of complete() including async and the
 # return type) against the ModelClient Protocol right here. ModelClient itself is
-# not otherwise imported or checked anywhere until Task 17's real adapters arrive,
-# so this is what would catch the two shapes drifting apart in the meantime.
+# not otherwise imported or checked anywhere until a real adapter implements it,
+# so this is what catches the two shapes drifting apart.
 _conforms: ModelClient = ScriptedModel([])
 
 
