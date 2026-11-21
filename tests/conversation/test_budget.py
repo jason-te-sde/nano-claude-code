@@ -74,7 +74,7 @@ def test_a_context_that_cannot_fit_even_empty_is_impossible_not_full():
 
 
 def test_the_impossible_error_names_the_window_and_what_is_in_it():
-    # The brief's own version of this test used a bare try/except with the
+    # An earlier version of this test used a bare try/except with the
     # assertions inside it: if require_fits ever stopped raising, the except
     # body would simply never run and the test would pass having checked
     # nothing (confirmed by deleting the raise -- this test stayed green).
@@ -86,10 +86,10 @@ def test_the_impossible_error_names_the_window_and_what_is_in_it():
     assert "--model" in str(exc_info.value)  # tells them the way out
 
 
-# The tests below extend the brief's own cases: every boundary of verdict()'s
+# The tests below extend the cases above: every boundary of verdict()'s
 # thresholds pinned exactly (not just "crosses, roughly"), both named halves
 # of require_fits (raises / is a no-op), pressure()'s own non-positive-window
-# guard, and the other Produces names (estimate_tokens, HeuristicCounter) each
+# guard, and the other public names (estimate_tokens, HeuristicCounter) each
 # getting their own direct test rather than only incidental exercise.
 
 
@@ -156,12 +156,12 @@ def test_pressure_is_zero_when_available_is_non_positive():
 
 def test_verdict_is_impossible_when_available_is_non_positive_even_for_an_empty_request():
     # The "available <= 0" half of verdict()'s impossible check, kept distinct
-    # from the brief's own "fixed cost too big for a positive window" case.
+    # from the "fixed cost too big for a positive window" case.
     assert Budget(TINY).verdict(Transcript(), "", "") == "impossible"
 
 
 def test_require_fits_does_nothing_when_the_budget_is_fine():
-    # The non-raising half of require_fits; the brief only tests the raise.
+    # The non-raising half of require_fits; the cases above only test the raise.
     # require_fits is annotated -> None, so mypy --strict itself refuses to
     # let anything treat that as a value (func-returns-value) -- called as a
     # bare statement instead; if it raised, the test would error.

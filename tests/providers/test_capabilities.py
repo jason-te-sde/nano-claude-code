@@ -83,7 +83,7 @@ def test_unknown_model_falls_back_to_the_conservative_default():
 
 
 def test_family_prefix_match_applies_when_no_exact_entry_exists():
-    # Neither of the brief's own two tests reaches the _FAMILIES loop at all: the
+    # Neither of the two tests above reaches the _FAMILIES loop at all: the
     # first hits an exact _KNOWN entry, the second falls all the way through to
     # CONSERVATIVE_DEFAULT. A model that is new but clearly part of a known family
     # (a Claude release not yet added to _KNOWN by name) must still get that
@@ -105,7 +105,7 @@ def test_family_prefix_is_paired_with_its_own_adapter():
 
 def test_conservative_default_never_assumes_capabilities_it_has_not_seen():
     """An unknown model must not be assumed to support parallel calls or caching."""
-    # Every field of Capabilities is pinned here, not just the four the brief's own
+    # Every field of Capabilities is pinned here, not just the four an earlier
     # version of this test checked -- CONSERVATIVE_DEFAULT's whole job is to be wrong
     # in the safe direction, and a field left unchecked is a field a regression could
     # silently flip to something a real adapter would read as a green light.

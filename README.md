@@ -171,7 +171,7 @@ Each figure is produced by `python scripts/measure.py`, which also writes `metri
 | Tests collected by pytest | `tests` | 4,955 | `python scripts/measure.py` |
 | Share of `nanoclaude` the tests run | `coverage_percent` | 99.9% | `python scripts/measure.py` |
 | Lines of Python in `src/` | `lines.src` | 17,311 | `python scripts/measure.py` |
-| Lines of Python in `tests/` | `lines.tests` | 48,422 | `python scripts/measure.py` |
+| Lines of Python in `tests/` | `lines.tests` | 48,401 | `python scripts/measure.py` |
 | Tools in the default registry | `tools` | 7 | `python scripts/measure.py` |
 | Adapters the configuration accepts | `adapters` | 3 | `python scripts/measure.py` |
 | Dangerous commands the regex classifier misses | `danger_corpus` | not measured yet | `python scripts/measure.py` |

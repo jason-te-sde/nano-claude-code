@@ -164,7 +164,7 @@ def test_a_stream_with_no_content_blocks_at_all_is_a_usable_error():
 
 
 def test_a_thinking_block_decodes_its_text():
-    # None of the four cassettes carry an extended-thinking block -- no Task 17
+    # None of the four cassettes carry an extended-thinking block -- no
     # scenario calls for one -- so this drives the state machine directly, the
     # same way test_an_error_event_becomes_a_model_error does, to reach
     # content_block_start/content_block_delta's "thinking" branch and

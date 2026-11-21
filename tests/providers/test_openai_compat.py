@@ -447,7 +447,7 @@ def test_reasoning_content_is_preserved_as_a_thinking_block():
 def test_all_three_reasoning_key_spellings_are_recognized(key):
     # The module docstring's other documented divergence: "reasoning content
     # arrives under three different key names depending on who is serving."
-    # The brief's own test above only drives "reasoning_content"; this pins
+    # The test above only drives "reasoning_content"; this pins
     # the other two as well, and that the recovered text is the right text.
     accumulator = ChunkAccumulator(model="o-series")
     accumulator.handle({"choices": [{"delta": {key: "because X"}}]})

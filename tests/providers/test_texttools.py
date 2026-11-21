@@ -103,7 +103,7 @@ def test_rendered_tools_include_the_name_description_and_schema():
     assert "Read" in rendered and "Read a file." in rendered and '"path"' in rendered
 
 
-# --- Beyond the brief's own tests: the extra guarantees the task calls out. ---
+# --- Further guarantees. ---
 
 
 def test_several_calls_with_no_prose_produce_no_stray_text_blocks():
@@ -223,7 +223,7 @@ def test_max_parse_retries_is_two():
     assert MAX_PARSE_RETRIES == 2
 
 
-def test_tool_protocol_prompt_is_byte_identical_to_the_brief():
+def test_tool_protocol_prompt_is_byte_identical_to_its_pinned_text():
     assert (
         TOOL_PROTOCOL_PROMPT
         == """\

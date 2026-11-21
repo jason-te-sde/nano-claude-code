@@ -100,7 +100,7 @@ def refusal(tmp_path: Path, home_text: str | None = None, project_text: str | No
 
 
 # --------------------------------------------------------------------------
-# The brief's own tests
+# Core behavior
 # --------------------------------------------------------------------------
 
 

@@ -252,7 +252,7 @@ def test_no_temperature_option_is_sent_unless_one_is_asked_for():
     assert zero["options"] == {"temperature": 0.0, "num_predict": 64}
 
 
-# -- complete(): happy paths, from the brief -----------------------------
+# -- complete(): happy paths -----------------------------
 
 
 async def test_a_text_reply_is_decoded():
@@ -404,7 +404,7 @@ async def test_a_missing_server_says_how_to_start_it():
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         # Only ModelError may cross the adapter boundary -- asserted here by
-        # catching that exact type rather than the brief's own looser
+        # catching that exact type rather than the looser
         # `Exception`, which also lets `.retryable` be checked below.
         with pytest.raises(ModelError, match="ollama serve") as excinfo:
             await OllamaClient(model="m", client=http).complete(
@@ -413,7 +413,7 @@ async def test_a_missing_server_says_how_to_start_it():
     assert not excinfo.value.retryable
 
 
-# -- complete(): the lessons from Tasks 17/18, applied here too -------------
+# -- complete(): edge cases shared with the other adapters -------------
 
 
 async def test_an_unfinished_stream_with_a_pending_tool_call_is_a_non_retryable_error():

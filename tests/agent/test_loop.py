@@ -202,10 +202,10 @@ def test_an_empty_reply_is_a_loop_error():
         step(start("hi"), ModelReply((), StopKind.END_TURN, Usage(), "scripted"))
 
 
-# The tests below close gaps the brief's own 8 tests left open: resume(), the
+# The tests below close gaps the tests above leave open: resume(), the
 # max_turns guard, observe()'s "nothing pending" guard, and turns_left all had
 # no test at all (line-coverage showed 93%, missing exactly these branches).
-# The brief's REFUSAL/MAX_TOKENS test was also split in two below, one case
+# The REFUSAL/MAX_TOKENS test was also split in two below, one case
 # per name (it was originally named for both but its body only ever
 # constructed a REFUSAL reply) -- the reason mapping is a dict literal, not a
 # branch, so statement coverage stays green regardless and would not have
@@ -308,10 +308,10 @@ def test_stamp_for_is_none_when_nothing_was_observed_at_that_path():
 # are above, next to the tests they changed.
 #
 # The first three: LoopState (and Done/RunTools, which embed it) had the exact
-# defect Task 2 fixed on ToolUseBlock -- frozen=True with the default eq=True
+# defect once fixed on ToolUseBlock -- frozen=True with the default eq=True
 # generates a real __hash__, so isinstance(x, Hashable) says True while
 # hash(x) actually raises, naming "mappingproxy" (from read_state) rather than
-# the class. Pinned the same way Task 2 pins ToolUseBlock: both directions,
+# the class. Pinned the same way ToolUseBlock is: both directions,
 # so a fix that makes one true without the other is still caught.
 
 

@@ -86,11 +86,10 @@ async def test_malformed_edits_argument_is_a_clear_error(ctx, tmp_repo):
     assert outcome.is_error and "edits must be a list" in outcome.content
 
 
-# The tests below are not in the brief. They close gaps: branches the brief's
-# seven given tests never reach, each guarded by an `or` whose two halves need
-# separate tests because line coverage cannot see a dropped half, plus the
-# tool's own refusal and permission-request behavior that "Produces: WriteTool,
-# EditTool" calls for but no given test exercises.
+# The tests below close gaps: branches the tests above never reach, each
+# guarded by an `or` whose two halves need separate tests because line
+# coverage cannot see a dropped half, plus the
+# tool's own refusal and permission-request behavior that no test above exercises.
 
 
 async def test_an_empty_edits_list_is_a_clear_error(ctx, tmp_repo):
@@ -204,7 +203,7 @@ def test_the_permission_request_marks_this_as_a_write(ctx, tmp_repo):
     assert request.is_write is True
 
 
-def test_the_description_is_the_one_from_the_brief():
+def test_the_description_is_pinned():
     description = EditTool().spec().description
     assert description.startswith("Make one or more exact string replacements in a single file.")
     assert "Never include the line-number prefix" in description

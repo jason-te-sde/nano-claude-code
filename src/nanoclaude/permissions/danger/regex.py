@@ -2,8 +2,8 @@
 
 Shipped, but not trusted. Regular expressions cannot see through the shell's own
 expansions, and every entry in :data:`KNOWN_BLIND_SPOTS` is a real way to write
-a destructive command that the patterns below wave through. Task 8 adds a
-syntax-tree classifier and a corpus that measures the gap.
+a destructive command that the patterns below wave through. A syntax-tree
+classifier, with a corpus that measures the gap, is meant to follow.
 
 When tree-sitter is unavailable this is the only classifier. Read its ``SAFE``
 verdicts precisely: they mean "none of the patterns below matched", not "this
@@ -47,7 +47,7 @@ RULES: tuple[DangerRule, ...] = (
 )
 
 #: Ways to write a destructive command this classifier will not catch. Each one
-#: becomes a case in the differential corpus in Task 8.
+#: becomes a case in the differential corpus that measures the gap.
 KNOWN_BLIND_SPOTS: tuple[str, ...] = (
     "word splitting: `rm$IFS-rf$IFS/` never contains the literal `rm -rf`",
     "command substitution that assembles the verb or holds a separator the patterns cannot span",

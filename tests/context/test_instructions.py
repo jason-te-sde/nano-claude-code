@@ -63,8 +63,8 @@ def test_an_enormous_instructions_file_is_truncated_not_loaded_whole(tmp_repo):
 
 def test_home_instructions_are_loaded_when_present(tmp_repo, tmp_path_factory):
     """The tests above all pass home=None, so the ``if home:`` branch never ran
-    in any of them. tmp_path stands in for the real home directory here, per
-    this task's own instruction -- never the developer's actual $HOME.
+    in any of them. tmp_path stands in for the real home directory here --
+    never the developer's actual $HOME.
     """
     home = tmp_path_factory.mktemp("home")
     (home / ".nanoclaude").mkdir()
