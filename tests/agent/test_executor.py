@@ -1,31 +1,23 @@
 """Tests for nanoclaude.agent.executor and nanoclaude.agent.ui.
 
-Transcribed from task-16-brief.md Step 1, with two kinds of change beyond it:
+Three rules are pinned where they touch this module: every audited call gets an
+outcome, a refusal has one text format, and the purity-test boundary. The outcome
+ones have their own tests below, reading the ``tool_calls`` row back.
 
-1. The three precedence notes at the top of the brief (every audited call gets
-   an outcome; the refusal text format; the purity-test boundary) are pinned
-   here where they touch this module -- the outcome ones get their own tests
-   below, reading the ``tool_calls`` row back.
-2. ``test_cancelling_the_batch_keeps_completed_results`` replaces the brief's
-   ``"Bash"`` call (``{"command": "sleep 5"}``) with a monkeypatched
-   ``WriteTool.run``. Task 13 (the Bash tool) is parked -- see
-   ``.superpowers/sdd/2026-09-30-nano-claude-code-v0.1/progress.md`` line 1736
-   ("Task 13 is parked") -- and this task's own BASE (52c26ee) only consumes
-   Tasks 4, 6, 10 and 11, so ``default_registry()`` has no "Bash" tool to call.
-   An unknown-tool call is refused synchronously in the decide phase and never
-   suspends at all, so the brief's literal form would finish in milliseconds
-   and ``task.cancel()`` would hit an already-completed task rather than an
-   in-flight one. Monkeypatching gets a real ``await`` suspension point
-   without building the out-of-scope Bash tool, and lets the test assert
-   something the brief's version did not: that the first write's effect is
-   still on disk after the second one is cancelled mid-flight.
+``test_cancelling_the_batch_keeps_completed_results`` monkeypatches
+``WriteTool.run`` to get an in-flight call to cancel. A call to an unregistered
+tool is refused synchronously in the decide phase and never suspends at all, so
+it would finish in milliseconds and ``task.cancel()`` would hit an
+already-completed task rather than an in-flight one. Monkeypatching gives a real
+``await`` suspension point without needing a slow tool, and lets the test assert
+that the first write's effect is still on disk after the second one is cancelled
+mid-flight.
 
-Beyond the brief's 8 given tests, this file adds coverage the task's own
-completeness bar asks for: a dedicated proof that concurrent reads are capped
+Beyond that, this file adds a dedicated proof that concurrent reads are capped
 at MAX_CONCURRENT_READS (not just "fast enough"), that writes to *different*
 paths still run one at a time, both directions of an ALWAYS grant's scope
 (does not retroact within a batch, does carry into the next one), that ONCE
-does not carry over, hashability of the new frozen ``_Plan``, and direct
+does not carry over, hashability of the frozen ``_Plan``, and direct
 coverage of the UI protocol's three concrete implementations.
 """
 
@@ -116,11 +108,9 @@ async def test_arguments_that_do_not_match_the_schema_become_an_error_result(pol
     assert "path must be a string" in outcomes[1].content
     assert "offset must be an integer" in outcomes[2].content
     assert "no tool named 'Nope'" in outcomes[3].content
-    # Note 2's "Refused (<rule>): <reason>" is the format _decide's own DENY
-    # branch (policy refusals) already used verbatim in the brief; applying it
-    # to _refused()'s two early-exit paths too (t1/t2's tool.bad-arguments and
-    # t4's tool.unknown, neither of which the brief's sketch wrapped) is this
-    # task's own addition, made for internal consistency -- the model sees one
+    # "Refused (<rule>): <reason>" is the format _decide's own DENY branch
+    # (policy refusals) uses; _refused()'s two early-exit paths (tool.bad-arguments
+    # and tool.unknown) use it too, for consistency -- the model sees one
     # shape for every refusal, not one shape for policy refusals and a bare
     # message for the other two. Pinned explicitly here since it is the one
     # case neither a "contains path must be a string" nor an "is_error" check
@@ -366,10 +356,10 @@ async def test_cancelling_the_batch_keeps_completed_results(policy, tmp_repo, mo
     assert not (tmp_repo / "b.txt").exists()
 
 
-# Tests below close gaps beyond the brief's 8 given tests: the "every audited
-# call gets an outcome" requirement (note 1) needs its own tests reading the
+# Tests below cover what the ones above leave open: the "every audited
+# call gets an outcome" requirement needs its own tests reading the
 # tool_calls row back, since none of the tests above wire up a real AuditLog;
-# hashability of the new frozen _Plan, per this task's own hashability rule;
+# hashability of the frozen _Plan;
 # a real proof that MAX_CONCURRENT_READS caps concurrency rather than merely
 # completing quickly; serial writes to *different* paths; both directions of
 # an ALWAYS grant's scope; ONCE not persisting; and the UI protocol's three
@@ -454,7 +444,7 @@ def test_plan_is_not_hashable():
 
 
 async def test_concurrent_reads_are_capped_at_max_concurrent_reads(policy, tmp_repo, monkeypatch):
-    """ "Completes quickly" (the brief's own concurrency test, above) would
+    """ "Completes quickly" (the concurrency test above) would
     pass just as well if every read ran serially -- each is fast regardless.
     This instead measures the actual peak number of reads in flight at once
     against MAX_CONCURRENT_READS directly, with more calls than the cap.

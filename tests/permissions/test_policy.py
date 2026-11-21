@@ -331,13 +331,12 @@ def test_the_reason_always_names_something_actionable(make_result, expected_rule
     assert fragment in result.reason
 
 
-# The tests below pin names from the brief's Interfaces -> Produces list, or
-# branches left uncovered by the twelve tests above (confirmed by
-# --cov-report=term-missing), rather than any of the brief's own steps.
+# The tests below pin public names and branches left uncovered by the twelve
+# tests above (confirmed by --cov-report=term-missing).
 
 
 def test_with_tool_grants_the_named_tool_without_mutating_the_original():
-    # Grants is explicitly named with .with_tool(name) in the Produces list,
+    # Grants has a .with_tool(name) method,
     # and none of the twelve tests above call it -- evaluate() only ever
     # receives grants built directly from a Grants(...) literal.
     before = Grants()
@@ -384,8 +383,7 @@ def test_grants_is_hashable():
 
 
 def test_grants_normalizes_a_plain_set_into_a_hashable_frozenset():
-    """The conditional-hashability trap this task's global constraints name,
-    word for word: Grants({"Bash"}) used to store the plain set unchanged.
+    """The conditional-hashability trap: Grants({"Bash"}) used to store the plain set unchanged.
     isinstance(x, Hashable) still reported True -- frozen=True's generated
     __hash__ exists regardless of what tools actually holds -- and only
     calling hash(x) raised, naming "set" rather than Grants.
@@ -394,7 +392,7 @@ def test_grants_normalizes_a_plain_set_into_a_hashable_frozenset():
     *typed* caller (tools is declared frozenset[str], and a plain set is a
     different, unrelated type) -- hence the ignore below. The point of this
     test is the untyped or dynamically-built caller __post_init__ now
-    protects regardless: Tasks 7-8's session-grant consumers, a config
+    protects regardless: session-grant consumers, a config
     loader, anything that hands Grants a set it built elsewhere.
     """
     grants = Grants({"Bash"})  # type: ignore[arg-type]
@@ -403,7 +401,7 @@ def test_grants_normalizes_a_plain_set_into_a_hashable_frozenset():
 
 
 def test_policy_normalizes_a_list_of_secret_paths_so_evaluate_does_not_raise():
-    """The conditional-hashability trap this task's global constraints name,
+    """The conditional-hashability trap,
     for Policy.secret_paths rather than Grants.tools (see
     test_grants_normalizes_a_plain_set_into_a_hashable_frozenset above):
     RuleSet.build's own allow/ask/deny parameters are typed list[str] | None,
@@ -448,7 +446,7 @@ def test_relative_of_a_path_equal_to_a_root_returns_a_single_dot():
     un-relativized candidate that also sits in evaluate()'s `subjects` tuple
     -- so the only rule shape this could ever change the outcome for is one
     whose subject is the literal "." itself (e.g. Read(.)), and nothing in
-    this suite, or the brief, writes one.
+    this suite writes one.
     """
     p = Policy(Sandbox((ROOT,)), RuleSet.build())
     assert p.relative(ROOT) == "."
@@ -535,7 +533,7 @@ def test_evaluate_defaults_to_no_grants_when_the_argument_is_omitted():
     assert (result.decision, result.rule) == (Decision.ASK, "rule.ask")
 
 
-# Step 7b: the degradation guarantee (spec 6.4, 17) enforced in code, not just
+# The degradation guarantee (spec 6.4, 17) enforced in code, not just
 # in prose. A SAFE verdict whose classifier was not authoritative -- every SAFE
 # the regex classifier gives, since it can refuse a command but never clear
 # one -- must not be promoted to ALLOW by row 8 or row 9. All four directions are pinned, not

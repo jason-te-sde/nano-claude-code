@@ -1,6 +1,6 @@
 """Ollama, using its native API rather than its OpenAI-compatible endpoint.
 
-The compatibility endpoint exists and the adapter in Task 18 would talk to it.
+The compatibility endpoint exists and the OpenAI-compatible adapter would talk to it.
 The native API is used anyway for one reason: ``/api/show`` returns the model's
 prompt template, and whether that template mentions tools is the only reliable
 way to know before the first request whether this model can call them. Guessing

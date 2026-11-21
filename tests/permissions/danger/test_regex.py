@@ -82,8 +82,8 @@ def test_known_blind_spots_are_documented_and_really_are_blind_spots():
     # Exact rather than a floor, so an entry cannot disappear silently.
     assert len(KNOWN_BLIND_SPOTS) == 8
     classifier = RegexClassifier()
-    # The substitution sample holds a separator the patterns cannot span. The
-    # brief's original one left the verb visible, was caught, and moved to DANGEROUS.
+    # The substitution sample holds a separator the patterns cannot span. An
+    # earlier sample left the verb visible, was caught, and moved to DANGEROUS.
     for obfuscated in ["$(echo rm; true) -rf /", "X=rm; $X -rf /", "r''m -rf /"]:
         assert classifier.classify(obfuscated).level is DangerLevel.SAFE
 
@@ -110,7 +110,7 @@ def test_additional_rule_patterns_are_blocked_and_named(command, rule_id):
 
 
 def test_every_rule_id_in_rules_is_unique():
-    # RULES is named in the brief's own Produces list, but nothing above
+    # RULES is part of the module's public surface, but nothing above
     # imports it directly -- classify() only reaches it through module
     # internals, and the parametrized tests pin behaviour, not the tuple
     # itself. A duplicate rule_id would make a verdict's matches/reason

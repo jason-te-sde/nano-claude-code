@@ -43,12 +43,12 @@ async def test_a_successful_write_reports_the_new_stamp(ctx, tmp_repo):
     assert path == str(tmp_repo / "new.py") and stamp.size == 6
 
 
-# The tests below are not in the brief. The brief's four given tests only ever
+# The tests below close gaps. The tests above only ever
 # exercise the "file did not exist" (Created) half of
 # `verb = "Updated" if current is not None else "Created"`, and only the
 # trailing-newline half of `content.endswith("\n") or not content` -- a
 # dropped "Updated" or a dropped half of that `or` would still pass every
-# given test, and line coverage alone cannot see it since each is one line.
+# test above, and line coverage alone cannot see it since each is one line.
 
 
 async def test_overwriting_a_file_that_was_read_and_is_unchanged_succeeds(ctx, tmp_repo):
@@ -86,7 +86,7 @@ def test_the_permission_request_marks_this_as_a_write(ctx, tmp_repo):
     assert request.is_write is True
 
 
-def test_the_description_is_the_one_from_the_brief():
+def test_the_description_is_pinned():
     """It is a prompt. Changing a word needs a design note, so pin the shape."""
     description = WriteTool().spec().description
     assert description.startswith("Write a UTF-8 text file, creating it or replacing it entirely.")

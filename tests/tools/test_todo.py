@@ -62,7 +62,7 @@ async def test_writing_a_new_list_replaces_the_old_one(ctx):
     assert [i.content for i in state.items] == ["b"]
 
 
-# -- Completeness beyond the brief's four given tests: every other refusal
+# -- Completeness beyond the main tests: every other refusal
 # branch in run(), plus spec()/permission_request()/read_only, none of which
 # the four tests above touch at all.
 

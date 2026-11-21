@@ -17,7 +17,7 @@ from nanoclaude.providers.capabilities import (
 )
 from nanoclaude.providers.ollama import probe_ollama
 
-# -- probe_ollama: the brief's own scenarios ---------------------------------
+# -- probe_ollama: the main scenarios ---------------------------------
 
 
 async def test_a_model_whose_template_declares_tools_gets_native_tools():
@@ -80,7 +80,7 @@ async def test_a_known_model_is_never_probed(tmp_path):
     assert caps.native_tools
 
 
-# -- probe_ollama: lessons from Tasks 17/18, applied here too ----------------
+# -- probe_ollama: edge cases shared with the other adapters ----------------
 
 
 @pytest.mark.parametrize("body", [["unexpected"], "just a string", 42, None])
@@ -356,7 +356,7 @@ async def test_a_successful_probe_that_matches_the_conservative_default_is_still
 
 
 async def test_the_table_wins_over_a_conflicting_cached_value(tmp_path):
-    # Table beats not just a fresh probe (the brief's own test) but a cache
+    # Table beats not just a fresh probe (the test above) but a cache
     # entry already sitting there for the same key.
     cache = CapabilityCache(tmp_path / "caps.json")
     cache.put("anthropic", "claude-sonnet-5", CONSERVATIVE_DEFAULT)
@@ -369,7 +369,7 @@ async def test_the_table_wins_over_a_conflicting_cached_value(tmp_path):
 
 
 async def test_no_probe_and_no_cache_entry_yields_the_conservative_default(tmp_path):
-    # The other half of "if probe is None:" -- the brief's own caching test
+    # The other half of "if probe is None:" -- the caching test above
     # always supplies a probe.
     cache = CapabilityCache(tmp_path / "caps.json")
     caps = await resolve_capabilities("ollama", "unknown-model", cache=cache)

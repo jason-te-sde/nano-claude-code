@@ -1,11 +1,11 @@
 """Tests for nanoclaude.agent.session and nanoclaude.testing.session.
 
-The first block is the brief's own eleven tests. Two of them changed shape and the
+The first block is the core behavior. Two of its tests have an unusual shape and the
 module says why where it happens: the compaction test could not pass as written
 (a one-message conversation is never compacted, so the marker it looks for never
 appears), and the retry test must not wait out a real back-off.
 
-The rest pin the notes the brief carries and what the session owns that no other
+The rest pin what the session owns that no other
 module can: that a bug in a tool does not end it, that an unknown cost is stored
 as unknown, that a reply of only complaints is asked for again a bounded number of
 times, that the configured retry policy is the one in force, that the context
@@ -87,7 +87,7 @@ from nanoclaude.tools.registry import ToolRegistry, default_registry
 UNPRICED = "model-without-a-price"
 
 #: A model with no native tool calling and a window the protocol prompt fits in
-#: with room to spare. The brief's own tests use CONSERVATIVE_DEFAULT (8,192
+#: with room to spare. The core tests use CONSERVATIVE_DEFAULT (8,192
 #: tokens); the retry tests add messages and should not depend on how close the
 #: fixed prompt sits to that window.
 TEXT_ONLY = Capabilities(
@@ -218,7 +218,7 @@ def row_after_closing(session: ScriptedSession) -> Any:
 
 
 # --------------------------------------------------------------------------
-# The brief's own tests
+# Core behavior
 # --------------------------------------------------------------------------
 
 
@@ -280,8 +280,7 @@ async def test_a_non_retryable_provider_error_surfaces(tmp_repo):
 
 
 async def test_crossing_the_hard_threshold_triggers_a_full_compaction(tmp_repo):
-    """The brief ran this on a one-message conversation, which full_compact leaves
-    alone: with nothing older than the recent turns there is nothing to summarise.
+    """A one-message conversation is left alone by full_compact: with nothing older than the recent turns there is nothing to summarise.
     It needs a history longer than the turns kept verbatim."""
     session = build_session(
         tmp_repo,

@@ -1,7 +1,4 @@
-"""The brief (task-11-brief.md Step 9) ships registry.py with no accompanying
-tests. These are written fresh against its committed behavior rather than
-transcribed.
-"""
+"""Tests for the default tool registry."""
 
 from __future__ import annotations
 
@@ -99,9 +96,8 @@ def test_default_registry_includes_read_write_edit_glob_grep_todowrite_and_task(
 
 
 async def test_default_registry_wires_a_given_todo_state_into_todowrite(ctx):
-    """Tasks 24-26 construct a TodoState and call default_registry(todo) so
-    that later reads of the state see what TodoWrite wrote (task-15-brief.md's
-    split note). A registry that silently built its own TodoState instead
+    """A caller constructs a TodoState and calls default_registry(todo) so
+    that later reads of the state see what TodoWrite wrote. A registry that silently built its own TodoState instead
     would leave the caller's instance permanently empty.
     """
     state = TodoState()
@@ -136,10 +132,8 @@ def test_every_path_taking_tool_resolves_its_path_into_resolved_paths(ctx, tmp_r
     resolved_paths would sail past the sandbox and the secret-path check for
     every call, silently.
 
-    Only Read is registered as of this task; Write and Edit (Task 12) and Glob
-    and Grep (Task 14) each register later and, per their briefs, take a `path`
-    argument too. Walking the live registry rather than naming Read keeps this
-    covering all of them without being revisited -- the final assert makes it
+    Read, Write, Edit, Glob and Grep all take a `path` argument. Walking the live
+    registry rather than naming them keeps this covering any tool added later -- the final assert makes it
     fail loudly, rather than vacuously pass, should some future registry drop
     every path-taking tool.
 

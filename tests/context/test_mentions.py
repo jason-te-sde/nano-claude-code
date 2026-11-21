@@ -57,8 +57,7 @@ def test_an_email_address_is_not_a_mention(tmp_repo):
 
 
 def test_a_secret_path_mention_is_left_as_written_by_default(tmp_repo):
-    """Requirement added 2026-10-01 (task-22-brief.md preamble): a mention must
-    not inline a secret file. Without this check, only the generic content
+    """A mention must not inline a secret file. Without this check, only the generic content
     redactor would stand between a mentioned .env and the model -- and that
     redactor matches known credential shapes, not a database URL with an
     inline password, which is exactly what this writes.
