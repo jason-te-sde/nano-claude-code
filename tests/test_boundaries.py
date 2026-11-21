@@ -18,7 +18,8 @@ BANNED_IN_AGENT = ("os", "subprocess", "time", "random", "uuid", "asyncio", "sql
 # CLI (test_agent_never_imports_the_cli, below). Enforced over this explicit
 # list rather than "every file under agent/" so that adding a new, impure
 # module to the package cannot silently widen what the no-I/O rule applies to;
-# a later module that is itself meant to be pure joins this tuple. test_pure_modules_is_non_empty_and_every_listed_module_exists (below)
+# a later module that is itself meant to be pure joins this tuple.
+# test_pure_modules_is_non_empty_and_every_listed_module_exists (below)
 # pins that the list itself cannot quietly empty out from under the test that
 # reads it.
 PURE_MODULES = ("loop.py",)

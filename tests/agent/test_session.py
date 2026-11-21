@@ -280,7 +280,8 @@ async def test_a_non_retryable_provider_error_surfaces(tmp_repo):
 
 
 async def test_crossing_the_hard_threshold_triggers_a_full_compaction(tmp_repo):
-    """A one-message conversation is left alone by full_compact: with nothing older than the recent turns there is nothing to summarise.
+    """A one-message conversation is left alone by full_compact:
+    with nothing older than the recent turns there is nothing to summarise.
     It needs a history longer than the turns kept verbatim."""
     session = build_session(
         tmp_repo,

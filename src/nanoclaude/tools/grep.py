@@ -210,9 +210,10 @@ class GrepTool:
         """Whether the policy would let Read show the model this file; a path is asked once.
 
         A credentials-shaped file discovered while walking the tree is never
-        returned, on either search backend, unless the policy explicitly opts in. The
-        check is the whole of Read's verdict (see ``read_refusal``), since a deny
-        rule for Read is no less a statement about what the model may see. Applies to a
+        returned, on either search backend, unless the policy explicitly opts in.
+        The check is the whole of Read's verdict (see ``read_refusal``), since a
+        deny rule for Read is no less a statement about what the model may see.
+        Applies to a
         context line exactly as it does to a match: both carry the same path, and the
         verdict is keyed on the path alone.
         """

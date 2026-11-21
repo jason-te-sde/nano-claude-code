@@ -86,8 +86,9 @@ async def test_malformed_edits_argument_is_a_clear_error(ctx, tmp_repo):
     assert outcome.is_error and "edits must be a list" in outcome.content
 
 
-# The tests below close gaps: branches the tests above never reach, each guarded by an `or` whose two halves need
-# separate tests because line coverage cannot see a dropped half, plus the
+# The tests below close gaps: branches the tests above never reach, each
+# guarded by an `or` whose two halves need separate tests because line
+# coverage cannot see a dropped half, plus the
 # tool's own refusal and permission-request behavior that no test above exercises.
 
 

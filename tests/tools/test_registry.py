@@ -97,8 +97,8 @@ def test_default_registry_includes_read_write_edit_glob_grep_todowrite_and_task(
 
 async def test_default_registry_wires_a_given_todo_state_into_todowrite(ctx):
     """A caller constructs a TodoState and calls default_registry(todo) so
-    that later reads of the state see what TodoWrite wrote. A registry that silently built its own TodoState instead
-    would leave the caller's instance permanently empty.
+    that later reads of the state see what TodoWrite wrote. A registry that
+    silently built its own TodoState instead would leave the caller's instance permanently empty.
     """
     state = TodoState()
     registry = default_registry(state)
@@ -133,9 +133,9 @@ def test_every_path_taking_tool_resolves_its_path_into_resolved_paths(ctx, tmp_r
     every call, silently.
 
     Read, Write, Edit, Glob and Grep all take a `path` argument. Walking the live
-    registry rather than naming them keeps this covering any tool added later -- the final assert makes it
-    fail loudly, rather than vacuously pass, should some future registry drop
-    every path-taking tool.
+    registry rather than naming them keeps this covering any tool added later --
+    the final assert makes it fail loudly, rather than vacuously pass, should some
+    future registry drop every path-taking tool.
 
     The call made on each tool is a *valid* one, not a minimal one: every other
     `required` string property (Write's `content`, Glob's and Grep's `pattern`)
