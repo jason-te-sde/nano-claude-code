@@ -14,7 +14,7 @@
 
 ---
 
-> **Status: version `0.1.0.dev0`, not released.** This describes `main` as it is. Built: the agent loop, the tools `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TodoWrite` and `Task`, four permission modes with a sandbox, the provider adapters, MCP servers over stdio, compaction, stored sessions, cost accounting and the REPL. **Not built yet: `Bash` and `Git`.** Until they are, the agent can read and change files in a project and cannot run a command or a test, and v0.1 will not be tagged before they land.
+> **Status: pre-release, version `0.1.0.dev0`.** This describes `main` as it is. Built: the agent loop, the tools `Read`, `Edit`, `Write`, `Glob`, `Grep`, `TodoWrite` and `Task`, four permission modes with a sandbox, the provider adapters, MCP servers over stdio, compaction, stored sessions, cost accounting and the REPL. **Next: the `Bash` and `Git` tools**, which complete v0.1.
 
 ## Install
 
