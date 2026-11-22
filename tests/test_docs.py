@@ -799,7 +799,7 @@ def test_every_tool_in_the_readme_exists_and_every_tool_is_in_the_readme():
 
 def test_the_readme_says_which_tools_are_not_built_and_names_no_other_as_built():
     readme = _text(README)
-    assert "Not built yet: `Bash` and `Git`" in readme
+    assert "Next: the `Bash` and `Git` tools" in readme
     registry = {tool.name for tool in default_registry(TodoState())}
     assert "Bash" not in registry
     assert "Git" not in registry
